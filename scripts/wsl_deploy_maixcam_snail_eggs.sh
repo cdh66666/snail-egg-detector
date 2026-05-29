@@ -6,6 +6,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONVERT_DIR="$PROJECT_DIR/dist/maixcam_snail_eggs_yolo/convert"
 RELEASE_DIR="$PROJECT_DIR/release/maixcam_copy_to_device"
 OUT_DEVICE="$RELEASE_DIR/root/models"
+NET_NAME="${NET_NAME:-snail_eggs_yolov8n_640x480}"
 
 export CONDA_PREFIX="$HOME/miniforge3/envs/tpu310"
 export PATH="$CONDA_PREFIX/bin:$PATH"
@@ -13,17 +14,17 @@ export PATH="$CONDA_PREFIX/bin:$PATH"
 cd "$CONVERT_DIR/workspace"
 
 python "$CONDA_PREFIX/lib/python3.10/site-packages/tpu_mlir/python/tools/model_deploy.py" \
-  --mlir snail_eggs_yolov8n_320x320.mlir \
+  --mlir "${NET_NAME}.mlir" \
   --quantize INT8 \
   --quant_input \
-  --calibration_table snail_eggs_yolov8n_320x320_cali_table \
+  --calibration_table "${NET_NAME}_cali_table" \
   --processor cv181x \
   --skip_validation \
-  --model snail_eggs_yolov8n_320x320.cvimodel
+  --model "${NET_NAME}.cvimodel"
 
 mkdir -p "$OUT_DEVICE"
-cp snail_eggs_yolov8n_320x320.cvimodel "$OUT_DEVICE/snail_eggs_yolov8n_320x320.cvimodel"
-cp "$PROJECT_DIR/maixcam/snail_eggs_yolov8n_320x320.mud" "$OUT_DEVICE/snail_eggs_yolov8n_320x320.mud"
+cp "${NET_NAME}.cvimodel" "$OUT_DEVICE/${NET_NAME}.cvimodel"
+cp "$PROJECT_DIR/maixcam/${NET_NAME}.mud" "$OUT_DEVICE/${NET_NAME}.mud"
 cp "$PROJECT_DIR/maixcam/main.py" "$RELEASE_DIR/main.py"
 
 cd "$PROJECT_DIR/release"

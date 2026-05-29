@@ -3,13 +3,13 @@ set -euxo pipefail
 
 # Run this inside Sipeed/SOPHGO's TPU-MLIR Docker environment.
 # Expected files next to this script:
-#   snail_eggs_yolov8n_320x320.onnx
+#   ${NET_NAME}.onnx
 #   image.jpg
 #   cali_images/*.jpg
 
-net_name=snail_eggs_yolov8n_320x320
-input_w=320
-input_h=320
+net_name="${NET_NAME:-snail_eggs_yolov8n_640x480}"
+input_w="${INPUT_W:-640}"
+input_h="${INPUT_H:-480}"
 
 # YOLOv8 detection output nodes for the exported Ultralytics YOLOv8n graph.
 # If your ONNX graph differs, inspect it with Netron and update these names.
@@ -29,20 +29,28 @@ run_tool() {
 mkdir -p workspace
 cd workspace
 
-run_tool model_transform.py \
-  --model_name ${net_name} \
-  --model_def ../${net_name}.onnx \
-  --input_shapes "[[1,3,${input_h},${input_w}]]" \
-  --mean "0,0,0" \
-  --scale "0.00392156862745098,0.00392156862745098,0.00392156862745098" \
-  --keep_aspect_ratio \
-  --pixel_format rgb \
-  --channel_format nchw \
-  --output_names "${output_names}" \
-  --test_input ../image.jpg \
-  --test_result ${net_name}_top_outputs.npz \
-  --tolerance 0.99,0.99 \
+transform_args=(
+  --model_name ${net_name}
+  --model_def ../${net_name}.onnx
+  --input_shapes "[[1,3,${input_h},${input_w}]]"
+  --mean "0,0,0"
+  --scale "0.00392156862745098,0.00392156862745098,0.00392156862745098"
+  --keep_aspect_ratio
+  --pixel_format rgb
+  --channel_format nchw
+  --output_names "${output_names}"
   --mlir ${net_name}.mlir
+)
+
+if [ "${VALIDATE_TRANSFORM:-1}" = "1" ]; then
+  transform_args+=(
+    --test_input ../image.jpg
+    --test_result ${net_name}_top_outputs.npz
+    --tolerance 0.99,0.99
+  )
+fi
+
+run_tool model_transform.py "${transform_args[@]}"
 
 run_tool run_calibration.py ${net_name}.mlir \
   --dataset ../cali_images \

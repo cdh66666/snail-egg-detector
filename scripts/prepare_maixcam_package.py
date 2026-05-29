@@ -20,6 +20,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare a MaixCam YOLO deployment package.")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--calibration-images", type=int, default=200)
+    parser.add_argument("--model-name", default="snail_eggs_yolov8n_640x480")
+    parser.add_argument("--onnx", type=Path, default=ROOT / "models" / "snail_eggs_yolov8n_640x480.onnx")
+    parser.add_argument("--mud", type=Path, default=ROOT / "maixcam" / "snail_eggs_yolov8n_640x480.mud")
+    parser.add_argument("--input-width", type=int, default=640)
+    parser.add_argument("--input-height", type=int, default=480)
     args = parser.parse_args()
 
     out = args.out.resolve()
@@ -27,11 +32,24 @@ def main() -> None:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    copy_file(ROOT / "models" / "snail_eggs_yolov8n_320x320.onnx", out / "convert" / "snail_eggs_yolov8n_320x320.onnx")
+    copy_file(args.onnx.resolve(), out / "convert" / f"{args.model_name}.onnx")
     copy_file(ROOT / "scripts" / "maixcam_convert_snail_eggs_yolov8.sh", out / "convert" / "maixcam_convert_snail_eggs_yolov8.sh")
-    copy_file(ROOT / "maixcam" / "snail_eggs_yolov8n_320x320.mud", out / "device" / "snail_eggs_yolov8n_320x320.mud")
+    copy_file(args.mud.resolve(), out / "device" / f"{args.model_name}.mud")
     copy_file(ROOT / "maixcam" / "main.py", out / "device" / "main.py")
     copy_file(ROOT / "README.md", out / "README_DEPLOY.md")
+
+    env_file = out / "convert" / "convert.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"export NET_NAME={args.model_name}",
+                f"export INPUT_W={args.input_width}",
+                f"export INPUT_H={args.input_height}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     image_dir = ROOT / "data" / "yolo_pinkeggs_hardneg_v2" / "images" / "train"
     images = sorted([p for p in image_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])

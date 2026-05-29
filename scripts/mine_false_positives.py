@@ -15,6 +15,15 @@ from ultralytics import YOLO
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
+def parse_imgsz(value: str) -> int | list[int]:
+    parts = [part.strip() for part in str(value).replace("x", ",").split(",") if part.strip()]
+    if len(parts) == 1:
+        return int(parts[0])
+    if len(parts) == 2:
+        return [int(parts[0]), int(parts[1])]
+    raise argparse.ArgumentTypeError("imgsz must be an int or HEIGHT,WIDTH, for example 640 or 480,640")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -26,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-data-root", type=Path, required=True)
     parser.add_argument("--output-data-root", type=Path, required=True)
     parser.add_argument("--negative-dir", type=Path, action="append", required=True)
-    parser.add_argument("--imgsz", type=int, default=320)
+    parser.add_argument("--imgsz", type=parse_imgsz, default=320)
     parser.add_argument("--conf", type=float, default=0.05)
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument("--device", default="0")

@@ -6,11 +6,11 @@ from maix import camera, display, image, nn, app, time
 # Copy this file to MaixVision as main.py after converting the ONNX model to MUD.
 # Put the MUD and model file under /root/models/ on the MaixCam.
 
-MODEL = "/root/models/snail_eggs_yolov8n_320x320.mud"
-CONF_TH = 0.15
+MODEL = "/root/models/snail_eggs_yolov8n_640x480.mud"
+CONF_TH = 0.25
 IOU_TH = 0.35
 MAX_TARGETS = 32
-MIN_MODEL_CONF = 0.15
+MIN_MODEL_CONF = 0.25
 STRONG_MODEL_CONF = 0.50
 LOW_CONF_MIN_PINK_RATIO = 0.03
 LOW_CONF_MIN_AREA = 24
@@ -21,20 +21,24 @@ LOW_CONF_MIN_AREA = 24
 # 3 = auto tune: color debug + save frames + print every raw/candidate stat.
 RUN_MODE = 2
 
-# The model input is 320x320. For small/distant egg clusters, reading a larger
-# camera frame and scanning 320x320 tiles preserves detail for laser aiming.
+# Runtime speed profiles:
+# - "full_frame": 640x480 model, one inference per camera frame, no memory boxes.
+# - "accuracy": legacy 320x320 model, scan all 6 tiles every frame.
+# - "balanced": legacy 320x320 model, scan 3 tiles per frame with short memory.
+# - "fast": legacy 320x320 model, scan 2 tiles per frame.
+# Keep the camera at 640x480 so aiming coordinates stay in the real view.
+SPEED_PROFILE = "full_frame"
+
+# The current deployed model input is 640x480, so the detector sees the whole
+# camera image in one pass. That avoids stale round-robin boxes for laser aiming.
 FRAME_W = 640
 FRAME_H = 480
-USE_TILED_INFERENCE = True
+USE_TILED_INFERENCE = False
 TILE_OVERLAP = 160
 MERGE_IOU = 0.45
-# Accuracy mode: scan every 320x320 tile on each frame. This is slower, but it
-# gives the best recall for small egg clusters and is the safer default for
-# laser aiming. Set ROUND_ROBIN_TILES=True and TILES_PER_FRAME=2 only when FPS
-# matters more than detecting every visible cluster.
-ROUND_ROBIN_TILES = False
-TILES_PER_FRAME = 6
-MEMORY_TTL_FRAMES = 48
+ROUND_ROBIN_TILES = True
+TILES_PER_FRAME = 3
+MEMORY_TTL_FRAMES = 36
 
 # Bring-up defaults: show what the model sees first. Keep laser disconnected.
 # After field tuning, raise CONF_TH, turn ENABLE_COLOR_GATE back on, and require
@@ -54,6 +58,26 @@ MAX_COLOR_CHECKS = 36
 REQUIRE_STABLE_FRAMES = 2
 TRACK_MAX_MISSES = 1
 WARMUP_FRAMES = 6
+
+if SPEED_PROFILE == "full_frame":
+    USE_TILED_INFERENCE = False
+    ROUND_ROBIN_TILES = False
+    TILES_PER_FRAME = 1
+    MEMORY_TTL_FRAMES = 0
+elif SPEED_PROFILE == "accuracy":
+    ROUND_ROBIN_TILES = False
+    TILES_PER_FRAME = 6
+    MEMORY_TTL_FRAMES = 48
+elif SPEED_PROFILE == "balanced":
+    ROUND_ROBIN_TILES = True
+    TILES_PER_FRAME = 3
+    MEMORY_TTL_FRAMES = 36
+elif SPEED_PROFILE == "fast":
+    ROUND_ROBIN_TILES = True
+    TILES_PER_FRAME = 2
+    MEMORY_TTL_FRAMES = 42
+else:
+    print("WARN,UNKNOWN_SPEED_PROFILE,%s" % SPEED_PROFILE)
 
 # For laser aiming, False keeps boxes aligned with the current frame. Set True only
 # if you prefer higher FPS and can tolerate one-frame image delay.
@@ -422,8 +446,9 @@ def detect_frame(detector, img, frame_id):
 
 print("YOLO SNAIL EGG DETECTOR BOOT")
 print(
-    "CFG,RUN_MODE,%d,FRAME,%dx%d,TILED,%d,RR,%d,TILES_PER_FRAME,%d,TTL,%d,DETECT_CONF,%.3f,MIN_MODEL,%.3f,STRONG_MODEL,%.3f,IOU,%.3f,MIN_PINK,%.4f"
+    "CFG,PROFILE,%s,RUN_MODE,%d,FRAME,%dx%d,TILED,%d,RR,%d,TILES_PER_FRAME,%d,TTL,%d,DETECT_CONF,%.3f,MIN_MODEL,%.3f,STRONG_MODEL,%.3f,IOU,%.3f,MIN_PINK,%.4f"
     % (
+        SPEED_PROFILE,
         RUN_MODE,
         FRAME_W,
         FRAME_H,

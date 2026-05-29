@@ -15,10 +15,14 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_PY = ROOT / "maixcam" / "main.py"
 PREVIEW_PY = ROOT / "maixcam" / "preview.py"
 MODEL_DIR = ROOT / "release" / "maixcam_copy_to_device" / "root" / "models"
-MODEL_FILES = [
-    MODEL_DIR / "snail_eggs_yolov8n_320x320.mud",
-    MODEL_DIR / "snail_eggs_yolov8n_320x320.cvimodel",
-]
+
+
+def model_files():
+    if not MODEL_DIR.exists():
+        return []
+    return sorted(
+        p for p in MODEL_DIR.iterdir() if p.suffix.lower() in {".mud", ".cvimodel"}
+    )
 
 
 def connect(args):
@@ -113,7 +117,7 @@ def probe(args):
         run_checked(
             ssh,
             "echo connected; hostname; python -V; "
-            "ls -lh /root/models/snail_eggs_yolov8n_320x320.* 2>/dev/null || true",
+            "ls -lh /root/models/snail_eggs_yolov8n_* 2>/dev/null || true",
         )
     finally:
         ssh.close()
@@ -129,7 +133,7 @@ def deploy(args, ssh=None):
         try:
             upload_file(sftp, MAIN_PY, f"{args.remote_dir}/main.py")
             if not args.skip_models:
-                for model in MODEL_FILES:
+                for model in model_files():
                     upload_file(sftp, model, f"/root/models/{model.name}")
         finally:
             sftp.close()
@@ -261,11 +265,11 @@ def install_autostart(args):
             f"printf %s {shlex.quote(args.app_id)} > /maixapp/auto_start.txt && "
             f"rm -f /root/snail_egg/headless {shlex.quote(app_dir)}/headless && "
             f"chmod 644 {shlex.quote(app_dir)}/main.py "
-            "/root/models/snail_eggs_yolov8n_320x320.mud "
-            "/root/models/snail_eggs_yolov8n_320x320.cvimodel && "
+            "/root/models/snail_eggs_yolov8n_*.mud "
+            "/root/models/snail_eggs_yolov8n_*.cvimodel && "
             "sync && "
             "echo Installed app: $(cat /maixapp/auto_start.txt) && "
-            f"ls -lh {shlex.quote(app_dir)}/main.py /root/models/snail_eggs_yolov8n_320x320.*"
+            f"ls -lh {shlex.quote(app_dir)}/main.py /root/models/snail_eggs_yolov8n_*"
         )
         run_checked(ssh, command, timeout=20)
         if args.reboot:

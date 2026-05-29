@@ -9,8 +9,10 @@ data/
 runs/
 runs_yolo/
 dist/
+outputs/
 *.cache
 *.log
+/yolo*.pt
 models/*hardneg*
 
 # Local media tests

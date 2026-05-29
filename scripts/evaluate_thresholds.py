@@ -11,12 +11,21 @@ from ultralytics import YOLO
 from safety_filter import pass_laser_safe_filter
 
 
+def parse_imgsz(value: str) -> int | list[int]:
+    parts = [part.strip() for part in str(value).replace("x", ",").split(",") if part.strip()]
+    if len(parts) == 1:
+        return int(parts[0])
+    if len(parts) == 2:
+        return [int(parts[0]), int(parts[1])]
+    raise argparse.ArgumentTypeError("imgsz must be an int or HEIGHT,WIDTH, for example 640 or 480,640")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate detection thresholds on a YOLO-format split.")
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--data-root", type=Path, default=Path("data/yolo_pinkeggs_full_960"))
     p.add_argument("--split", default="test")
-    p.add_argument("--imgsz", type=int, default=320)
+    p.add_argument("--imgsz", type=parse_imgsz, default=320)
     p.add_argument("--iou-match", type=float, default=0.5)
     p.add_argument("--confs", default="0.35,0.50,0.60,0.65,0.70,0.75,0.80")
     p.add_argument("--safe-filter", action="store_true")

@@ -15,13 +15,12 @@ if ([string]::IsNullOrWhiteSpace($HostName)) {
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $MainPy = Join-Path $Root "maixcam\main.py"
-$Mud = Join-Path $Root "release\maixcam_copy_to_device\root\models\snail_eggs_yolov8n_320x320.mud"
-$Cvi = Join-Path $Root "release\maixcam_copy_to_device\root\models\snail_eggs_yolov8n_320x320.cvimodel"
+$ModelDir = Join-Path $Root "release\maixcam_copy_to_device\root\models"
+$ModelFiles = @(Get-ChildItem -LiteralPath $ModelDir -Filter "snail_eggs_yolov8n_*" -File -ErrorAction SilentlyContinue)
 
 if (-not (Test-Path $MainPy)) { throw "Missing $MainPy" }
 if (-not $SkipModels) {
-  if (-not (Test-Path $Mud)) { throw "Missing $Mud" }
-  if (-not (Test-Path $Cvi)) { throw "Missing $Cvi" }
+  if ($ModelFiles.Count -eq 0) { throw "Missing model files in $ModelDir" }
 }
 
 $Target = "$User@$HostName"
@@ -56,10 +55,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if (-not $SkipModels) {
   Write-Host "==> Upload model files"
-  scp @ScpArgs $Mud "${Target}:/root/models/snail_eggs_yolov8n_320x320.mud"
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  scp @ScpArgs $Cvi "${Target}:/root/models/snail_eggs_yolov8n_320x320.cvimodel"
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  foreach ($ModelFile in $ModelFiles) {
+    scp @ScpArgs $ModelFile.FullName "${Target}:/root/models/$($ModelFile.Name)"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  }
 }
 
 if ($NoRun) {
