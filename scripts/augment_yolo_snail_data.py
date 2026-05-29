@@ -182,6 +182,8 @@ def generate_split(root: Path, split: str, montage_count: int, negative_count: i
         raise SystemExit(f"No egg crops found for split {split}.")
     image_dir = root / "images" / split
     label_dir = root / "labels" / split
+    existing_montage = len(list(image_dir.glob("aug_montage_*.jpg")))
+    existing_negative = len(list(image_dir.glob("aug_hardneg_*.jpg")))
 
     for idx in range(montage_count):
         width, height = rng.choice([(640, 384), (640, 480), (512, 512), (768, 432)])
@@ -193,7 +195,7 @@ def generate_split(root: Path, split: str, montage_count: int, negative_count: i
             box = paste_crop(canvas, rng.choice(crops), rng)
             if box is not None and box[2] - box[0] >= 4 and box[3] - box[1] >= 4:
                 labels.append(to_yolo_line(box, width, height))
-        name = f"aug_montage_{idx:04d}.jpg"
+        name = f"aug_montage_{existing_montage + idx:04d}.jpg"
         cv2.imwrite(str(image_dir / name), canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         (label_dir / f"{Path(name).stem}.txt").write_text("\n".join(labels) + "\n", encoding="utf-8")
 
@@ -201,7 +203,7 @@ def generate_split(root: Path, split: str, montage_count: int, negative_count: i
         width, height = rng.choice([(640, 384), (640, 480), (512, 512), (768, 432)])
         canvas = concrete_background(width, height, rng)
         draw_hard_distractors(canvas, rng)
-        name = f"aug_hardneg_{idx:04d}.jpg"
+        name = f"aug_hardneg_{existing_negative + idx:04d}.jpg"
         cv2.imwrite(str(image_dir / name), canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         (label_dir / f"{Path(name).stem}.txt").write_text("", encoding="utf-8")
 

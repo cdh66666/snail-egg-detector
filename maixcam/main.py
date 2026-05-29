@@ -7,12 +7,12 @@ from maix import camera, display, image, nn, app, time
 # Put the MUD and model file under /root/models/ on the MaixCam.
 
 MODEL = "/root/models/snail_eggs_yolov8n_320x320.mud"
-CONF_TH = 0.05
+CONF_TH = 0.15
 IOU_TH = 0.35
 MAX_TARGETS = 32
-MIN_MODEL_CONF = 0.05
-STRONG_MODEL_CONF = 0.25
-LOW_CONF_MIN_PINK_RATIO = 0.20
+MIN_MODEL_CONF = 0.15
+STRONG_MODEL_CONF = 0.50
+LOW_CONF_MIN_PINK_RATIO = 0.03
 LOW_CONF_MIN_AREA = 24
 
 # 0 = raw YOLO debug: draw every model detection, no color filtering.
@@ -45,10 +45,10 @@ MAX_BOX_SIDE_RATIO = 0.52
 MIN_ASPECT = 0.18
 MAX_ASPECT = 5.5
 ENABLE_COLOR_GATE = True
-MIN_PINK_RATIO = 0.18
-MIN_PINK_PIXELS = 3
+MIN_PINK_RATIO = 0.03
+MIN_PINK_PIXELS = 1
 MAX_RED_BAD_RATIO = 0.55
-RED_BAD_DOMINANCE = 2.6
+RED_BAD_DOMINANCE = 2.2
 COLOR_GRID = 6
 MAX_COLOR_CHECKS = 36
 REQUIRE_STABLE_FRAMES = 2
@@ -124,30 +124,14 @@ def pink_pixel(r, g, b):
     if r >= 145 and g >= 75 and b < 50 and (r - g) >= 24:
         return False
 
-    saturated_pink = (
-        r >= 82
-        and b >= 48
-        and g >= 32
-        and (r - g) >= 2
-        and (b - g) >= -48
-        and (r - b) <= 145
+    return (
+        r >= 80
+        and b >= 50
+        and g >= 40
+        and ((r - g) >= 10 or (b - g) >= 12)
+        and (r - b) <= 120
+        and (r - b) >= -45
     )
-    pale_pink = (
-        r >= 118
-        and b >= 82
-        and g >= 62
-        and (r - g) >= -8
-        and (b - g) >= -42
-        and (r - b) <= 130
-    )
-    magenta_pink = (
-        r >= 72
-        and b >= 60
-        and (r - g) >= 4
-        and (b - g) >= -18
-        and (r - b) <= 125
-    )
-    return saturated_pink or pale_pink or magenta_pink
 
 
 def red_bad_pixel(r, g, b):
@@ -258,10 +242,13 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
         if red_ratio > best_red_ratio:
             best_red_ratio = red_ratio
         area = w * h
+        red_reject = red_ratio > MAX_RED_BAD_RATIO and red_ratio > pink_ratio * RED_BAD_DOMINANCE
         score_ok = obj.score >= MIN_MODEL_CONF
-        if score_ok and obj.score < STRONG_MODEL_CONF:
-            score_ok = pink_ratio >= LOW_CONF_MIN_PINK_RATIO and area >= LOW_CONF_MIN_AREA
-        if not ok or not score_ok:
+        if score_ok and obj.score >= STRONG_MODEL_CONF:
+            color_ok = not red_reject
+        else:
+            color_ok = ok and pink_ratio >= LOW_CONF_MIN_PINK_RATIO and area >= LOW_CONF_MIN_AREA
+        if not color_ok or not score_ok:
             continue
         kept.append(obj)
     return kept, best_pink_ratio, best_red_ratio, rows

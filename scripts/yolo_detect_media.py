@@ -251,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--row-height", type=int, default=0, help="Row bucket size for top-left to bottom-right IDs. 0 = auto.")
     parser.add_argument("--box-shrink", type=float, default=0.0, help="Optional visual box shrink ratio, 0.0 to 0.45.")
     parser.add_argument("--safe-filter", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--min-pink-ratio", type=float, default=0.018)
+    parser.add_argument("--min-pink-ratio", type=float, default=0.03)
     parser.add_argument("--no-json", action="store_true")
     return parser.parse_args()
 

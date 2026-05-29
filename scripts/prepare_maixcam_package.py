@@ -33,7 +33,7 @@ def main() -> None:
     copy_file(ROOT / "maixcam" / "main.py", out / "device" / "main.py")
     copy_file(ROOT / "README.md", out / "README_DEPLOY.md")
 
-    image_dir = ROOT / "data" / "yolo_pinkeggs_full_960" / "images" / "train"
+    image_dir = ROOT / "data" / "yolo_pinkeggs_hardneg_v2" / "images" / "train"
     images = sorted([p for p in image_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
     if not images:
         raise SystemExit(f"No calibration images found in {image_dir}")
