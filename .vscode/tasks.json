@@ -1,0 +1,103 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "MaixCam: Probe",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/maix_remote.ps1",
+        "probe"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "MaixCam: Deploy main + models + run",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/maix_remote.ps1",
+        "deploy-run"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "MaixCam: Deploy main only + run",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/maix_remote.ps1",
+        "deploy-run",
+        "--skip-models"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "MaixCam: Deploy only",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/maix_remote.ps1",
+        "deploy"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "MaixCam: Run 20s for Codex debug",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/maix_remote.ps1",
+        "deploy-run",
+        "--skip-models",
+        "--run-seconds",
+        "20"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "MaixCam: Reboot board",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/maix_remote.ps1",
+        "reboot"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "MaixCam: Install autostart + reboot",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/maix_remote.ps1",
+        "install-autostart",
+        "--app-id",
+        "cdh1_",
+        "--reboot"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

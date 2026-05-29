@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Large local data and training outputs
+data/
+runs/
+runs_yolo/
+dist/
+*.cache
+*.log
+models/*hardneg*
+
+# Local media tests
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.m4v
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/tasks.json
+.idea/
+.codex_tools/

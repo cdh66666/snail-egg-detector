@@ -1,2 +1,8 @@
-# Auto detect text files and perform LF normalization
 * text=auto
+*.jpg binary
+*.png binary
+*.pt binary
+*.onnx binary
+*.cvimodel binary
+*.mud text eol=lf
+*.zip binary

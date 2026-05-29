@@ -1,0 +1,8 @@
+opencv-python
+numpy
+requests
+ultralytics
+onnx
+onnxruntime
+onnxslim
+paramiko<4
