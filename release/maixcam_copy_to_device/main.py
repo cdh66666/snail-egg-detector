@@ -7,13 +7,13 @@ from maix import camera, display, image, nn, app, time
 # Put the MUD and model file under /root/models/ on the MaixCam.
 
 MODEL = "/root/models/snail_eggs_yolov8n_640x480.mud"
-CONF_TH = 0.25
+CONF_TH = 0.18
 IOU_TH = 0.35
 MAX_TARGETS = 32
-MIN_MODEL_CONF = 0.25
+MIN_MODEL_CONF = 0.18
 STRONG_MODEL_CONF = 0.50
-LOW_CONF_MIN_PINK_RATIO = 0.03
-LOW_CONF_MIN_AREA = 24
+LOW_CONF_MIN_PINK_RATIO = 0.035
+LOW_CONF_MIN_AREA = 18
 
 # 0 = raw YOLO debug: draw every model detection, no color filtering.
 # 1 = color debug: raw boxes are yellow, pink-passed boxes are green.
@@ -21,12 +21,9 @@ LOW_CONF_MIN_AREA = 24
 # 3 = auto tune: color debug + save frames + print every raw/candidate stat.
 RUN_MODE = 2
 
-# Runtime speed profiles:
-# - "full_frame": 640x480 model, one inference per camera frame, no memory boxes.
-# - "accuracy": legacy 320x320 model, scan all 6 tiles every frame.
-# - "balanced": legacy 320x320 model, scan 3 tiles per frame with short memory.
-# - "fast": legacy 320x320 model, scan 2 tiles per frame.
-# Keep the camera at 640x480 so aiming coordinates stay in the real view.
+# Runtime speed profiles. The packaged release uses "full_frame": one 640x480
+# inference per camera frame, no stale memory boxes. Tile profiles are kept only
+# for experiments with smaller custom models.
 SPEED_PROFILE = "full_frame"
 
 # The current deployed model input is 640x480, so the detector sees the whole
@@ -44,15 +41,15 @@ MEMORY_TTL_FRAMES = 36
 # After field tuning, raise CONF_TH, turn ENABLE_COLOR_GATE back on, and require
 # stable frames before sending targets to any actuator.
 MIN_BOX_AREA = 18
-MAX_BOX_AREA_RATIO = 0.12
-MAX_BOX_SIDE_RATIO = 0.52
+MAX_BOX_AREA_RATIO = 0.32
+MAX_BOX_SIDE_RATIO = 0.86
 MIN_ASPECT = 0.18
 MAX_ASPECT = 5.5
 ENABLE_COLOR_GATE = True
-MIN_PINK_RATIO = 0.03
+MIN_PINK_RATIO = 0.035
 MIN_PINK_PIXELS = 1
 MAX_RED_BAD_RATIO = 0.55
-RED_BAD_DOMINANCE = 2.2
+RED_BAD_DOMINANCE = 2.4
 COLOR_GRID = 6
 MAX_COLOR_CHECKS = 36
 REQUIRE_STABLE_FRAMES = 2

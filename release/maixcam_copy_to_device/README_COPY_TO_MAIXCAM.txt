@@ -1,11 +1,12 @@
 MaixCam 福寿螺卵识别部署包
 
-当前默认版本：
+当前版本：
 - 模型：snail_eggs_yolov8n_640x480.mud + snail_eggs_yolov8n_640x480.cvimodel
 - 程序：main.py
-- 运行模式：SPEED_PROFILE = "full_frame"
 - 摄像头：640x480
-- 特点：单次全画面推理，不使用 tile 轮询，不显示记忆残留框
+- 推理：full_frame，全画面单次推理
+- 默认阈值：CONF_TH = 0.18
+- 后处理：模型分数 + 粉色比例 + 红色排除 + 大小/形状过滤
 
 复制位置：
 
@@ -21,13 +22,6 @@ MaixCam 福寿螺卵识别部署包
    放到：
    /root/models/snail_eggs_yolov8n_640x480.cvimodel
 
-开机自启：
-
-如果 app_id 是 cdh1_，则：
-
-  /maixapp/apps/cdh1_/main.py
-  /maixapp/auto_start.txt 的内容写成：cdh1_
-
 Mac 终端示例：
 
   MAIX_IP=192.168.10.107
@@ -37,5 +31,9 @@ Mac 终端示例：
   scp root/models/snail_eggs_yolov8n_640x480.* root@$MAIX_IP:/root/models/
   ssh root@$MAIX_IP "echo $APP_ID > /maixapp/auto_start.txt && sync && reboot"
 
+重启后检查：
+
+  ssh root@$MAIX_IP "cat /maixapp/auto_start.txt && ps | grep main.py"
+
 安全提醒：
-程序只输出视觉候选目标。接入激光或其他执行器前，必须使用低功率指示灯或断开激光测试，并配合物理使能、急停、遮光/门禁联锁和人工确认流程。
+程序只输出视觉候选目标。接入激光或其他执行器前，必须使用低功率指示灯或断开激光测试，并配合物理使能、急停、遮光门禁联锁和人工确认流程。

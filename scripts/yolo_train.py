@@ -26,10 +26,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--optimizer", default="auto")
+    parser.add_argument("--lr0", type=float, default=0.01)
+    parser.add_argument("--lrf", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--project", default="runs_yolo")
     parser.add_argument("--name", default="pinkeggs_yolov8n_320")
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--rect", action="store_true", help="Use rectangular batches during training.")
+    parser.add_argument("--hsv-h", type=float, default=0.015, help="Hue augmentation strength.")
+    parser.add_argument("--hsv-s", type=float, default=0.7, help="Saturation augmentation strength.")
+    parser.add_argument("--hsv-v", type=float, default=0.4, help="Value/brightness augmentation strength.")
+    parser.add_argument("--degrees", type=float, default=0.0, help="Rotation augmentation in degrees.")
+    parser.add_argument("--translate", type=float, default=0.1, help="Translate augmentation fraction.")
+    parser.add_argument("--scale", type=float, default=0.5, help="Scale augmentation fraction.")
+    parser.add_argument("--mosaic", type=float, default=1.0, help="Mosaic augmentation probability.")
+    parser.add_argument("--mixup", type=float, default=0.0, help="MixUp augmentation probability.")
+    parser.add_argument("--close-mosaic", type=int, default=10, help="Disable mosaic for final N epochs.")
     parser.add_argument("--export-onnx", action="store_true")
     return parser.parse_args()
 
@@ -44,10 +57,23 @@ def main() -> None:
         batch=args.batch,
         workers=args.workers,
         device=args.device,
+        optimizer=args.optimizer,
+        lr0=args.lr0,
+        lrf=args.lrf,
+        weight_decay=args.weight_decay,
         project=args.project,
         name=args.name,
         patience=args.patience,
         rect=args.rect,
+        hsv_h=args.hsv_h,
+        hsv_s=args.hsv_s,
+        hsv_v=args.hsv_v,
+        degrees=args.degrees,
+        translate=args.translate,
+        scale=args.scale,
+        mosaic=args.mosaic,
+        mixup=args.mixup,
+        close_mosaic=args.close_mosaic,
         cache=False,
         verbose=True,
     )

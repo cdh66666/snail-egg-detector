@@ -61,8 +61,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\maix_remote.ps1 inst
 ```text
 /maixapp/apps/cdh1_/main.py
 /maixapp/auto_start.txt
-/root/models/snail_eggs_yolov8n_320x320.mud
-/root/models/snail_eggs_yolov8n_320x320.cvimodel
+/root/models/snail_eggs_yolov8n_640x480.mud
+/root/models/snail_eggs_yolov8n_640x480.cvimodel
 ```
 
 ## 6. VSCode 任务

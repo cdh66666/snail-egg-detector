@@ -1,10 +1,20 @@
 # MaixCam 福寿螺卵实时识别
 
-这个仓库用于在 Sipeed MaixCam 上实时识别福寿螺卵团，并在 640x480 摄像头画面中标出紧贴目标的框、中心十字和从左上到右下排序的 ID。当前默认版本是 640x480 YOLOv8n 单次全画面推理，不使用 tile 轮询和短时记忆框，适合后续做低延迟瞄准验证。
+基于 YOLOv8n 和 Sipeed MaixCam 的福寿螺卵团实时检测程序。项目默认使用 640x480 摄像头画面做全画面单次推理，在屏幕上标出紧贴目标的检测框、中心十字和从左上到右下排序的 ID。
+
+当前版本面向低延迟瞄准验证：不使用 tile 轮询，不保留旧帧记忆框，避免同一位置反复残留识别框。
 
 > 安全提醒：本项目只输出视觉候选目标和坐标。任何激光、机械臂、喷洒或消杀执行器都必须加入物理使能、急停、遮光/门禁联锁、低功率预瞄准验证和人工确认流程。首次调试请断开激光，或用低功率指示灯替代。
 
 ![检测流程](assets/diagrams/pipeline.svg)
+
+## 效果示例
+
+![测试样本 1](assets/results/test_samples_1.jpg)
+
+![测试样本 2](assets/results/test_samples_2.jpg)
+
+![测试样本 3](assets/results/test_samples_3.jpg)
 
 ## 当前版本
 
@@ -13,26 +23,29 @@
 | 设备 | Sipeed MaixCam / MaixPy |
 | 模型 | YOLOv8n |
 | 输入 | 640x480 |
-| 运行方式 | 单次全画面推理 |
-| 模型文件 | `snail_eggs_yolov8n_640x480.cvimodel` + `snail_eggs_yolov8n_640x480.mud` |
-| 程序文件 | `release/maixcam_copy_to_device/main.py` |
+| 推理方式 | 全画面单次推理 |
+| MaixCam 模型 | `snail_eggs_yolov8n_640x480.cvimodel` + `snail_eggs_yolov8n_640x480.mud` |
+| 默认程序 | `release/maixcam_copy_to_device/main.py` |
 | 开机自启 | 写入 `/maixapp/auto_start.txt` |
 
-关键设备端参数在 [maixcam/main.py](maixcam/main.py) 顶部：
+关键参数在 [maixcam/main.py](maixcam/main.py) 顶部：
 
 ```python
 MODEL = "/root/models/snail_eggs_yolov8n_640x480.mud"
-CONF_TH = 0.25
-MIN_MODEL_CONF = 0.25
+CONF_TH = 0.18
+MIN_MODEL_CONF = 0.18
+MAX_BOX_AREA_RATIO = 0.32
+MAX_BOX_SIDE_RATIO = 0.86
+MIN_PINK_RATIO = 0.035
 SPEED_PROFILE = "full_frame"
 FRAME_W = 640
 FRAME_H = 480
 USE_TILED_INFERENCE = False
 ```
 
-`full_frame` 模式每一帧只跑一次 640x480 模型，不使用上一轮 tile 的记忆目标，因此不会出现固定位置不断残留旧框的问题。
+`CONF_TH=0.18` 是当前实机部署的召回优先设置。接入执行器前建议先把 `CONF_TH` 和 `MIN_MODEL_CONF` 提高到 `0.25` 或 `0.35`，用低功率指示灯验证坐标稳定性后再调整。
 
-## 验收指标
+## 离线评估
 
 当前上线权重：
 
@@ -40,51 +53,41 @@ USE_TILED_INFERENCE = False
 runs/detect/runs_yolo/pinkeggs_yolov8n_640x480_hardneg_v5/weights/best.pt
 ```
 
-导出的 MaixCam 文件：
+对应的可发布文件已经放在：
 
 ```text
+models/snail_eggs_yolov8n_640x480.pt
+models/snail_eggs_yolov8n_640x480.onnx
 release/maixcam_copy_to_device/root/models/snail_eggs_yolov8n_640x480.cvimodel
 release/maixcam_copy_to_device/root/models/snail_eggs_yolov8n_640x480.mud
 ```
 
-离线评估结果：
-
 | 评估项 | 设置 | 结果 |
 | --- | --- | --- |
-| YOLO test split | `imgsz=480,640`，`conf=0.25`，带安全过滤 | TP 87 / FP 4 / FN 8，Recall 91.58%，Precision 95.60% |
-| YOLO test split | `imgsz=480,640`，`conf=0.15`，带安全过滤 | TP 88 / FP 6 / FN 7，Recall 92.63%，Precision 93.62% |
-| COCO 负样本 holdout | 3700 张未进入训练的 COCO 图，`conf=0.25`，带安全过滤 | 2 张图出现误检，图像级误检率 0.054% |
-| COCO 负样本 holdout | 3700 张未进入训练的 COCO 图，`conf=0.35`，带安全过滤 | 1 张图出现误检，图像级误检率 0.027% |
+| YOLO test split | `imgsz=480,640`，`conf=0.18`，安全过滤 | TP 91 / FP 6 / FN 4，Recall 95.79%，Precision 93.81% |
+| YOLO test split | `imgsz=480,640`，`conf=0.25`，安全过滤 | TP 90 / FP 4 / FN 5，Recall 94.74%，Precision 95.74% |
+| 混合负样本 holdout | 5183 张 COCO + Bing/Wikimedia/混杂负样本，`conf=0.18`，安全过滤 | 3 张图误检，图像级误检率 0.058% |
+| 混合负样本 holdout | 5183 张 COCO + Bing/Wikimedia/混杂负样本，`conf=0.25`，安全过滤 | 2 张图误检，图像级误检率 0.039% |
 
-当前设备端默认采用 `conf=0.25`。如果要接执行器，可以先把 `CONF_TH` 和 `MIN_MODEL_CONF` 提到 `0.35` 做低功率验证，再按现场召回需求逐步调低。
-
-效果示例：
-
-![测试样本 1](assets/results/test_samples_1.jpg)
-![测试样本 2](assets/results/test_samples_2.jpg)
-![测试样本 3](assets/results/test_samples_3.jpg)
-
-## 仓库结构
+评估结果保存在：
 
 ```text
-assets/                         说明图和检测示例
-docs/                           VSCode + SSH 工作流说明
-maixcam/                        MaixCam 实时检测程序和 MUD 模板
-models/                         PC 端训练/导出模型
-release/maixcam_copy_to_device/ 可直接复制到 MaixCam 的部署包
-scripts/                        采集、训练、评估、转换、部署脚本
-requirements.txt                PC/Mac 端 Python 依赖
+runs/eval_640x480_v5_revised_filter.json
+runs/eval_640x480_v5_revised_neg_conf018.json
 ```
 
-本地大数据和训练输出默认不进入 Git：`data/`、`runs/`、`dist/`、`*.cache`、临时导出的权重等。
+`runs/` 默认不提交到 Git；如果需要复核，请在本地重新运行评估脚本。
 
-## Mac 学生快速部署
+## 快速部署到 MaixCam
 
-学生不需要重新训练模型，只要把 release 包复制到 MaixCam。
+仓库已经包含可直接复制到设备的部署包：
 
-1. MaixCam 连上同一个网络，确认 IP，例如 `192.168.10.107`。
-2. 在 Mac 终端进入仓库目录。
-3. 上传程序和模型：
+```text
+release/maixcam_copy_to_device/
+release/maixcam_copy_to_device.zip
+```
+
+Mac / Linux 终端示例：
 
 ```bash
 MAIX_IP=192.168.10.107
@@ -96,17 +99,21 @@ scp release/maixcam_copy_to_device/root/models/snail_eggs_yolov8n_640x480.* root
 ssh root@$MAIX_IP "echo $APP_ID > /maixapp/auto_start.txt && sync && reboot"
 ```
 
-4. 重启后确认：
+重启后检查：
 
 ```bash
 ssh root@$MAIX_IP "cat /maixapp/auto_start.txt && ps | grep main.py"
 ```
 
-看到 `python3 /maixapp/apps/cdh1_/main.py auto_start` 就说明开机自启已生效。
+看到类似下面的进程即部署成功：
 
-## Windows 自动部署
+```text
+python3 /maixapp/apps/cdh1_/main.py auto_start
+```
 
-仓库里带了基于 SSH 的部署脚本。先安装依赖：
+## Windows / VSCode 自动部署
+
+安装依赖：
 
 ```powershell
 python -m venv .venv
@@ -119,14 +126,19 @@ pip install -r requirements.txt
 ```powershell
 $env:MAIXCAM_HOST='192.168.10.107'
 $env:MAIXCAM_PASSWORD='root'
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\maix_remote.ps1 install-autostart --app-id cdh1_ --reboot
+$env:PYTHONPATH='.codex_tools\paramiko'
+python scripts\maix_remote.py install-autostart --app-id cdh1_ --reboot
 ```
 
-这条命令会上传 `main.py` 和 release 里的模型文件，写入 `/maixapp/auto_start.txt`，然后重启设备。
+只更新 `main.py`、不重传模型：
 
-更多细节见 [docs/vscode_maixcam_workflow.md](docs/vscode_maixcam_workflow.md)。
+```powershell
+python scripts\maix_remote.py install-autostart --app-id cdh1_ --skip-models --reboot
+```
 
-## PC/Mac 图片和视频检测
+更多 VSCode + SSH 流程见 [docs/vscode_maixcam_workflow.md](docs/vscode_maixcam_workflow.md)。
+
+## PC / Mac 图片和视频检测
 
 安装依赖：
 
@@ -141,7 +153,7 @@ pip install -r requirements.txt
 ```bash
 python scripts/yolo_detect_media.py path/to/image.jpg \
   --model models/snail_eggs_yolov8n_640x480.pt \
-  --conf 0.25 \
+  --conf 0.18 \
   --safe-filter
 ```
 
@@ -150,91 +162,46 @@ python scripts/yolo_detect_media.py path/to/image.jpg \
 ```bash
 python scripts/yolo_detect_media.py path/to/video.mp4 \
   --model models/snail_eggs_yolov8n_640x480.pt \
-  --conf 0.25 \
+  --conf 0.18 \
   --safe-filter \
   --video-stride 1
 ```
 
-输出默认保存到 `runs/yolo_media/`，包括标注图片/视频和 JSON 坐标。
+输出默认保存到 `runs/yolo_media/`，包括标注图、标注视频和 JSON 坐标。
 
 ## 复现训练
 
-训练数据不直接提交到 Git。复现时需要准备正样本和负样本。
+训练数据默认不提交到 Git。复现训练时需要准备 YOLO 格式数据集：
 
-1. 收集正样本并导出 YOLO 标签：
-
-```bash
-python scripts/collect_pinkeggs_dataset.py --source full --limit 500 --output-dir data/pinkeggs_full_500
-python scripts/export_yolo_labels.py --dataset data/pinkeggs_full_500/annotations.json --output-dir data/yolo_pinkeggs_clean_500 --clean
+```text
+data/yolo_pinkeggs_hardneg_v5_640x480/
+  images/train
+  images/val
+  images/test
+  labels/train
+  labels/val
+  labels/test
+  pinkeggs_hardneg.yaml
 ```
 
-2. 准备生活场景负样本。推荐 COCO val2017，也可以加入自己拍摄的红色电机、线材、贴纸、手套、玩具、反光物等干扰物：
+现场采集到新的光照、距离、角度样本后，可以用训练集增强脚本生成额外鲁棒性样本：
 
 ```bash
-mkdir -p data/coco
-curl -L --fail --retry 3 -o data/coco/val2017.zip http://images.cocodataset.org/zips/val2017.zip
-unzip -o data/coco/val2017.zip -d data/coco
+python scripts/augment_field_robustness.py \
+  --base-root data/yolo_pinkeggs_hardneg_v5_640x480 \
+  --output-root data/yolo_pinkeggs_hardneg_v6_field_640x480 \
+  --overwrite
 ```
 
-3. 构建 hard-negative 数据集：
+这个脚本只扩充训练集，默认不改验证集和测试集，方便保持评估相对公平。
 
-```bash
-python scripts/build_hard_negative_yolo.py \
-  --positive-root data/yolo_pinkeggs_clean_500 \
-  --negative-dir data/coco/val2017 \
-  --output-dir data/yolo_pinkeggs_hardneg_v2 \
-  --clean \
-  --seed 20260529
-
-python scripts/augment_yolo_snail_data.py \
-  --data-root data/yolo_pinkeggs_hardneg_v2 \
-  --train-montage 220 \
-  --train-negatives 360 \
-  --val-montage 30 \
-  --val-negatives 70 \
-  --seed 20260529
-```
-
-4. 先训练 320 基线模型：
-
-```bash
-python scripts/yolo_train.py \
-  --data data/yolo_pinkeggs_hardneg_v2/pinkeggs_hardneg.yaml \
-  --base-model yolov8n.pt \
-  --epochs 70 \
-  --imgsz 320 \
-  --batch 32 \
-  --device 0 \
-  --workers 0 \
-  --project runs_yolo \
-  --name pinkeggs_yolov8n_hardneg_v2 \
-  --patience 16 \
-  --export-onnx
-```
-
-5. 用 320 基线挖 640x480 难负样本：
-
-```bash
-python scripts/mine_false_positives.py \
-  --model runs/detect/runs_yolo/pinkeggs_yolov8n_hardneg_v2/weights/best.pt \
-  --base-data-root data/yolo_pinkeggs_hardneg_v2 \
-  --output-data-root data/yolo_pinkeggs_hardneg_v5_640x480 \
-  --negative-dir data/coco/val2017 \
-  --imgsz 480,640 \
-  --conf 0.05 \
-  --device 0 \
-  --max-full-images 1400 \
-  --max-crops 2200 \
-  --clean
-```
-
-6. 训练当前 640x480 上线模型：
+训练当前 640x480 模型：
 
 ```bash
 python scripts/yolo_train.py \
   --data data/yolo_pinkeggs_hardneg_v5_640x480/pinkeggs_hardneg.yaml \
-  --base-model runs/detect/runs_yolo/pinkeggs_yolov8n_hardneg_v2/weights/best.pt \
-  --epochs 35 \
+  --base-model yolov8n.pt \
+  --epochs 45 \
   --imgsz 640 \
   --export-imgsz 480,640 \
   --batch 12 \
@@ -242,15 +209,18 @@ python scripts/yolo_train.py \
   --workers 0 \
   --project runs_yolo \
   --name pinkeggs_yolov8n_640x480_hardneg_v5 \
-  --patience 10 \
+  --patience 12 \
+  --rect \
   --export-onnx
 ```
 
-`--imgsz 640` 用于训练增强，`--export-imgsz 480,640` 用于导出固定 640x480 ONNX，匹配 MaixCam 摄像头画面。
+说明：
 
-## 评估命令
+- `--imgsz 640` 用于训练增强。
+- `--export-imgsz 480,640` 导出固定 640x480 ONNX，匹配 MaixCam 摄像头。
+- 实际上线前必须重新跑阈值扫描和负样本误检评估。
 
-阈值扫描：
+评估阈值：
 
 ```bash
 python scripts/evaluate_thresholds.py \
@@ -259,37 +229,32 @@ python scripts/evaluate_thresholds.py \
   --split test \
   --imgsz 480,640 \
   --safe-filter \
-  --confs 0.15,0.20,0.25,0.30,0.35,0.40,0.50 \
-  --output runs/eval_640x480_v5_safe.json
+  --confs 0.10,0.12,0.15,0.18,0.20,0.25,0.30,0.35 \
+  --output runs/eval_640x480_v5_revised_filter.json
 ```
 
-独立负样本误检率：
+评估负样本误检：
 
 ```bash
 python scripts/evaluate_negative_fps.py \
   --model runs/detect/runs_yolo/pinkeggs_yolov8n_640x480_hardneg_v5/weights/best.pt \
   --negative-dir data/coco/val2017 \
+  --negative-dir data/hard_negatives_bing_v2 \
+  --negative-dir data/hard_negatives_mixed_v2 \
+  --negative-dir data/hard_negatives_wikimedia_v2 \
   --imgsz 480,640 \
-  --conf 0.25 \
+  --conf 0.18 \
+  --device 0 \
   --safe-filter \
   --exclude-yolo-root data/yolo_pinkeggs_hardneg_v5_640x480 \
-  --output runs/eval_640x480_v5_coco_holdout_conf025.json
+  --output runs/eval_640x480_v5_revised_neg_conf018.json
 ```
 
-## 转换到 MaixCam
+## 转换为 MaixCam 模型
 
-MaixCam 不能直接运行 `.pt` 或普通 `.onnx`。转换链路是：
-
-```text
-YOLO .pt -> ONNX .onnx -> MaixCam .cvimodel + .mud
-```
-
-准备转换目录：
+先把 ONNX 和 MUD 准备到转换目录：
 
 ```bash
-cp runs/detect/runs_yolo/pinkeggs_yolov8n_640x480_hardneg_v5/weights/best.pt models/snail_eggs_yolov8n_640x480.pt
-cp runs/detect/runs_yolo/pinkeggs_yolov8n_640x480_hardneg_v5/weights/best.onnx models/snail_eggs_yolov8n_640x480.onnx
-
 python scripts/prepare_maixcam_package.py \
   --model-name snail_eggs_yolov8n_640x480 \
   --onnx models/snail_eggs_yolov8n_640x480.onnx \
@@ -299,16 +264,15 @@ python scripts/prepare_maixcam_package.py \
   --calibration-images 200
 ```
 
-在 TPU-MLIR 环境中转换：
+在 WSL / TPU-MLIR 环境中转换：
 
 ```bash
 VALIDATE_TRANSFORM=0 bash scripts/wsl_convert_maixcam_snail_eggs.sh
 ```
 
-成功后会更新：
+转换成功后会更新：
 
 ```text
-release/maixcam_copy_to_device/main.py
 release/maixcam_copy_to_device/root/models/snail_eggs_yolov8n_640x480.cvimodel
 release/maixcam_copy_to_device/root/models/snail_eggs_yolov8n_640x480.mud
 release/maixcam_copy_to_device.zip
@@ -316,7 +280,7 @@ release/maixcam_copy_to_device.zip
 
 ## 坐标输出
 
-状态行：
+设备端串口/终端会输出状态行：
 
 ```text
 STAT,<frame>,FPS,<fps>,RAW,<raw_count>,CAND,<candidate_count>,EGGS,<target_count>,TILE,<tile_info>
@@ -328,22 +292,52 @@ STAT,<frame>,FPS,<fps>,RAW,<raw_count>,CAND,<candidate_count>,EGGS,<target_count
 EGG,<id>,<cx>,<cy>,<x>,<y>,<w>,<h>,<score>,<cx_norm>,<cy_norm>
 ```
 
-`id` 是从左上到右下排序后的编号；`cx/cy` 是检测框中心像素坐标；`cx_norm/cy_norm` 是 0 到 1 的归一化中心点。
+字段说明：
+
+- `id`：从左上到右下排序后的目标编号。
+- `cx/cy`：检测框中心像素坐标。
+- `x/y/w/h`：检测框左上角和宽高。
+- `score`：模型置信度。
+- `cx_norm/cy_norm`：0 到 1 的归一化中心点，便于下游控制器使用。
+
+## 仓库结构
+
+```text
+assets/                         说明图和检测示例
+docs/                           VSCode + SSH 工作流说明
+maixcam/                        MaixCam 实时检测程序和 MUD 模板
+models/                         PC 端权重和 ONNX 模型
+release/maixcam_copy_to_device/ 可直接复制到 MaixCam 的部署包
+scripts/                        采集、训练、评估、转换、部署脚本
+requirements.txt                PC/Mac 端 Python 依赖
+```
+
+默认不提交的本地内容：
+
+```text
+data/
+runs/
+runs_yolo/
+dist/
+outputs/
+*.cache
+*.log
+```
 
 ## 现场继续提升
 
-最有效的提升方式是补真实现场数据：
+模型效果最依赖真实现场数据。继续提升时建议按这个顺序补数据：
 
-1. 用最终安装角度的 MaixCam 拍摄真实场景。
-2. 把漏检的卵团重新标注后加入正样本。
+1. 用最终安装角度的 MaixCam 拍真实场景。
+2. 把漏检卵团重新标注后加入正样本。
 3. 把红色电机、线材、贴纸、手套、粉色玩具、反光物等误检对象加入负样本。
-4. 重新训练、评估、转换、部署。
-5. 接入执行器前，先用低功率指示灯验证坐标稳定性。
+4. 重新训练、阈值扫描、负样本评估、转换、部署。
+5. 接入执行器前先用低功率指示灯验证坐标稳定性。
 
-## 参考资料
+## 参考
 
 - [Sipeed MaixPy](https://github.com/sipeed/maixpy)
 - [MaixPy 自定义 YOLOv8 模型文档](https://wiki.sipeed.com/maixpy/doc/zh/vision/customize_model_yolov8.html)
 - [MaixCam ONNX 转 MUD 文档](https://wiki.sipeed.com/maixpy/doc/zh/ai_model_converter/maixcam.html)
-- [Ultralytics YOLO 文档](https://docs.ultralytics.com/)
+- [Ultralytics YOLO](https://docs.ultralytics.com/)
 - [Pink-Eggs Dataset V1](https://datasetninja.com/pink-eggs-dataset-v1)

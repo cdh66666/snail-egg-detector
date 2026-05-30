@@ -56,12 +56,12 @@ def pass_laser_safe_filter(
     *,
     min_conf: float = 0.62,
     min_area_ratio: float = 0.00004,
-    max_area_ratio: float = 0.12,
+    max_area_ratio: float = 0.32,
     min_aspect: float = 0.18,
     max_aspect: float = 5.5,
-    min_pink_ratio: float = 0.03,
+    min_pink_ratio: float = 0.035,
     max_red_bad_ratio: float = 0.55,
-    red_bad_dominance: float = 2.6,
+    red_bad_dominance: float = 2.4,
     strong_conf: float = 0.50,
 ) -> tuple[bool, float]:
     if confidence < min_conf:
