@@ -1,6 +1,7 @@
 import os
+import time as pytime
 
-from maix import camera, display, image, nn, app, time
+from maix import camera, display, image, nn, app, time, pwm, pinmap
 
 
 # Copy this file to MaixVision as main.py after converting the ONNX model to MUD.
@@ -14,6 +15,19 @@ MIN_MODEL_CONF = 0.18
 STRONG_MODEL_CONF = 0.50
 LOW_CONF_MIN_PINK_RATIO = 0.035
 LOW_CONF_MIN_AREA = 18
+
+# Basic gimbal control. A19/PWM7 is pan, A18/PWM6 is tilt.
+# Every command is clamped to center +/-45 degrees before PWM output.
+# Keep the gimbal completely still during detector startup. Tracking code can
+# enable this explicitly after the camera has reached a stable state.
+ENABLE_GIMBAL = False
+GIMBAL_DISABLE_FLAG = "/root/snail_egg/disable_gimbal"
+GIMBAL_FREQ = 50
+GIMBAL_CENTER_DEG = 90
+GIMBAL_MAX_OFFSET_DEG = 45
+GIMBAL_CENTER_SETTLE_S = 0.35
+GIMBAL_PAN_PWM_ID = 7
+GIMBAL_TILT_PWM_ID = 6
 
 # 0 = raw YOLO debug: draw every model detection, no color filtering.
 # 1 = color debug: raw boxes are yellow, pink-passed boxes are green.
@@ -30,6 +44,9 @@ SPEED_PROFILE = "full_frame"
 # camera image in one pass. That avoids stale round-robin boxes for laser aiming.
 FRAME_W = 640
 FRAME_H = 480
+# A 640x480 RGB888 frame is large on MaixCam. The SDK default is three
+# buffers; one buffer is enough here and avoids the VI memory allocation crash.
+CAMERA_BUFF_NUM = 1
 USE_TILED_INFERENCE = False
 TILE_OVERLAP = 160
 MERGE_IOU = 0.45
@@ -53,7 +70,16 @@ RED_BAD_DOMINANCE = 2.4
 COLOR_GRID = 6
 MAX_COLOR_CHECKS = 36
 REQUIRE_STABLE_FRAMES = 2
-TRACK_MAX_MISSES = 1
+# Keep a short prediction window when the detector misses a frame. At about
+# 19 FPS this is roughly 0.3 seconds, long enough to bridge transient misses.
+TRACK_MAX_MISSES = 6
+TRACK_PREDICT_MAX_MISSES = 4
+TRACK_MATCH_DISTANCE_SCALE = 1.35
+TRACK_KF_PROCESS_NOISE = 2.0
+TRACK_KF_MEASUREMENT_NOISE = 16.0
+# 0 means automatically lock the first stable track; set a positive ID to
+# lock a specific track later when the gimbal controller is connected.
+LOCK_TARGET_ID = 0
 WARMUP_FRAMES = 6
 
 if SPEED_PROFILE == "full_frame":
@@ -91,18 +117,113 @@ DEBUG_MAX_SAVES = 6
 ENABLE_DISPLAY = True
 HEADLESS_FLAG = "/root/snail_egg/headless"
 _tracks = []
+_next_track_id = 1
+_locked_track_id = 0
 _tile_scan_index = 0
 _memory = []
 _last_tile_info = "0/0"
 
 
+def clamp_gimbal_offset(offset):
+    if offset < -GIMBAL_MAX_OFFSET_DEG:
+        return -GIMBAL_MAX_OFFSET_DEG
+    if offset > GIMBAL_MAX_OFFSET_DEG:
+        return GIMBAL_MAX_OFFSET_DEG
+    return offset
+
+
+def clamp_gimbal_angle(angle):
+    min_angle = GIMBAL_CENTER_DEG - GIMBAL_MAX_OFFSET_DEG
+    max_angle = GIMBAL_CENTER_DEG + GIMBAL_MAX_OFFSET_DEG
+    if angle < min_angle:
+        return min_angle
+    if angle > max_angle:
+        return max_angle
+    return angle
+
+
+def servo_duty_from_angle(angle):
+    # Standard hobby servo pulse: 0.5ms..2.5ms in a 20ms period.
+    # That maps 0..180 degrees to 2.5%..12.5% duty at 50Hz.
+    angle = clamp_gimbal_angle(angle)
+    return 2.5 + (float(angle) / 180.0) * 10.0
+
+
+def safe_sleep(seconds):
+    try:
+        pytime.sleep(seconds)
+    except Exception:
+        pass
+
+
+class Gimbal:
+    def __init__(self):
+        self.pan_offset = 0
+        self.tilt_offset = 0
+        pinmap.set_pin_function("A19", "PWM7")
+        pinmap.set_pin_function("A18", "PWM6")
+        center_duty = servo_duty_from_angle(GIMBAL_CENTER_DEG)
+        self.pan = pwm.PWM(GIMBAL_PAN_PWM_ID, freq=GIMBAL_FREQ, duty=center_duty, enable=True)
+        self.tilt = pwm.PWM(GIMBAL_TILT_PWM_ID, freq=GIMBAL_FREQ, duty=center_duty, enable=True)
+        safe_sleep(GIMBAL_CENTER_SETTLE_S)
+
+    def set_offsets(self, pan_offset, tilt_offset, source="CMD"):
+        self.pan_offset = clamp_gimbal_offset(pan_offset)
+        self.tilt_offset = clamp_gimbal_offset(tilt_offset)
+        pan_angle = clamp_gimbal_angle(GIMBAL_CENTER_DEG + self.pan_offset)
+        tilt_angle = clamp_gimbal_angle(GIMBAL_CENTER_DEG + self.tilt_offset)
+        self.pan.duty(servo_duty_from_angle(pan_angle))
+        self.tilt.duty(servo_duty_from_angle(tilt_angle))
+        print(
+            "GIMBAL,%s,PAN_OFFSET,%d,TILT_OFFSET,%d,PAN_ANGLE,%d,TILT_ANGLE,%d"
+            % (source, self.pan_offset, self.tilt_offset, pan_angle, tilt_angle)
+        )
+
+    def close(self):
+        try:
+            self.set_offsets(0, 0, "STOP_CENTER")
+            safe_sleep(GIMBAL_CENTER_SETTLE_S)
+        except Exception as e:
+            print("GIMBAL_STOP_CENTER_ERROR,%s" % e)
+        try:
+            self.pan.disable()
+        except Exception as e:
+            print("GIMBAL_DISABLE_PAN_ERROR,%s" % e)
+        try:
+            self.tilt.disable()
+        except Exception as e:
+            print("GIMBAL_DISABLE_TILT_ERROR,%s" % e)
+
+
+def init_gimbal():
+    if not ENABLE_GIMBAL:
+        print("GIMBAL_SKIP,DISABLED")
+        return None
+    try:
+        if os.path.exists(GIMBAL_DISABLE_FLAG):
+            print("GIMBAL_SKIP,FLAG")
+            return None
+    except Exception:
+        pass
+    try:
+        print("GIMBAL_INIT_START,LIMIT,+-%d" % GIMBAL_MAX_OFFSET_DEG)
+        gimbal = Gimbal()
+        print("GIMBAL_INIT_OK")
+        return gimbal
+    except Exception as e:
+        print("GIMBAL_INIT_ERROR,%s" % e)
+        return None
+
+
 class DetectedBox:
-    def __init__(self, x, y, w, h, score):
+    def __init__(self, x, y, w, h, score, track_id=0, predicted=False):
         self.x = int(x)
         self.y = int(y)
         self.w = int(w)
         self.h = int(h)
         self.score = float(score)
+        self.track_id = int(track_id)
+        self.predicted = bool(predicted)
 
 
 def draw_cross(img, cx, cy, color):
@@ -275,36 +396,168 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
     return kept, best_pink_ratio, best_red_ratio, rows
 
 
+class ScalarKalman:
+    """Small constant-velocity Kalman filter for one scalar value."""
+
+    def __init__(self, value):
+        self.pos = float(value)
+        self.vel = 0.0
+        self.p00 = 25.0
+        self.p01 = 0.0
+        self.p11 = 9.0
+
+    def predict(self):
+        self.pos += self.vel
+        old_p01 = self.p01
+        self.p00 = self.p00 + 2.0 * old_p01 + self.p11 + TRACK_KF_PROCESS_NOISE
+        self.p01 = old_p01 + self.p11
+        self.p11 += TRACK_KF_PROCESS_NOISE * 0.25
+
+    def update(self, measurement):
+        measurement = float(measurement)
+        innovation = measurement - self.pos
+        innovation_cov = self.p00 + TRACK_KF_MEASUREMENT_NOISE
+        if innovation_cov <= 0.0:
+            return
+        k0 = self.p00 / innovation_cov
+        k1 = self.p01 / innovation_cov
+        old_p01 = self.p01
+        self.pos += k0 * innovation
+        self.vel += k1 * innovation
+        self.p00 = max(0.01, (1.0 - k0) * self.p00)
+        self.p01 = (1.0 - k0) * old_p01
+        self.p11 = max(0.01, self.p11 - k1 * old_p01)
+
+
+def track_box(track):
+    cx = track["cx"].pos
+    cy = track["cy"].pos
+    width = max(2.0, track["w"].pos)
+    height = max(2.0, track["h"].pos)
+    return (
+        int(cx - width * 0.5),
+        int(cy - height * 0.5),
+        int(width),
+        int(height),
+    )
+
+
+def track_object(track, predicted):
+    x, y, w, h = track_box(track)
+    score = track["score"] if not predicted else max(0.0, track["score"] * 0.98)
+    return DetectedBox(x, y, w, h, score, track["id"], predicted)
+
+
+def new_track(obj):
+    global _next_track_id
+    cx, cy = obj_center(obj)
+    track = {
+        "id": _next_track_id,
+        "cx": ScalarKalman(cx),
+        "cy": ScalarKalman(cy),
+        "w": ScalarKalman(max(2, obj.w)),
+        "h": ScalarKalman(max(2, obj.h)),
+        "score": obj.score,
+        "stable": 1,
+        "misses": 0,
+        "age": 1,
+    }
+    _next_track_id += 1
+    track["obj"] = track_object(track, False)
+    return track
+
+
+def track_match_cost(obj, track):
+    predicted_box = track_box(track)
+    measured_box = (int(obj.x), int(obj.y), int(obj.w), int(obj.h))
+    predicted_cx, predicted_cy = obj_center(DetectedBox(*predicted_box, 0.0))
+    measured_cx, measured_cy = obj_center(obj)
+    dx = measured_cx - predicted_cx
+    dy = measured_cy - predicted_cy
+    distance = (dx * dx + dy * dy) ** 0.5
+    scale = max(28.0, max(predicted_box[2], predicted_box[3]) * TRACK_MATCH_DISTANCE_SCALE)
+    overlap = box_iou(measured_box, predicted_box)
+    if overlap < 0.02 and distance > scale:
+        return None
+    return distance / scale + (1.0 - overlap) * 0.65
+
+
 def update_tracks(objs):
     global _tracks
-    next_tracks = []
-    used = set()
-    for obj in objs:
-        box = (int(obj.x), int(obj.y), int(obj.w), int(obj.h))
-        best_idx = -1
-        best_score = 0
-        for idx, tr in enumerate(_tracks):
-            if idx in used:
-                continue
-            score = box_iou(box, tr["box"])
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        stable = 1
-        if best_idx >= 0 and best_score >= 0.25:
-            used.add(best_idx)
-            stable = _tracks[best_idx]["stable"] + 1
-        next_tracks.append({"box": box, "obj": obj, "stable": stable, "misses": 0})
+    for track in _tracks:
+        track["cx"].predict()
+        track["cy"].predict()
+        track["w"].predict()
+        track["h"].predict()
 
-    for idx, tr in enumerate(_tracks):
-        if idx in used:
+    pairs = []
+    for det_idx, obj in enumerate(objs):
+        for track_idx, track in enumerate(_tracks):
+            cost = track_match_cost(obj, track)
+            if cost is not None:
+                pairs.append((cost, det_idx, track_idx))
+    pairs.sort(key=lambda item: item[0])
+
+    used_detections = set()
+    used_tracks = set()
+    next_tracks = []
+    for cost, det_idx, track_idx in pairs:
+        if det_idx in used_detections or track_idx in used_tracks:
             continue
-        if tr["misses"] < TRACK_MAX_MISSES:
-            tr["misses"] += 1
-            next_tracks.append(tr)
+        obj = objs[det_idx]
+        track = _tracks[track_idx]
+        used_detections.add(det_idx)
+        used_tracks.add(track_idx)
+        track["cx"].update(obj_center(obj)[0])
+        track["cy"].update(obj_center(obj)[1])
+        track["w"].update(max(2, obj.w))
+        track["h"].update(max(2, obj.h))
+        track["score"] = obj.score
+        track["stable"] += 1
+        track["age"] += 1
+        track["misses"] = 0
+        track["obj"] = track_object(track, False)
+        next_tracks.append(track)
+
+    for track_idx, track in enumerate(_tracks):
+        if track_idx in used_tracks:
+            continue
+        track["misses"] += 1
+        track["age"] += 1
+        if track["misses"] <= TRACK_MAX_MISSES:
+            track["obj"] = track_object(track, True)
+            next_tracks.append(track)
+
+    for det_idx, obj in enumerate(objs):
+        if det_idx not in used_detections:
+            next_tracks.append(new_track(obj))
 
     _tracks = next_tracks
-    return [tr["obj"] for tr in _tracks if tr["stable"] >= REQUIRE_STABLE_FRAMES and tr["misses"] == 0]
+    return [
+        track["obj"]
+        for track in _tracks
+        if track["stable"] >= REQUIRE_STABLE_FRAMES
+        and track["misses"] <= TRACK_PREDICT_MAX_MISSES
+    ]
+
+
+def select_primary_target(objs):
+    global _locked_track_id
+    ids = [getattr(obj, "track_id", 0) for obj in objs]
+    if LOCK_TARGET_ID > 0:
+        _locked_track_id = LOCK_TARGET_ID if LOCK_TARGET_ID in ids else 0
+    elif _locked_track_id not in ids:
+        if objs:
+            # Lock the first stable target by score; this remains fixed while
+            # the target is briefly occluded or missed by the detector.
+            chosen = sorted(objs, key=lambda obj: obj.score, reverse=True)[0]
+            _locked_track_id = getattr(chosen, "track_id", 0)
+        else:
+            _locked_track_id = 0
+    for obj in objs:
+        if getattr(obj, "track_id", 0) == _locked_track_id:
+            return obj
+    return None
 
 
 def merge_overlaps(objs):
@@ -442,6 +695,7 @@ def detect_frame(detector, img, frame_id):
 
 
 print("YOLO SNAIL EGG DETECTOR BOOT")
+gimbal = init_gimbal()
 print(
     "CFG,PROFILE,%s,RUN_MODE,%d,FRAME,%dx%d,TILED,%d,RR,%d,TILES_PER_FRAME,%d,TTL,%d,DETECT_CONF,%.3f,MIN_MODEL,%.3f,STRONG_MODEL,%.3f,IOU,%.3f,MIN_PINK,%.4f"
     % (
@@ -472,7 +726,12 @@ except Exception:
 detector = nn.YOLOv8(model=MODEL, dual_buff=DUAL_BUFF)
 print("INIT,DETECTOR_OK")
 print("INIT,TILES,%d" % len(tile_origins(FRAME_W, FRAME_H, detector.input_width(), detector.input_height())))
-cam = camera.Camera(FRAME_W, FRAME_H, detector.input_format())
+cam = camera.Camera(
+    FRAME_W,
+    FRAME_H,
+    detector.input_format(),
+    buff_num=CAMERA_BUFF_NUM,
+)
 print("INIT,CAMERA_OK")
 if ENABLE_DISPLAY:
     disp = display.Display()
@@ -501,6 +760,8 @@ while not app.need_exit():
         print("TRACE,%d,DETECT_OK,%d" % (frame_id, raw_count))
     stable = update_tracks(candidates)
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
+    primary_obj = select_primary_target([item[0] for item in targets])
+    primary_id = getattr(primary_obj, "track_id", 0) if primary_obj else 0
     save_debug = (
         RUN_MODE == 3
         and debug_saved < DEBUG_MAX_SAVES
@@ -515,7 +776,7 @@ while not app.need_exit():
     fps_now = time.fps()
     img.draw_string(2, 2, "FPS %.1f" % fps_now, image.COLOR_GREEN)
     status_label = "WARM" if frame_id < WARMUP_FRAMES else "EGGS"
-    img.draw_string(2, 18, "M%d RAW %d CAND %d %s %d" % (RUN_MODE, raw_count, len(candidates), status_label, len(targets)),
+    img.draw_string(2, 18, "M%d RAW %d CAND %d %s %d LOCK %d" % (RUN_MODE, raw_count, len(candidates), status_label, len(targets), primary_id),
                     image.COLOR_GREEN if targets else image.COLOR_RED)
     img.draw_string(
         2,
@@ -539,15 +800,19 @@ while not app.need_exit():
 
     for idx, item in enumerate(targets):
         obj, cx, cy = item
-        target_id = idx + 1
+        target_id = getattr(obj, "track_id", 0) or (idx + 1)
+        is_primary = target_id == primary_id
+        predicted = getattr(obj, "predicted", False)
         x = int(obj.x)
         y = int(obj.y)
         w = int(obj.w)
         h = int(obj.h)
-        img.draw_rect(x, y, w, h, color=image.COLOR_GREEN, thickness=2)
-        draw_cross(img, cx, cy, image.COLOR_RED)
+        box_color = image.COLOR_YELLOW if predicted else image.COLOR_GREEN
+        box_thickness = 3 if is_primary else 2
+        img.draw_rect(x, y, w, h, color=box_color, thickness=box_thickness)
+        draw_cross(img, cx, cy, image.COLOR_RED if not is_primary else image.COLOR_BLUE)
         label_y = y - 14 if y >= 14 else y
-        img.draw_string(x, label_y, str(target_id), image.COLOR_GREEN)
+        img.draw_string(x, label_y, str(target_id), box_color)
 
         if frame_id % PRINT_EVERY_N_FRAMES == 0:
             print(
@@ -609,4 +874,6 @@ while not app.need_exit():
         disp.show(img)
     frame_id += 1
 
+if gimbal:
+    gimbal.close()
 print("YOLO SNAIL EGG DETECTOR STOP")
