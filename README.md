@@ -6,6 +6,21 @@
 
 > 安全提醒：本项目只输出视觉候选目标和坐标。任何激光、机械臂、喷洒或消杀执行器都必须加入物理使能、急停、遮光/门禁联锁、低功率预瞄准验证和人工确认流程。首次调试请断开激光，或用低功率指示灯替代。
 
+## 二轴云台跟踪
+
+当前版本已经加入轻量的云台跟踪控制器，设计说明见 [docs/gimbal_tracking_design.md](docs/gimbal_tracking_design.md)。默认配置不会初始化 PWM，也不会让舵机动作：
+
+```python
+ENABLE_GIMBAL = False
+ENABLE_GIMBAL_TRACKING = False
+```
+
+开启真实舵机跟踪前，必须只连接安全的舵机负载，并确认 A19/PWM7 和 A18/PWM6 的接线。控制器包含稳定帧门槛、当前帧检测门槛、图像中心死区、8 Hz 更新、单次最大 2° 变化和 45° 绝对偏移限幅。预测框只用于保持画面和 ID 连续，不会驱动舵机。紧急禁用可以在设备上创建：
+
+```text
+/root/snail_egg/disable_gimbal
+```
+
 ![检测流程](assets/diagrams/pipeline.svg)
 
 ## 效果示例

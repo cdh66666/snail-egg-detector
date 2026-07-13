@@ -21,6 +21,9 @@ LOW_CONF_MIN_AREA = 18
 # Keep the gimbal completely still during detector startup. Tracking code can
 # enable this explicitly after the camera has reached a stable state.
 ENABLE_GIMBAL = False
+# The controller is deliberately a second opt-in switch.  It cannot move a
+# servo unless both this flag and ENABLE_GIMBAL are enabled.
+ENABLE_GIMBAL_TRACKING = False
 GIMBAL_DISABLE_FLAG = "/root/snail_egg/disable_gimbal"
 GIMBAL_FREQ = 50
 GIMBAL_CENTER_DEG = 90
@@ -28,6 +31,22 @@ GIMBAL_MAX_OFFSET_DEG = 45
 GIMBAL_CENTER_SETTLE_S = 0.35
 GIMBAL_PAN_PWM_ID = 7
 GIMBAL_TILT_PWM_ID = 6
+# Control loop is slower than the detector on purpose.  The detector/display
+# can stay near 19 FPS while the hobby servos receive smooth 8 Hz updates.
+GIMBAL_CONTROL_HZ = 8.0
+GIMBAL_DEADZONE_X = 0.055
+GIMBAL_DEADZONE_Y = 0.055
+GIMBAL_MAX_STEP_DEG = 2.0
+GIMBAL_PAN_KP = 5.5
+GIMBAL_PAN_KI = 0.0
+GIMBAL_PAN_KD = 0.18
+GIMBAL_TILT_KP = 5.0
+GIMBAL_TILT_KI = 0.0
+GIMBAL_TILT_KD = 0.16
+GIMBAL_PAN_SIGN = 1.0
+GIMBAL_TILT_SIGN = -1.0
+GIMBAL_MIN_STABLE = 3
+GIMBAL_MIN_SCORE = 0.28
 
 # 0 = raw YOLO debug: draw every model detection, no color filtering.
 # 1 = color debug: raw boxes are yellow, pink-passed boxes are green.
@@ -195,6 +214,112 @@ class Gimbal:
             print("GIMBAL_DISABLE_TILT_ERROR,%s" % e)
 
 
+class GimbalAxisController:
+    """Small bounded PID-like controller for one servo axis.
+
+    The output is an angle increment, not a raw PWM duty.  This makes the
+    absolute +/-45 degree mechanical limit and the per-update slew limit easy
+    to enforce before touching the hardware.
+    """
+
+    def __init__(self, kp, ki, kd, sign):
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.kd = float(kd)
+        self.sign = float(sign)
+        self.integral = 0.0
+        self.previous_error = 0.0
+        self.has_previous = False
+
+    def reset(self):
+        self.integral = 0.0
+        self.previous_error = 0.0
+        self.has_previous = False
+
+    def step(self, error, dt):
+        if dt <= 0.0:
+            dt = 1.0 / GIMBAL_CONTROL_HZ
+        self.integral += error * dt
+        # Integral is currently zero by default, but this clamp keeps future
+        # field tuning from building a large wind-up near a hard stop.
+        self.integral = max(-0.5, min(0.5, self.integral))
+        derivative = 0.0
+        if self.has_previous:
+            derivative = (error - self.previous_error) / dt
+        self.previous_error = error
+        self.has_previous = True
+        output = self.sign * (self.kp * error + self.ki * self.integral + self.kd * derivative)
+        return max(-GIMBAL_MAX_STEP_DEG, min(GIMBAL_MAX_STEP_DEG, output))
+
+
+class GimbalTracker:
+    """Safety-gated image-center tracker layered on top of the gimbal PWM."""
+
+    def __init__(self, gimbal):
+        self.gimbal = gimbal
+        self.pan = GimbalAxisController(GIMBAL_PAN_KP, GIMBAL_PAN_KI, GIMBAL_PAN_KD, GIMBAL_PAN_SIGN)
+        self.tilt = GimbalAxisController(GIMBAL_TILT_KP, GIMBAL_TILT_KI, GIMBAL_TILT_KD, GIMBAL_TILT_SIGN)
+        self.pan_offset = 0.0
+        self.tilt_offset = 0.0
+        self.last_update = 0.0
+
+    def reset(self):
+        self.pan.reset()
+        self.tilt.reset()
+
+    def update(self, target, frame_w, frame_h, now):
+        # Never drive from a predicted box.  A predicted box is useful for
+        # stable display/ID continuity, but it is not fresh visual evidence.
+        if target is None or getattr(target, "predicted", False):
+            self.reset()
+            return "HOLD,NO_FRESH_TARGET"
+        if getattr(target, "track_id", 0) <= 0:
+            self.reset()
+            return "HOLD,NO_TRACK_ID"
+        if getattr(target, "stable", 0) < GIMBAL_MIN_STABLE:
+            self.reset()
+            return "HOLD,UNSTABLE"
+        if getattr(target, "misses", 1) != 0 or getattr(target, "score", 0.0) < GIMBAL_MIN_SCORE:
+            self.reset()
+            return "HOLD,QUALITY"
+
+        interval = 1.0 / GIMBAL_CONTROL_HZ
+        if self.last_update > 0.0 and now - self.last_update < interval:
+            return "HOLD,RATE"
+        dt = interval if self.last_update <= 0.0 else max(0.001, now - self.last_update)
+        self.last_update = now
+
+        cx = target.x + target.w * 0.5
+        cy = target.y + target.h * 0.5
+        error_x = (cx - frame_w * 0.5) / max(1.0, frame_w * 0.5)
+        error_y = (cy - frame_h * 0.5) / max(1.0, frame_h * 0.5)
+        if abs(error_x) < GIMBAL_DEADZONE_X:
+            error_x = 0.0
+        if abs(error_y) < GIMBAL_DEADZONE_Y:
+            error_y = 0.0
+
+        self.pan_offset = clamp_gimbal_offset(self.pan_offset + self.pan.step(error_x, dt))
+        self.tilt_offset = clamp_gimbal_offset(self.tilt_offset + self.tilt.step(error_y, dt))
+        self.gimbal.set_offsets(round(self.pan_offset), round(self.tilt_offset), "TRACK")
+        return "TRACK,%d,EX,%.3f,EY,%.3f,PAN,%d,TILT,%d" % (
+            target.track_id,
+            error_x,
+            error_y,
+            round(self.pan_offset),
+            round(self.tilt_offset),
+        )
+
+
+def init_gimbal_tracker(gimbal):
+    if gimbal is None or not ENABLE_GIMBAL_TRACKING:
+        print("GIMBAL_TRACK_SKIP,DISABLED")
+        return None
+    print("GIMBAL_TRACK_OK,HZ,%.1f,DEADZONE,%.3f,MAX_STEP,%.1f" % (
+        GIMBAL_CONTROL_HZ, GIMBAL_DEADZONE_X, GIMBAL_MAX_STEP_DEG
+    ))
+    return GimbalTracker(gimbal)
+
+
 def init_gimbal():
     if not ENABLE_GIMBAL:
         print("GIMBAL_SKIP,DISABLED")
@@ -216,7 +341,7 @@ def init_gimbal():
 
 
 class DetectedBox:
-    def __init__(self, x, y, w, h, score, track_id=0, predicted=False):
+    def __init__(self, x, y, w, h, score, track_id=0, predicted=False, stable=0, misses=0):
         self.x = int(x)
         self.y = int(y)
         self.w = int(w)
@@ -224,6 +349,8 @@ class DetectedBox:
         self.score = float(score)
         self.track_id = int(track_id)
         self.predicted = bool(predicted)
+        self.stable = int(stable)
+        self.misses = int(misses)
 
 
 def draw_cross(img, cx, cy, color):
@@ -445,7 +572,7 @@ def track_box(track):
 def track_object(track, predicted):
     x, y, w, h = track_box(track)
     score = track["score"] if not predicted else max(0.0, track["score"] * 0.98)
-    return DetectedBox(x, y, w, h, score, track["id"], predicted)
+    return DetectedBox(x, y, w, h, score, track["id"], predicted, track["stable"], track["misses"])
 
 
 def new_track(obj):
@@ -696,6 +823,7 @@ def detect_frame(detector, img, frame_id):
 
 print("YOLO SNAIL EGG DETECTOR BOOT")
 gimbal = init_gimbal()
+gimbal_tracker = init_gimbal_tracker(gimbal)
 print(
     "CFG,PROFILE,%s,RUN_MODE,%d,FRAME,%dx%d,TILED,%d,RR,%d,TILES_PER_FRAME,%d,TTL,%d,DETECT_CONF,%.3f,MIN_MODEL,%.3f,STRONG_MODEL,%.3f,IOU,%.3f,MIN_PINK,%.4f"
     % (
@@ -762,6 +890,10 @@ while not app.need_exit():
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
     primary_obj = select_primary_target([item[0] for item in targets])
     primary_id = getattr(primary_obj, "track_id", 0) if primary_obj else 0
+    if gimbal_tracker is not None:
+        control_status = gimbal_tracker.update(primary_obj, FRAME_W, FRAME_H, pytime.time())
+        if control_status.startswith("TRACK,"):
+            print("AIM,%s" % control_status)
     save_debug = (
         RUN_MODE == 3
         and debug_saved < DEBUG_MAX_SAVES
