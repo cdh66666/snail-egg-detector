@@ -11,7 +11,8 @@ MaixCam 福寿螺卵识别部署包
 云台跟踪默认关闭。只有同时把 main.py 顶部的 ENABLE_GIMBAL 和
 ENABLE_GIMBAL_TRACKING 改为 True，程序才会输出舵机 PWM。预测框、丢失目标
 和不稳定目标都不会驱动舵机；控制器每次最多移动 2 度，绝对范围固定为
-45 到 135 度。紧急禁用：在设备上创建 /root/snail_egg/disable_gimbal。
+45 到 135 度。当前接线为水平 A19/PWM7、俯仰 A18/PWM6。
+紧急禁用：在设备上创建 /root/snail_egg/disable_gimbal。
 
 复制位置：
 

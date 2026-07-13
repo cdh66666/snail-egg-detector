@@ -16,7 +16,8 @@ STRONG_MODEL_CONF = 0.50
 LOW_CONF_MIN_PINK_RATIO = 0.035
 LOW_CONF_MIN_AREA = 18
 
-# Basic gimbal control. A19/PWM7 is pan, A18/PWM6 is tilt.
+# Basic gimbal control. On the current wiring A19/PWM7 is pan and
+# A18/PWM6 is tilt. Every command is clamped to center +/-45 degrees.
 # Every command is clamped to center +/-45 degrees before PWM output.
 # Keep the gimbal completely still during detector startup. Tracking code can
 # enable this explicitly after the camera has reached a stable state.
