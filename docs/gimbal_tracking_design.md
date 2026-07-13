@@ -89,6 +89,29 @@ GIMBAL_TILT_SIGN = 1.0
 
 ## 验证方法
 
+### 1. 先验证舵机通道
+
+先不要开启识别跟踪，把 `maixcam/gimbal_servo_test.py` 复制到设备应用目录，手动运行：
+
+```bash
+python3 /maixapp/apps/<app_id>/gimbal_servo_test.py
+```
+
+它会依次测试水平轴和俯仰轴，输出 `SERVO,PASS` 后关闭 PWM，不会修改自启动。
+
+### 2. 再开启视觉跟踪
+
+确认通道方向后，在 `main.py` 顶部修改：
+
+```python
+ENABLE_GIMBAL = True
+ENABLE_GIMBAL_TRACKING = True
+```
+
+第一次建议把 `GIMBAL_MAX_STEP_DEG` 改为 `1.0`，并只用安全舵机观察方向。若水平或俯仰方向相反，只改对应的 `GIMBAL_PAN_SIGN` 或 `GIMBAL_TILT_SIGN`，不要改角度限幅。
+
+### 3. 观察日志
+
 先保持两个开关为 `False`，确认设备画面和检测框正常。之后只接舵机，不接任何危险执行器，打开两个开关，观察串口：
 
 ```text

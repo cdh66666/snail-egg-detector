@@ -917,6 +917,15 @@ while not app.need_exit():
         "PINK %.2f RED %.2f T %s" % (best_pink_ratio, best_red_ratio, _last_tile_info),
         image.COLOR_GREEN if candidates else image.COLOR_RED,
     )
+    if gimbal_tracker is None:
+        gimbal_label = "GIMBAL OFF"
+    elif primary_obj is None:
+        gimbal_label = "GIMBAL HOLD"
+    elif getattr(primary_obj, "predicted", False):
+        gimbal_label = "GIMBAL HOLD PRED"
+    else:
+        gimbal_label = "GIMBAL TRACK %d" % primary_id
+    img.draw_string(2, 50, gimbal_label, image.COLOR_BLUE if gimbal_tracker else image.COLOR_RED)
 
     if RUN_MODE == 0:
         raw_targets = sort_targets([row[1] for row in candidate_rows], FRAME_H)

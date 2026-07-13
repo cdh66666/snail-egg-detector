@@ -8,6 +8,11 @@ MaixCam 福寿螺卵识别部署包
 - 默认阈值：CONF_TH = 0.18
 - 后处理：模型分数 + 粉色比例 + 红色排除 + 大小/形状过滤
 
+明天调试建议：先单独运行 gimbal_servo_test.py，确认两个舵机轴向和方向；
+再把 main.py 顶部的 ENABLE_GIMBAL 和 ENABLE_GIMBAL_TRACKING 都改为 True。
+首次建议把 GIMBAL_MAX_STEP_DEG 改为 1.0。方向相反时只调整对应的
+GIMBAL_PAN_SIGN 或 GIMBAL_TILT_SIGN，不要扩大 45 度绝对限幅。
+
 云台跟踪默认关闭。只有同时把 main.py 顶部的 ENABLE_GIMBAL 和
 ENABLE_GIMBAL_TRACKING 改为 True，程序才会输出舵机 PWM。预测框、丢失目标
 和不稳定目标都不会驱动舵机；控制器每次最多移动 2 度，绝对范围固定为
