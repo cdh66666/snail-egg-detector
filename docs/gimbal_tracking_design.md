@@ -66,15 +66,15 @@ GIMBAL_MIN_SCORE = 0.28
 舵机接线默认是：
 
 ```text
-水平轴: A19 / PWM7
-俯仰轴: A18 / PWM6
+水平轴: A18 / PWM6
+俯仰轴: A19 / PWM7
 ```
 
 如果方向相反，只修改：
 
 ```python
 GIMBAL_PAN_SIGN = -1.0
-GIMBAL_TILT_SIGN = 1.0
+GIMBAL_TILT_SIGN = -1.0
 ```
 
 不要修改硬限幅来扩大运动范围。
@@ -108,7 +108,7 @@ ENABLE_GIMBAL = True
 ENABLE_GIMBAL_TRACKING = True
 ```
 
-第一次建议把 `GIMBAL_MAX_STEP_DEG` 改为 `1.0`，并只用安全舵机观察方向。若水平或俯仰方向相反，只改对应的 `GIMBAL_PAN_SIGN` 或 `GIMBAL_TILT_SIGN`，不要改角度限幅。
+第一次保持 `GIMBAL_MAX_STEP_DEG = 0.5`，并只用安全舵机观察方向。若水平或俯仰方向相反，只改对应的 `GIMBAL_PAN_SIGN` 或 `GIMBAL_TILT_SIGN`，不要改角度限幅。
 
 ### 3. 观察日志
 

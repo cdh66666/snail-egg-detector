@@ -16,8 +16,8 @@ STRONG_MODEL_CONF = 0.50
 LOW_CONF_MIN_PINK_RATIO = 0.035
 LOW_CONF_MIN_AREA = 18
 
-# Basic gimbal control. On the current wiring A19/PWM7 is pan and
-# A18/PWM6 is tilt. Every command is clamped to center +/-45 degrees
+# Basic gimbal control. On the current wiring A18/PWM6 is pan and
+# A19/PWM7 is tilt. Every command is clamped to center +/-45 degrees
 # before PWM output.
 # Keep the gimbal completely still during detector startup. Tracking code can
 # enable this explicitly after the camera has reached a stable state.
@@ -37,8 +37,8 @@ GIMBAL_FREQ = 50
 GIMBAL_CENTER_DEG = 90
 GIMBAL_MAX_OFFSET_DEG = 45
 GIMBAL_CENTER_SETTLE_S = 0.35
-GIMBAL_PAN_PWM_ID = 7
-GIMBAL_TILT_PWM_ID = 6
+GIMBAL_PAN_PWM_ID = 6
+GIMBAL_TILT_PWM_ID = 7
 # Control loop is slower than the detector on purpose. The detector/display
 # can stay near 19 FPS while the hobby servos receive smooth 5 Hz updates.
 GIMBAL_CONTROL_HZ = 5.0
@@ -51,7 +51,7 @@ GIMBAL_PAN_KD = 0.0
 GIMBAL_TILT_KP = 2.0
 GIMBAL_TILT_KI = 0.0
 GIMBAL_TILT_KD = 0.0
-GIMBAL_PAN_SIGN = 1.0
+GIMBAL_PAN_SIGN = -1.0
 GIMBAL_TILT_SIGN = -1.0
 GIMBAL_MIN_STABLE = 3
 GIMBAL_MIN_SCORE = 0.28

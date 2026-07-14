@@ -12,8 +12,8 @@ MIN_ANGLE = 45
 MAX_ANGLE = 135
 CENTER_ANGLE = 90
 FREQUENCY = 50
-PAN_PWM_ID = 7
-TILT_PWM_ID = 6
+PAN_PWM_ID = 6
+TILT_PWM_ID = 7
 
 
 def clamp_angle(angle):
@@ -38,7 +38,7 @@ def move(pan, tilt, pan_angle, tilt_angle, pause=0.7):
 pan = None
 tilt = None
 try:
-    # Current wiring: A19/PWM7 = horizontal, A18/PWM6 = pitch.
+    # Current wiring: A18/PWM6 = horizontal, A19/PWM7 = pitch.
     pinmap.set_pin_function("A19", "PWM7")
     pinmap.set_pin_function("A18", "PWM6")
     pan = pwm.PWM(PAN_PWM_ID, freq=FREQUENCY, duty=duty_from_angle(CENTER_ANGLE), enable=True)
@@ -59,4 +59,3 @@ finally:
         except Exception as exc:
             print("SERVO,DISABLE_ERROR,%s" % exc)
     print("SERVO,PWM_DISABLED")
-
