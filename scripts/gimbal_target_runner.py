@@ -248,9 +248,13 @@ class TargetRunner:
         if mode == "center":
             return self.args.center_x, self.args.center_y
         if mode == "horizontal":
-            return self.args.center_x + 0.27 * math.sin(2.0 * math.pi * phase_t / 10.0), self.args.center_y
+            return self.args.center_x + self.args.amplitude_x * math.sin(
+                2.0 * math.pi * phase_t / self.args.period_x
+            ), self.args.center_y
         if mode == "vertical":
-            return self.args.center_x, self.args.center_y + 0.22 * math.sin(2.0 * math.pi * phase_t / 10.0)
+            return self.args.center_x, self.args.center_y + self.args.amplitude_y * math.sin(
+                2.0 * math.pi * phase_t / self.args.period_y
+            )
         if mode == "rectangle":
             x, y = self.rectangle_position(phase_t)
             return self.args.center_x + (x - 0.5), self.args.center_y + (y - 0.5)
@@ -351,6 +355,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-x", type=float, default=0.5)
     parser.add_argument("--center-y", type=float, default=0.5)
     parser.add_argument("--smoothing", type=float, default=1.4)
+    parser.add_argument("--amplitude-x", type=float, default=0.27)
+    parser.add_argument("--amplitude-y", type=float, default=0.22)
+    parser.add_argument("--period-x", type=float, default=10.0)
+    parser.add_argument("--period-y", type=float, default=10.0)
     parser.add_argument("--pet-width", type=int, default=520)
     parser.add_argument("--pet-height", type=int, default=420)
     parser.add_argument("--fullscreen", action="store_true", help="Use only for unattended lab tests")
@@ -361,6 +369,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("PPTX does not exist: %s" % args.pptx)
     if args.model is not None and not args.model.is_file():
         parser.error("model does not exist: %s" % args.model)
+    if args.period_x <= 0.0 or args.period_y <= 0.0:
+        parser.error("--period-x and --period-y must be positive")
     return args
 
 

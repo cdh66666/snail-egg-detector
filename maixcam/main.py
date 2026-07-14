@@ -32,7 +32,7 @@ GIMBAL_DISABLE_FLAG = "/root/snail_egg/disable_gimbal"
 # outdoor scenes. This opt-in flag lowers only the model score floor for the
 # desktop tracking rig; removing it restores the production thresholds above.
 SCREEN_TEST_FLAG = "/root/snail_egg/screen_tracking_test"
-SCREEN_TEST_CONF_TH = 0.05
+SCREEN_TEST_CONF_TH = 0.01
 GIMBAL_FREQ = 50
 GIMBAL_CENTER_DEG = 90
 GIMBAL_MAX_OFFSET_DEG = 45
@@ -40,17 +40,21 @@ GIMBAL_CENTER_SETTLE_S = 0.35
 GIMBAL_PAN_PWM_ID = 6
 GIMBAL_TILT_PWM_ID = 7
 # Control loop is slower than the detector on purpose. The detector/display
-# can stay near 19 FPS while the hobby servos receive smooth 5 Hz updates.
-GIMBAL_CONTROL_HZ = 5.0
-GIMBAL_DEADZONE_X = 0.070
-GIMBAL_DEADZONE_Y = 0.070
-GIMBAL_MAX_STEP_DEG = 0.5
-GIMBAL_PAN_KP = 2.2
+# can stay near 19 FPS while the hobby servos receive smooth 10 Hz updates.
+GIMBAL_CONTROL_HZ = 10.0
+GIMBAL_DEADZONE_X = 0.040
+GIMBAL_DEADZONE_Y = 0.050
+GIMBAL_MAX_STEP_DEG = 0.7
+GIMBAL_MAX_RATE_DEG_S = 6.0
+GIMBAL_MAX_ACCEL_DEG_S2 = 12.0
+GIMBAL_ERROR_FILTER_TAU_S = 0.12
+# In the velocity controller KP maps normalized image error to deg/s.
+GIMBAL_PAN_KP = 20.0
 GIMBAL_PAN_KI = 0.0
-GIMBAL_PAN_KD = 0.0
-GIMBAL_TILT_KP = 2.0
+GIMBAL_PAN_KD = 6.0
+GIMBAL_TILT_KP = 16.0
 GIMBAL_TILT_KI = 0.0
-GIMBAL_TILT_KD = 0.0
+GIMBAL_TILT_KD = 4.0
 GIMBAL_PAN_SIGN = -1.0
 GIMBAL_TILT_SIGN = -1.0
 GIMBAL_MIN_STABLE = 3
@@ -72,6 +76,15 @@ SPEED_PROFILE = "full_frame"
 # camera image in one pass. That avoids stale round-robin boxes for laser aiming.
 FRAME_W = 640
 FRAME_H = 480
+# GC4653 stock lens: H-FOV 81 degrees, V-FOV 51 degrees. With the laser
+# emitter 10 mm right and 60 mm below the camera, parallel-axis parallax at
+# 1.0 m is approximately (+3.7, +30.2) pixels. The rounded point below is the
+# fixed 1 m aim reference; production control does not need red-dot detection.
+LASER_WORK_DISTANCE_MM = 1000
+LASER_OFFSET_RIGHT_MM = 10
+LASER_OFFSET_DOWN_MM = 60
+FIXED_AIM_X = 324
+FIXED_AIM_Y = 270
 # A 640x480 RGB888 frame is large on MaixCam. The SDK default is three
 # buffers; one buffer is enough here and avoids the VI memory allocation crash.
 CAMERA_BUFF_NUM = 1
@@ -214,6 +227,7 @@ def gimbal_tracking_requested():
 SCREEN_TEST_MODE = file_exists(SCREEN_TEST_FLAG)
 ACTIVE_CONF_TH = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else CONF_TH
 ACTIVE_MIN_MODEL_CONF = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else MIN_MODEL_CONF
+ACTIVE_GIMBAL_MIN_SCORE = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else GIMBAL_MIN_SCORE
 
 
 class Gimbal:
@@ -275,7 +289,7 @@ class DryRunGimbal:
 
 
 class GimbalAxisController:
-    """Small bounded PID-like controller for one servo axis.
+    """Acceleration-limited image-error to angular-velocity controller.
 
     The output is an angle increment, not a raw PWM duty.  This makes the
     absolute +/-45 degree mechanical limit and the per-update slew limit easy
@@ -290,30 +304,51 @@ class GimbalAxisController:
         self.integral = 0.0
         self.previous_error = 0.0
         self.has_previous = False
+        self.filtered_error = 0.0
+        self.velocity = 0.0
 
     def reset(self):
         self.integral = 0.0
         self.previous_error = 0.0
         self.has_previous = False
+        self.filtered_error = 0.0
+        self.velocity = 0.0
 
     def step(self, error, dt):
         if dt <= 0.0:
             dt = 1.0 / GIMBAL_CONTROL_HZ
-        self.integral += error * dt
+        alpha = 1.0 - pow(2.718281828, -dt / max(0.01, GIMBAL_ERROR_FILTER_TAU_S))
+        if not self.has_previous:
+            self.filtered_error = error
+        else:
+            self.filtered_error += alpha * (error - self.filtered_error)
+        self.integral += self.filtered_error * dt
         # Integral is currently zero by default, but this clamp keeps future
         # field tuning from building a large wind-up near a hard stop.
         self.integral = max(-0.5, min(0.5, self.integral))
         derivative = 0.0
         if self.has_previous:
-            derivative = (error - self.previous_error) / dt
-        self.previous_error = error
+            derivative = (self.filtered_error - self.previous_error) / dt
+        self.previous_error = self.filtered_error
         self.has_previous = True
-        output = self.sign * (self.kp * error + self.ki * self.integral + self.kd * derivative)
+        desired_rate = self.sign * (
+            self.kp * self.filtered_error + self.ki * self.integral + self.kd * derivative
+        )
+        desired_rate = max(-GIMBAL_MAX_RATE_DEG_S, min(GIMBAL_MAX_RATE_DEG_S, desired_rate))
+        if error == 0.0:
+            desired_rate = 0.0
+        max_rate_change = GIMBAL_MAX_ACCEL_DEG_S2 * dt
+        rate_error = desired_rate - self.velocity
+        rate_error = max(-max_rate_change, min(max_rate_change, rate_error))
+        self.velocity += rate_error
+        if desired_rate == 0.0 and abs(self.velocity) < max_rate_change:
+            self.velocity = 0.0
+        output = self.velocity * dt
         return max(-GIMBAL_MAX_STEP_DEG, min(GIMBAL_MAX_STEP_DEG, output))
 
 
 class GimbalTracker:
-    """Safety-gated image-center tracker layered on top of the gimbal PWM."""
+    """Safety-gated target tracker layered on top of the gimbal PWM."""
 
     def __init__(self, gimbal):
         self.gimbal = gimbal
@@ -339,7 +374,7 @@ class GimbalTracker:
         if getattr(target, "stable", 0) < GIMBAL_MIN_STABLE:
             self.reset()
             return "HOLD,UNSTABLE"
-        if getattr(target, "misses", 1) != 0 or getattr(target, "score", 0.0) < GIMBAL_MIN_SCORE:
+        if getattr(target, "misses", 1) != 0 or getattr(target, "score", 0.0) < ACTIVE_GIMBAL_MIN_SCORE:
             self.reset()
             return "HOLD,QUALITY"
 
@@ -351,8 +386,10 @@ class GimbalTracker:
 
         cx = target.x + target.w * 0.5
         cy = target.y + target.h * 0.5
-        error_x = (cx - frame_w * 0.5) / max(1.0, frame_w * 0.5)
-        error_y = (cy - frame_h * 0.5) / max(1.0, frame_h * 0.5)
+        reference_x = FIXED_AIM_X
+        reference_y = FIXED_AIM_Y
+        error_x = (cx - reference_x) / max(1.0, frame_w * 0.5)
+        error_y = (cy - reference_y) / max(1.0, frame_h * 0.5)
         if abs(error_x) < GIMBAL_DEADZONE_X:
             error_x = 0.0
         if abs(error_y) < GIMBAL_DEADZONE_Y:
@@ -361,12 +398,14 @@ class GimbalTracker:
         self.pan_offset = clamp_gimbal_offset(self.pan_offset + self.pan.step(error_x, dt))
         self.tilt_offset = clamp_gimbal_offset(self.tilt_offset + self.tilt.step(error_y, dt))
         self.gimbal.set_offsets(self.pan_offset, self.tilt_offset, "TRACK")
-        return "TRACK,%d,EX,%.3f,EY,%.3f,PAN,%.2f,TILT,%.2f" % (
+        return "TRACK,%d,EX,%.3f,EY,%.3f,PAN,%.2f,TILT,%.2f,REF,%d,%d" % (
             target.track_id,
             error_x,
             error_y,
             self.pan_offset,
             self.tilt_offset,
+            int(reference_x),
+            int(reference_y),
         )
 
 
@@ -374,8 +413,13 @@ def init_gimbal_tracker(gimbal):
     if gimbal is None or not gimbal_tracking_requested():
         print("GIMBAL_TRACK_SKIP,DISABLED")
         return None
-    print("GIMBAL_TRACK_OK,HZ,%.1f,DEADZONE,%.3f,MAX_STEP,%.1f" % (
-        GIMBAL_CONTROL_HZ, GIMBAL_DEADZONE_X, GIMBAL_MAX_STEP_DEG
+    print("GIMBAL_TRACK_OK,HZ,%.1f,DEADZONE,%.3f,MAX_STEP,%.1f,AIM,%d,%d,DIST_MM,%d" % (
+        GIMBAL_CONTROL_HZ,
+        GIMBAL_DEADZONE_X,
+        GIMBAL_MAX_STEP_DEG,
+        FIXED_AIM_X,
+        FIXED_AIM_Y,
+        LASER_WORK_DISTANCE_MM,
     ))
     return GimbalTracker(gimbal)
 

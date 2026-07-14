@@ -2,7 +2,7 @@
 
 ## 目标
 
-让 MaixCam 在检测到多个目标时稳定锁住一个目标，并让云台平滑地把目标中心移动到画面中心。识别器、跟踪器和舵机控制器分开处理：
+让 MaixCam 在检测到多个目标时稳定锁住一个目标，并让云台平滑地把目标中心移动到 1 m 激光固定瞄准点。识别器、跟踪器和舵机控制器分开处理：
 
 ```text
 YOLO 检测 -> 目标过滤 -> 多目标跟踪 -> 主目标锁定 -> 云台控制
@@ -45,7 +45,7 @@ ENABLE_GIMBAL_TRACKING = True
 4. 用预测框与新检测框的距离和 IoU 做轻量数据关联，保持稳定 ID。
 5. 允许短暂漏检时继续显示预测框，但预测框不会驱动舵机。
 6. 主目标默认锁住当前最高分的稳定轨迹；也可以设置 `LOCK_TARGET_ID` 锁定指定 ID。
-7. 云台控制每秒最多 5 次，带图像中心死区、P 控制、单次变化限幅和绝对角度限幅。
+7. 云台控制每秒最多 10 次，使用误差低通、PD 速度控制、角加速度限制、单次变化限幅和绝对角度限幅。
 
 这样可以保留 MaixCam 的实时性，不把完整 PC 跟踪框架和深度特征模型搬到设备端。
 
@@ -54,14 +54,28 @@ ENABLE_GIMBAL_TRACKING = True
 在 `maixcam/main.py` 顶部调整：
 
 ```python
-GIMBAL_CONTROL_HZ = 5.0
-GIMBAL_DEADZONE_X = 0.070
-GIMBAL_DEADZONE_Y = 0.070
-GIMBAL_MAX_STEP_DEG = 0.5
+GIMBAL_CONTROL_HZ = 10.0
+GIMBAL_DEADZONE_X = 0.040
+GIMBAL_DEADZONE_Y = 0.050
+GIMBAL_MAX_STEP_DEG = 0.7
+GIMBAL_MAX_RATE_DEG_S = 6.0
+GIMBAL_MAX_ACCEL_DEG_S2 = 12.0
 GIMBAL_MAX_OFFSET_DEG = 45
 GIMBAL_MIN_STABLE = 3
 GIMBAL_MIN_SCORE = 0.28
 ```
+
+## 1 m 固定瞄准关系
+
+GC4653 原装镜头视场角为水平 `81°`、垂直 `51°`。640x480 下等效焦距约为 `fx=374 px`、`fy=503 px`。激光位于摄像头右侧 `10 mm`、下方 `60 mm`，在 `1000 mm` 平面上的像素偏移为：
+
+```text
+dx = fx * 10 / 1000 = 3.7 px
+dy = fy * 60 / 1000 = 30.2 px
+固定瞄准点 = (320 + 4, 240 + 30) = (324, 270)
+```
+
+程序不识别红点。该关系只适用于约 1 m；例如距离变化到 0.9 m 或 1.1 m 时会出现毫米级剩余视差。
 
 舵机接线默认是：
 
@@ -108,7 +122,7 @@ ENABLE_GIMBAL = True
 ENABLE_GIMBAL_TRACKING = True
 ```
 
-第一次保持 `GIMBAL_MAX_STEP_DEG = 0.5`，并只用安全舵机观察方向。若水平或俯仰方向相反，只改对应的 `GIMBAL_PAN_SIGN` 或 `GIMBAL_TILT_SIGN`，不要改角度限幅。
+第一次保持 `GIMBAL_MAX_STEP_DEG = 0.7`，并只用安全舵机观察方向。若水平或俯仰方向相反，只改对应的 `GIMBAL_PAN_SIGN` 或 `GIMBAL_TILT_SIGN`，不要改角度限幅。
 
 ### 3. 观察日志
 
@@ -116,8 +130,8 @@ ENABLE_GIMBAL_TRACKING = True
 
 ```text
 GIMBAL_INIT_OK
-GIMBAL_TRACK_OK,HZ,8.0,DEADZONE,0.055,MAX_STEP,2.0
-AIM,TRACK,<id>,EX,<x_error>,EY,<y_error>,PAN,<angle>,TILT,<angle>
+GIMBAL_TRACK_OK,HZ,10.0,DEADZONE,0.040,MAX_STEP,0.7,AIM,324,270,DIST_MM,1000
+AIM,TRACK,<id>,EX,<x_error>,EY,<y_error>,PAN,<angle>,TILT,<angle>,REF,324,270
 ```
 
 任何时刻发现动作异常，建立 `/root/snail_egg/disable_gimbal` 文件并重启应用；程序检测到该文件后不会初始化 PWM。

@@ -87,12 +87,22 @@ rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run
 第一轮建议：
 
 ```python
-GIMBAL_MAX_STEP_DEG = 0.5
-GIMBAL_CONTROL_HZ = 5.0
-GIMBAL_DEADZONE_X = 0.070
-GIMBAL_DEADZONE_Y = 0.070
+GIMBAL_MAX_STEP_DEG = 0.7
+GIMBAL_CONTROL_HZ = 10.0
+GIMBAL_DEADZONE_X = 0.040
+GIMBAL_DEADZONE_Y = 0.050
+GIMBAL_MAX_RATE_DEG_S = 6.0
+GIMBAL_MAX_ACCEL_DEG_S2 = 12.0
 GIMBAL_PAN_KI = 0.0
 GIMBAL_TILT_KI = 0.0
+```
+
+验收标准：静态误差 3 秒内进入 12 px；10 秒周期、50 px 幅度扰动的稳态 `P95 <= 30 px`；目标丢失后不再发送新角度；任何时刻不得超出 `45°~135°`。
+
+控制器离线回归：
+
+```powershell
+python scripts\test_gimbal_control_dynamics.py
 ```
 
 ## 日志评价
