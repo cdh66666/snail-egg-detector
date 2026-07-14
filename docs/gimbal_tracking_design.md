@@ -45,7 +45,7 @@ ENABLE_GIMBAL_TRACKING = True
 4. 用预测框与新检测框的距离和 IoU 做轻量数据关联，保持稳定 ID。
 5. 允许短暂漏检时继续显示预测框，但预测框不会驱动舵机。
 6. 主目标默认锁住当前最高分的稳定轨迹；也可以设置 `LOCK_TARGET_ID` 锁定指定 ID。
-7. 云台控制每秒最多 8 次，带图像中心死区、PID、单次变化限幅和绝对角度限幅。
+7. 云台控制每秒最多 5 次，带图像中心死区、P 控制、单次变化限幅和绝对角度限幅。
 
 这样可以保留 MaixCam 的实时性，不把完整 PC 跟踪框架和深度特征模型搬到设备端。
 
@@ -54,10 +54,10 @@ ENABLE_GIMBAL_TRACKING = True
 在 `maixcam/main.py` 顶部调整：
 
 ```python
-GIMBAL_CONTROL_HZ = 8.0
-GIMBAL_DEADZONE_X = 0.055
-GIMBAL_DEADZONE_Y = 0.055
-GIMBAL_MAX_STEP_DEG = 2.0
+GIMBAL_CONTROL_HZ = 5.0
+GIMBAL_DEADZONE_X = 0.070
+GIMBAL_DEADZONE_Y = 0.070
+GIMBAL_MAX_STEP_DEG = 0.5
 GIMBAL_MAX_OFFSET_DEG = 45
 GIMBAL_MIN_STABLE = 3
 GIMBAL_MIN_SCORE = 0.28

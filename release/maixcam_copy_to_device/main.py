@@ -17,37 +17,45 @@ LOW_CONF_MIN_PINK_RATIO = 0.035
 LOW_CONF_MIN_AREA = 18
 
 # Basic gimbal control. On the current wiring A19/PWM7 is pan and
-# A18/PWM6 is tilt. Every command is clamped to center +/-45 degrees.
-# Every command is clamped to center +/-45 degrees before PWM output.
+# A18/PWM6 is tilt. Every command is clamped to center +/-45 degrees
+# before PWM output.
 # Keep the gimbal completely still during detector startup. Tracking code can
 # enable this explicitly after the camera has reached a stable state.
 ENABLE_GIMBAL = False
 # The controller is deliberately a second opt-in switch.  It cannot move a
 # servo unless both this flag and ENABLE_GIMBAL are enabled.
 ENABLE_GIMBAL_TRACKING = False
+GIMBAL_ENABLE_FLAG = "/root/snail_egg/enable_gimbal_tracking"
+GIMBAL_DRY_RUN_FLAG = "/root/snail_egg/gimbal_dry_run"
 GIMBAL_DISABLE_FLAG = "/root/snail_egg/disable_gimbal"
+# A monitor photographed by the camera is a different visual domain from real
+# outdoor scenes. This opt-in flag lowers only the model score floor for the
+# desktop tracking rig; removing it restores the production thresholds above.
+SCREEN_TEST_FLAG = "/root/snail_egg/screen_tracking_test"
+SCREEN_TEST_CONF_TH = 0.05
 GIMBAL_FREQ = 50
 GIMBAL_CENTER_DEG = 90
 GIMBAL_MAX_OFFSET_DEG = 45
 GIMBAL_CENTER_SETTLE_S = 0.35
 GIMBAL_PAN_PWM_ID = 7
 GIMBAL_TILT_PWM_ID = 6
-# Control loop is slower than the detector on purpose.  The detector/display
-# can stay near 19 FPS while the hobby servos receive smooth 8 Hz updates.
-GIMBAL_CONTROL_HZ = 8.0
-GIMBAL_DEADZONE_X = 0.055
-GIMBAL_DEADZONE_Y = 0.055
-GIMBAL_MAX_STEP_DEG = 2.0
-GIMBAL_PAN_KP = 5.5
+# Control loop is slower than the detector on purpose. The detector/display
+# can stay near 19 FPS while the hobby servos receive smooth 5 Hz updates.
+GIMBAL_CONTROL_HZ = 5.0
+GIMBAL_DEADZONE_X = 0.070
+GIMBAL_DEADZONE_Y = 0.070
+GIMBAL_MAX_STEP_DEG = 0.5
+GIMBAL_PAN_KP = 2.2
 GIMBAL_PAN_KI = 0.0
-GIMBAL_PAN_KD = 0.18
-GIMBAL_TILT_KP = 5.0
+GIMBAL_PAN_KD = 0.0
+GIMBAL_TILT_KP = 2.0
 GIMBAL_TILT_KI = 0.0
-GIMBAL_TILT_KD = 0.16
+GIMBAL_TILT_KD = 0.0
 GIMBAL_PAN_SIGN = 1.0
 GIMBAL_TILT_SIGN = -1.0
 GIMBAL_MIN_STABLE = 3
 GIMBAL_MIN_SCORE = 0.28
+GIMBAL_LOG_EVERY_N_FRAMES = 10
 
 # 0 = raw YOLO debug: draw every model detection, no color filtering.
 # 1 = color debug: raw boxes are yellow, pink-passed boxes are green.
@@ -129,8 +137,12 @@ DUAL_BUFF = False
 PRINT_EVERY_N_FRAMES = 10
 STAT_EVERY_N_FRAMES = 30
 DEBUG_DIR = "/root/snail_egg/debug"
+DEBUG_CAPTURE_FLAG = "/root/snail_egg/capture_frames"
+DEBUG_CAPTURE_ONCE_FLAG = "/root/snail_egg/capture_once"
 DEBUG_SAVE_EVERY_N_FRAMES = 15
 DEBUG_MAX_SAVES = 6
+MANUAL_CAPTURE_EVERY_N_FRAMES = 60
+MANUAL_CAPTURE_MAX_SAVES = 4
 # Default to visual output for MaixVision/device use. The VSCode SSH helper
 # creates /root/snail_egg/headless before running so automated tests do not
 # block on display.Display().
@@ -176,6 +188,34 @@ def safe_sleep(seconds):
         pass
 
 
+def file_exists(path):
+    try:
+        return os.path.exists(path)
+    except Exception:
+        return False
+
+
+def gimbal_pwm_requested():
+    if file_exists(GIMBAL_DISABLE_FLAG):
+        return False
+    return ENABLE_GIMBAL or file_exists(GIMBAL_ENABLE_FLAG)
+
+
+def gimbal_tracking_requested():
+    if file_exists(GIMBAL_DISABLE_FLAG):
+        return False
+    return (
+        (ENABLE_GIMBAL and ENABLE_GIMBAL_TRACKING)
+        or file_exists(GIMBAL_ENABLE_FLAG)
+        or file_exists(GIMBAL_DRY_RUN_FLAG)
+    )
+
+
+SCREEN_TEST_MODE = file_exists(SCREEN_TEST_FLAG)
+ACTIVE_CONF_TH = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else CONF_TH
+ACTIVE_MIN_MODEL_CONF = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else MIN_MODEL_CONF
+
+
 class Gimbal:
     def __init__(self):
         self.pan_offset = 0
@@ -213,6 +253,25 @@ class Gimbal:
             self.tilt.disable()
         except Exception as e:
             print("GIMBAL_DISABLE_TILT_ERROR,%s" % e)
+
+
+class DryRunGimbal:
+    """Records bounded commands without configuring pins or PWM hardware."""
+
+    def __init__(self):
+        self.pan_offset = 0.0
+        self.tilt_offset = 0.0
+
+    def set_offsets(self, pan_offset, tilt_offset, source="CMD"):
+        self.pan_offset = clamp_gimbal_offset(pan_offset)
+        self.tilt_offset = clamp_gimbal_offset(tilt_offset)
+        print(
+            "GIMBAL,DRY_RUN,%s,PAN_OFFSET,%.2f,TILT_OFFSET,%.2f"
+            % (source, self.pan_offset, self.tilt_offset)
+        )
+
+    def close(self):
+        print("GIMBAL,DRY_RUN,CLOSE")
 
 
 class GimbalAxisController:
@@ -301,18 +360,18 @@ class GimbalTracker:
 
         self.pan_offset = clamp_gimbal_offset(self.pan_offset + self.pan.step(error_x, dt))
         self.tilt_offset = clamp_gimbal_offset(self.tilt_offset + self.tilt.step(error_y, dt))
-        self.gimbal.set_offsets(round(self.pan_offset), round(self.tilt_offset), "TRACK")
-        return "TRACK,%d,EX,%.3f,EY,%.3f,PAN,%d,TILT,%d" % (
+        self.gimbal.set_offsets(self.pan_offset, self.tilt_offset, "TRACK")
+        return "TRACK,%d,EX,%.3f,EY,%.3f,PAN,%.2f,TILT,%.2f" % (
             target.track_id,
             error_x,
             error_y,
-            round(self.pan_offset),
-            round(self.tilt_offset),
+            self.pan_offset,
+            self.tilt_offset,
         )
 
 
 def init_gimbal_tracker(gimbal):
-    if gimbal is None or not ENABLE_GIMBAL_TRACKING:
+    if gimbal is None or not gimbal_tracking_requested():
         print("GIMBAL_TRACK_SKIP,DISABLED")
         return None
     print("GIMBAL_TRACK_OK,HZ,%.1f,DEADZONE,%.3f,MAX_STEP,%.1f" % (
@@ -322,15 +381,12 @@ def init_gimbal_tracker(gimbal):
 
 
 def init_gimbal():
-    if not ENABLE_GIMBAL:
+    if file_exists(GIMBAL_DRY_RUN_FLAG) and not file_exists(GIMBAL_DISABLE_FLAG):
+        print("GIMBAL_INIT_DRY_RUN")
+        return DryRunGimbal()
+    if not gimbal_pwm_requested():
         print("GIMBAL_SKIP,DISABLED")
         return None
-    try:
-        if os.path.exists(GIMBAL_DISABLE_FLAG):
-            print("GIMBAL_SKIP,FLAG")
-            return None
-    except Exception:
-        pass
     try:
         print("GIMBAL_INIT_START,LIMIT,+-%d" % GIMBAL_MAX_OFFSET_DEG)
         gimbal = Gimbal()
@@ -513,7 +569,7 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
             best_red_ratio = red_ratio
         area = w * h
         red_reject = red_ratio > MAX_RED_BAD_RATIO and red_ratio > pink_ratio * RED_BAD_DOMINANCE
-        score_ok = obj.score >= MIN_MODEL_CONF
+        score_ok = obj.score >= ACTIVE_MIN_MODEL_CONF
         if score_ok and obj.score >= STRONG_MODEL_CONF:
             color_ok = not red_reject
         else:
@@ -802,7 +858,7 @@ def detect_frame(detector, img, frame_id):
         tile = img if (tx == 0 and ty == 0 and frame_w == tile_w and frame_h == tile_h) else crop_tile(img, tx, ty, tile_w, tile_h)
         if tile is None:
             continue
-        objs = detector.detect(tile, conf_th=CONF_TH, iou_th=IOU_TH)
+        objs = detector.detect(tile, conf_th=ACTIVE_CONF_TH, iou_th=IOU_TH)
         raw_count += len(objs)
         candidates, pink_ratio, red_ratio, candidate_rows = filter_candidates(
             tile, objs, tile_w, tile_h, frame_id
@@ -836,8 +892,8 @@ print(
         1 if ROUND_ROBIN_TILES else 0,
         TILES_PER_FRAME,
         MEMORY_TTL_FRAMES,
-        CONF_TH,
-        MIN_MODEL_CONF,
+        ACTIVE_CONF_TH,
+        ACTIVE_MIN_MODEL_CONF,
         STRONG_MODEL_CONF,
         IOU_TH,
         MIN_PINK_RATIO,
@@ -870,6 +926,7 @@ else:
     print("INIT,DISPLAY_SKIP")
 frame_id = 0
 debug_saved = 0
+manual_capture_saved = 0
 print("INIT,LOOP_START")
 
 while not app.need_exit():
@@ -885,15 +942,38 @@ while not app.need_exit():
             print("TRACE,%d,SAVE_ERROR,%s" % (frame_id, e))
         print("TRACE,%d,DETECT_BEGIN" % frame_id)
     raw_count, candidates, best_pink_ratio, best_red_ratio, candidate_rows = detect_frame(detector, img, frame_id)
+    if file_exists(DEBUG_CAPTURE_ONCE_FLAG):
+        try:
+            capture_path = "%s/once_%06d.jpg" % (DEBUG_DIR, frame_id)
+            img.save(capture_path)
+            os.remove(DEBUG_CAPTURE_ONCE_FLAG)
+            print("MANUAL_CAPTURE_ONCE,%s" % capture_path)
+        except Exception as e:
+            print("MANUAL_CAPTURE_ONCE_ERROR,%s" % e)
+    if (
+        manual_capture_saved < MANUAL_CAPTURE_MAX_SAVES
+        and file_exists(DEBUG_CAPTURE_FLAG)
+        and frame_id % MANUAL_CAPTURE_EVERY_N_FRAMES == 0
+    ):
+        try:
+            capture_path = "%s/manual_%06d.jpg" % (DEBUG_DIR, frame_id)
+            img.save(capture_path)
+            manual_capture_saved += 1
+            print("MANUAL_CAPTURE,%s" % capture_path)
+        except Exception as e:
+            print("MANUAL_CAPTURE_ERROR,%s" % e)
     if RUN_MODE == 3 and frame_id < 3:
         print("TRACE,%d,DETECT_OK,%d" % (frame_id, raw_count))
     stable = update_tracks(candidates)
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
     primary_obj = select_primary_target([item[0] for item in targets])
     primary_id = getattr(primary_obj, "track_id", 0) if primary_obj else 0
+    control_status = "OFF"
     if gimbal_tracker is not None:
         control_status = gimbal_tracker.update(primary_obj, FRAME_W, FRAME_H, pytime.time())
         if control_status.startswith("TRACK,"):
+            print("AIM,%s" % control_status)
+        elif frame_id % GIMBAL_LOG_EVERY_N_FRAMES == 0 and control_status != "HOLD,RATE":
             print("AIM,%s" % control_status)
     save_debug = (
         RUN_MODE == 3

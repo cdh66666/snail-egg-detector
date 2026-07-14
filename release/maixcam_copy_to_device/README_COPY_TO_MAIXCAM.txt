@@ -8,16 +8,21 @@ MaixCam 福寿螺卵识别部署包
 - 默认阈值：CONF_TH = 0.18
 - 后处理：模型分数 + 粉色比例 + 红色排除 + 大小/形状过滤
 
-明天调试建议：先单独运行 gimbal_servo_test.py，确认两个舵机轴向和方向；
-再把 main.py 顶部的 ENABLE_GIMBAL 和 ENABLE_GIMBAL_TRACKING 都改为 True。
-首次建议把 GIMBAL_MAX_STEP_DEG 改为 1.0。方向相反时只调整对应的
-GIMBAL_PAN_SIGN 或 GIMBAL_TILT_SIGN，不要扩大 45 度绝对限幅。
+云台跟踪默认关闭。当前接线为水平 A19/PWM7、俯仰 A18/PWM6；控制频率
+5 Hz，每次最多移动 0.5 度，绝对范围固定为 45 到 135 度。预测框、丢失目标
+和不稳定目标不会驱动舵机。两个舵机应使用独立稳压 5V 电源并与 MaixCam 共地。
 
-云台跟踪默认关闭。只有同时把 main.py 顶部的 ENABLE_GIMBAL 和
-ENABLE_GIMBAL_TRACKING 改为 True，程序才会输出舵机 PWM。预测框、丢失目标
-和不稳定目标都不会驱动舵机；控制器每次最多移动 2 度，绝对范围固定为
-45 到 135 度。当前接线为水平 A19/PWM7、俯仰 A18/PWM6。
-紧急禁用：在设备上创建 /root/snail_egg/disable_gimbal。
+先用干跑模式验证跟踪，不输出 PWM：
+  mkdir -p /root/snail_egg
+  touch /root/snail_egg/gimbal_dry_run
+
+确认供电、方向、急停和机械限位后，才开启真实跟踪：
+  rm -f /root/snail_egg/gimbal_dry_run /root/snail_egg/disable_gimbal
+  touch /root/snail_egg/enable_gimbal_tracking
+
+紧急禁用：
+  touch /root/snail_egg/disable_gimbal
+  rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run
 
 复制位置：
 
@@ -40,6 +45,10 @@ Mac 终端示例：
   ssh root@$MAIX_IP "mkdir -p /maixapp/apps/$APP_ID /root/models"
   scp main.py root@$MAIX_IP:/maixapp/apps/$APP_ID/main.py
   scp root/models/snail_eggs_yolov8n_640x480.* root@$MAIX_IP:/root/models/
+  ssh root@$MAIX_IP "sync"
+
+需要开机自启时再执行：
+
   ssh root@$MAIX_IP "echo $APP_ID > /maixapp/auto_start.txt && sync && reboot"
 
 重启后检查：

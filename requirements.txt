@@ -6,3 +6,4 @@ onnx
 onnxruntime
 onnxslim
 paramiko<4
+pillow

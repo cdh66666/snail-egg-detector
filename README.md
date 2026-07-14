@@ -15,11 +15,19 @@ ENABLE_GIMBAL = False
 ENABLE_GIMBAL_TRACKING = False
 ```
 
-开启真实舵机跟踪前，必须只连接安全的舵机负载，并确认当前接线为水平 A19/PWM7、俯仰 A18/PWM6。控制器包含稳定帧门槛、当前帧检测门槛、图像中心死区、8 Hz 更新、单次最大 2° 变化和 45° 绝对偏移限幅。预测框只用于保持画面和 ID 连续，不会驱动舵机。紧急禁用可以在设备上创建：
+开启真实舵机跟踪前，必须只连接安全的舵机负载，并确认当前接线为水平 A19/PWM7、俯仰 A18/PWM6。控制器包含稳定帧门槛、当前帧检测门槛、图像中心死区、5 Hz 更新、单次最大 0.5° 变化和 45° 绝对偏移限幅。预测框只用于保持画面和 ID 连续，不会驱动舵机。紧急禁用可以在设备上创建：
 
 ```text
 /root/snail_egg/disable_gimbal
 ```
+
+可重复的屏幕目标程序和调试方法见 [云台跟踪测试方法](docs/gimbal_tracking_test_protocol.md)。程序默认是置顶的桌面小窗，不会占满屏幕；它会直接读取 PPTX 内的图片，依次运行居中、水平、垂直、矩形和平滑随机轨迹，并把目标位置写入 CSV：
+
+```powershell
+python scripts\gimbal_target_runner.py --pptx "path\to\images.pptx" --mode sequence --model models\snail_eggs_yolov8n_640x480.pt
+```
+
+右键或 `Esc` 可关闭小窗。`--fullscreen` 只用于无人值守实验，不是默认行为。
 
 ![检测流程](assets/diagrams/pipeline.svg)
 
