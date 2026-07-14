@@ -1,5 +1,35 @@
 # MaixCam 福寿螺卵实时识别
 
+## 多目标小目标优化（v12）
+
+本版针对“单团准确、同屏多团漏检”重新训练。数据严格按
+`train/val/test` 分源，测试图片不参与训练；新增 2--6 团多实例场景、
+18--82 px 尺度分层、亮度/对比度变化和真实硬负背景，并保留上下文中
+每一团可辨卵的标签。
+
+独立 PC 验收（640 输入，置信度 0.38）：
+
+- 原始 test：mAP50 97.45%，mAP50-95 62.75%。
+- 多目标可辨尺度验证集：实例召回率 90.1%。
+- 800 张独立硬负图片：颜色安全过滤后出现 2 个点状误检；部署端额外
+  排除双边均不超过 11 px 的不可操作点状框。
+- MaixCam 单次 640x480 推理约 20 FPS；未启用会显著降速的逐帧 SAHI。
+
+复现多目标数据和评估：
+
+```bash
+python scripts/build_multi_instance_dataset.py \
+  --base data/yolo_pinkeggs_camera_domain_v10_640x480 \
+  --source data/yolo_pinkeggs_hardneg_v8_field_light_640x480 \
+  --output data/yolo_pinkeggs_multi_v12_640x480 \
+  --train-scenes 1400 --val-scenes 240 --clean
+
+python scripts/evaluate_multi_instance.py \
+  --model models/snail_eggs_yolov8n_640x480.pt \
+  --dataset data/yolo_pinkeggs_multi_v12_640x480 \
+  --conf 0.38 --output runs/multi_instance_report.json
+```
+
 基于 YOLOv8n 和 Sipeed MaixCam 的福寿螺卵团实时检测程序。项目默认使用 640x480 摄像头画面做全画面单次推理，在屏幕上标出紧贴目标的检测框、中心十字和从左上到右下排序的 ID。
 
 当前版本面向低延迟瞄准验证：不使用 tile 轮询，不保留旧帧记忆框，避免同一位置反复残留识别框。

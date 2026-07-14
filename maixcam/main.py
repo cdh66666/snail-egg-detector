@@ -110,6 +110,9 @@ MEMORY_TTL_FRAMES = 36
 # After field tuning, raise CONF_TH, turn ENABLE_COLOR_GATE back on, and require
 # stable frames before sending targets to any actuator.
 MIN_BOX_AREA = 18
+# Reject dot-like detections that are too small to be an actionable egg mass.
+# A thin mass is still accepted when either side exceeds this limit.
+MAX_TINY_BOX_SIDE = 11
 MAX_BOX_AREA_RATIO = 0.32
 MAX_BOX_SIDE_RATIO = 0.86
 MIN_ASPECT = 0.18
@@ -587,6 +590,8 @@ def pass_geometry(obj, frame_w, frame_h):
     h = int(obj.h)
     area = w * h
     if area < MIN_BOX_AREA:
+        return False
+    if w <= MAX_TINY_BOX_SIDE and h <= MAX_TINY_BOX_SIDE:
         return False
     if area / float(frame_w * frame_h) > MAX_BOX_AREA_RATIO:
         return False
