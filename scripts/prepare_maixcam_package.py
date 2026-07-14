@@ -25,6 +25,11 @@ def main() -> None:
     parser.add_argument("--mud", type=Path, default=ROOT / "maixcam" / "snail_eggs_yolov8n_640x480.mud")
     parser.add_argument("--input-width", type=int, default=640)
     parser.add_argument("--input-height", type=int, default=480)
+    parser.add_argument(
+        "--calibration-dir",
+        type=Path,
+        default=ROOT / "data" / "yolo_pinkeggs_hardneg_v2" / "images" / "train",
+    )
     args = parser.parse_args()
 
     out = args.out.resolve()
@@ -51,14 +56,15 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    image_dir = ROOT / "data" / "yolo_pinkeggs_hardneg_v2" / "images" / "train"
+    image_dir = args.calibration_dir.resolve()
     images = sorted([p for p in image_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
     if not images:
         raise SystemExit(f"No calibration images found in {image_dir}")
 
     cali_dir = out / "convert" / "cali_images"
     cali_dir.mkdir(parents=True, exist_ok=True)
-    selected = images[: args.calibration_images]
+    count = min(args.calibration_images, len(images))
+    selected = [images[index * len(images) // count] for index in range(count)]
     for img in selected:
         shutil.copy2(img, cali_dir / img.name)
     shutil.copy2(selected[0], out / "convert" / "image.jpg")

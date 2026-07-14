@@ -23,6 +23,8 @@ ENABLE_GIMBAL_TRACKING = False
 
 当前激光发生器位于摄像头右侧 `10 mm`、下方 `60 mm`，只要求约 `1.0 m` 工作距离。按 GC4653 原装镜头水平 `81°`、垂直 `51°` 视场计算，固定瞄准点是画面 `(324,270)`，不是几何中心 `(320,240)`。生产控制直接使用这个固定点，不识别红点；改变距离、镜头、分辨率或安装位置后必须重新标定。
 
+近距离屏幕调试约为 `0.35 m`，`screen_tracking_test` 模式使用实测点 `(329,326)` 和 `0.08` 检测阈值；同时排除该点 `32 px` 内尺寸不超过 `52x56 px` 的小亮斑框，防止模型反过来锁住激光红点。删除测试标志后自动恢复 1 m 参数。
+
 可重复的屏幕目标程序和调试方法见 [云台跟踪测试方法](docs/gimbal_tracking_test_protocol.md)。程序默认是置顶的桌面小窗，不会占满屏幕；它会直接读取 PPTX 内的图片，依次运行居中、水平、垂直、矩形和平滑随机轨迹，并把目标位置写入 CSV：
 
 ```powershell
@@ -57,8 +59,8 @@ python scripts\gimbal_target_runner.py --pptx "path\to\images.pptx" --mode seque
 
 ```python
 MODEL = "/root/models/snail_eggs_yolov8n_640x480.mud"
-CONF_TH = 0.18
-MIN_MODEL_CONF = 0.18
+CONF_TH = 0.38
+MIN_MODEL_CONF = 0.38
 MAX_BOX_AREA_RATIO = 0.32
 MAX_BOX_SIDE_RATIO = 0.86
 MIN_PINK_RATIO = 0.035
@@ -68,14 +70,14 @@ FRAME_H = 480
 USE_TILED_INFERENCE = False
 ```
 
-`CONF_TH=0.18` 是当前实机部署的召回优先设置。接入执行器前建议先把 `CONF_TH` 和 `MIN_MODEL_CONF` 提高到 `0.25` 或 `0.35`，用低功率指示灯验证坐标稳定性后再调整。
+`CONF_TH=0.38` 是 v10 INT8 模型在当前 MaixCam 上经过正负动态验收后的设置。更换镜头、光照环境或安装距离后必须重新跑正样本召回和困难负样本测试，不应只靠降低阈值补召回。
 
 ## 离线评估
 
 当前上线权重：
 
 ```text
-runs/detect/runs_yolo/pinkeggs_yolov8n_640x480_hardneg_v5/weights/best.pt
+runs/detect/runs_yolo/pinkeggs_camera_domain_v10_v8n/weights/best.pt
 ```
 
 对应的可发布文件已经放在：
@@ -89,10 +91,10 @@ release/maixcam_copy_to_device/root/models/snail_eggs_yolov8n_640x480.mud
 
 | 评估项 | 设置 | 结果 |
 | --- | --- | --- |
-| YOLO test split | `imgsz=480,640`，`conf=0.18`，安全过滤 | TP 91 / FP 6 / FN 4，Recall 95.79%，Precision 93.81% |
-| YOLO test split | `imgsz=480,640`，`conf=0.25`，安全过滤 | TP 90 / FP 4 / FN 5，Recall 94.74%，Precision 95.74% |
-| 混合负样本 holdout | 5183 张 COCO + Bing/Wikimedia/混杂负样本，`conf=0.18`，安全过滤 | 3 张图误检，图像级误检率 0.058% |
-| 混合负样本 holdout | 5183 张 COCO + Bing/Wikimedia/混杂负样本，`conf=0.25`，安全过滤 | 2 张图误检，图像级误检率 0.039% |
+| 原始 YOLO test split | 216 张，95 个实例 | Precision 94.7%，Recall 93.3%，mAP50 97.0% |
+| 真机 PPT 留出集 | 27 帧，未参与训练，PC `conf=0.40` | 25/27 帧检出，帧召回 92.6% |
+| 真机动态正样本 | 正常、暗淡、缩小和移动，INT8 `conf=0.38` | 可见统计窗口全部保持检测；约 16.5 FPS |
+| 真机动态困难负样本 | 40 类干扰图，INT8 `conf=0.38` | 64/64 统计窗口零误报；约 19.1 FPS |
 
 评估结果保存在：
 
@@ -196,44 +198,42 @@ python scripts/yolo_detect_media.py path/to/video.mp4 \
 
 ## 复现训练
 
-训练数据默认不提交到 Git。复现训练时需要准备 YOLO 格式数据集：
+训练数据默认不提交到 Git。当前 v10 先用 MaixCam 拍摄显示器中的训练图片，通过单应变换把原标签投影到原始摄像头帧，再和 v8 数据合并。PPT 图片只作留出测试，禁止加入训练集。
 
 ```text
-data/yolo_pinkeggs_hardneg_v5_640x480/
+data/yolo_pinkeggs_camera_domain_v10_640x480/
   images/train
   images/val
   images/test
   labels/train
   labels/val
   labels/test
-  pinkeggs_hardneg.yaml
+  pinkeggs_camera_domain.yaml
 ```
 
-现场采集到新的光照、距离、角度样本后，可以用训练集增强脚本生成额外鲁棒性样本：
+真实相机域采集和合并命令：
 
 ```bash
-python scripts/augment_field_robustness.py \
-  --base-root data/yolo_pinkeggs_hardneg_v5_640x480 \
-  --output-root data/yolo_pinkeggs_hardneg_v6_field_640x480 \
-  --overwrite
+python scripts/collect_maixcam_domain_dataset.py --dataset data/yolo_pinkeggs_hardneg_v8_field_light_640x480 --pptx path/to/holdout.pptx --output runs/camera_domain_v10
+python scripts/build_camera_domain_dataset.py --base data/yolo_pinkeggs_hardneg_v8_field_light_640x480 --camera runs/camera_domain_v10 --output data/yolo_pinkeggs_camera_domain_v10_640x480
 ```
 
-这个脚本只扩充训练集，默认不改验证集和测试集，方便保持评估相对公平。
+采集器给正样本保留约 3.2 倍目标上下文，避免模型把显示器里的图片卡片边界当成目标；过暗到肉眼不可辨识的正样本只用于压力测试。构建器不修改原测试集，也不会合并 PPT 留出帧。
 
 训练当前 640x480 模型：
 
 ```bash
 python scripts/yolo_train.py \
-  --data data/yolo_pinkeggs_hardneg_v5_640x480/pinkeggs_hardneg.yaml \
-  --base-model yolov8n.pt \
-  --epochs 45 \
+  --data data/yolo_pinkeggs_camera_domain_v10_640x480/pinkeggs_camera_domain.yaml \
+  --base-model models/snail_eggs_yolov8n_640x480.pt \
+  --epochs 50 \
   --imgsz 640 \
   --export-imgsz 480,640 \
-  --batch 12 \
+  --batch 16 \
   --device 0 \
   --workers 0 \
   --project runs_yolo \
-  --name pinkeggs_yolov8n_640x480_hardneg_v5 \
+  --name pinkeggs_camera_domain_v10_v8n \
   --patience 12 \
   --rect \
   --export-onnx
@@ -249,30 +249,30 @@ python scripts/yolo_train.py \
 
 ```bash
 python scripts/evaluate_thresholds.py \
-  --model runs/detect/runs_yolo/pinkeggs_yolov8n_640x480_hardneg_v5/weights/best.pt \
-  --data-root data/yolo_pinkeggs_hardneg_v5_640x480 \
+  --model runs/detect/runs_yolo/pinkeggs_camera_domain_v10_v8n/weights/best.pt \
+  --data-root data/yolo_pinkeggs_camera_domain_v10_640x480 \
   --split test \
   --imgsz 480,640 \
   --safe-filter \
-  --confs 0.10,0.12,0.15,0.18,0.20,0.25,0.30,0.35 \
-  --output runs/eval_640x480_v5_revised_filter.json
+  --confs 0.20,0.25,0.30,0.35,0.38,0.40,0.45 \
+  --output runs/eval_640x480_v10_filter.json
 ```
 
 评估负样本误检：
 
 ```bash
 python scripts/evaluate_negative_fps.py \
-  --model runs/detect/runs_yolo/pinkeggs_yolov8n_640x480_hardneg_v5/weights/best.pt \
+  --model runs/detect/runs_yolo/pinkeggs_camera_domain_v10_v8n/weights/best.pt \
   --negative-dir data/coco/val2017 \
   --negative-dir data/hard_negatives_bing_v2 \
   --negative-dir data/hard_negatives_mixed_v2 \
   --negative-dir data/hard_negatives_wikimedia_v2 \
   --imgsz 480,640 \
-  --conf 0.18 \
+  --conf 0.38 \
   --device 0 \
   --safe-filter \
-  --exclude-yolo-root data/yolo_pinkeggs_hardneg_v5_640x480 \
-  --output runs/eval_640x480_v5_revised_neg_conf018.json
+  --exclude-yolo-root data/yolo_pinkeggs_camera_domain_v10_640x480 \
+  --output runs/eval_640x480_v10_neg_conf038.json
 ```
 
 ## 转换为 MaixCam 模型
@@ -286,6 +286,7 @@ python scripts/prepare_maixcam_package.py \
   --mud maixcam/snail_eggs_yolov8n_640x480.mud \
   --input-width 640 \
   --input-height 480 \
+  --calibration-dir data/yolo_pinkeggs_camera_domain_v10_640x480/images/train \
   --calibration-images 200
 ```
 

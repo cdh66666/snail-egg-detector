@@ -8,11 +8,11 @@ from maix import camera, display, image, nn, app, time, pwm, pinmap
 # Put the MUD and model file under /root/models/ on the MaixCam.
 
 MODEL = "/root/models/snail_eggs_yolov8n_640x480.mud"
-CONF_TH = 0.18
+CONF_TH = 0.38
 IOU_TH = 0.35
 MAX_TARGETS = 32
-MIN_MODEL_CONF = 0.18
-STRONG_MODEL_CONF = 0.50
+MIN_MODEL_CONF = 0.38
+STRONG_MODEL_CONF = 0.38
 LOW_CONF_MIN_PINK_RATIO = 0.035
 LOW_CONF_MIN_AREA = 18
 
@@ -32,7 +32,7 @@ GIMBAL_DISABLE_FLAG = "/root/snail_egg/disable_gimbal"
 # outdoor scenes. This opt-in flag lowers only the model score floor for the
 # desktop tracking rig; removing it restores the production thresholds above.
 SCREEN_TEST_FLAG = "/root/snail_egg/screen_tracking_test"
-SCREEN_TEST_CONF_TH = 0.01
+SCREEN_TEST_CONF_TH = 0.08
 GIMBAL_FREQ = 50
 GIMBAL_CENTER_DEG = 90
 GIMBAL_MAX_OFFSET_DEG = 45
@@ -85,6 +85,17 @@ LASER_OFFSET_RIGHT_MM = 10
 LASER_OFFSET_DOWN_MM = 60
 FIXED_AIM_X = 324
 FIXED_AIM_Y = 270
+# The desktop monitor used for gimbal tuning is about 0.35 m away. A captured
+# frame measured the visible aiming dot at y=326 there. Keep this calibration
+# separate so the field profile remains correct at the required 1.0 m range.
+SCREEN_TEST_AIM_X = 329
+SCREEN_TEST_AIM_Y = 326
+SCREEN_TEST_DISTANCE_MM = 350
+# A visible aiming dot can itself produce a small low-confidence YOLO box.
+# Reject only marker-sized boxes very close to the calibrated aim point.
+AIM_MARKER_REJECT_RADIUS_PX = 32
+AIM_MARKER_REJECT_MAX_W = 52
+AIM_MARKER_REJECT_MAX_H = 56
 # A 640x480 RGB888 frame is large on MaixCam. The SDK default is three
 # buffers; one buffer is enough here and avoids the VI memory allocation crash.
 CAMERA_BUFF_NUM = 1
@@ -228,6 +239,9 @@ SCREEN_TEST_MODE = file_exists(SCREEN_TEST_FLAG)
 ACTIVE_CONF_TH = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else CONF_TH
 ACTIVE_MIN_MODEL_CONF = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else MIN_MODEL_CONF
 ACTIVE_GIMBAL_MIN_SCORE = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else GIMBAL_MIN_SCORE
+ACTIVE_AIM_X = SCREEN_TEST_AIM_X if SCREEN_TEST_MODE else FIXED_AIM_X
+ACTIVE_AIM_Y = SCREEN_TEST_AIM_Y if SCREEN_TEST_MODE else FIXED_AIM_Y
+ACTIVE_AIM_DISTANCE_MM = SCREEN_TEST_DISTANCE_MM if SCREEN_TEST_MODE else LASER_WORK_DISTANCE_MM
 
 
 class Gimbal:
@@ -386,8 +400,8 @@ class GimbalTracker:
 
         cx = target.x + target.w * 0.5
         cy = target.y + target.h * 0.5
-        reference_x = FIXED_AIM_X
-        reference_y = FIXED_AIM_Y
+        reference_x = ACTIVE_AIM_X
+        reference_y = ACTIVE_AIM_Y
         error_x = (cx - reference_x) / max(1.0, frame_w * 0.5)
         error_y = (cy - reference_y) / max(1.0, frame_h * 0.5)
         if abs(error_x) < GIMBAL_DEADZONE_X:
@@ -417,9 +431,9 @@ def init_gimbal_tracker(gimbal):
         GIMBAL_CONTROL_HZ,
         GIMBAL_DEADZONE_X,
         GIMBAL_MAX_STEP_DEG,
-        FIXED_AIM_X,
-        FIXED_AIM_Y,
-        LASER_WORK_DISTANCE_MM,
+        ACTIVE_AIM_X,
+        ACTIVE_AIM_Y,
+        ACTIVE_AIM_DISTANCE_MM,
     ))
     return GimbalTracker(gimbal)
 
@@ -582,6 +596,19 @@ def pass_geometry(obj, frame_w, frame_h):
     return MIN_ASPECT <= aspect <= MAX_ASPECT
 
 
+def is_aim_marker_box(obj):
+    w = int(obj.w)
+    h = int(obj.h)
+    if w > AIM_MARKER_REJECT_MAX_W or h > AIM_MARKER_REJECT_MAX_H:
+        return False
+    cx = int(obj.x) + w // 2
+    cy = int(obj.y) + h // 2
+    return (
+        abs(cx - ACTIVE_AIM_X) <= AIM_MARKER_REJECT_RADIUS_PX
+        and abs(cy - ACTIVE_AIM_Y) <= AIM_MARKER_REJECT_RADIUS_PX
+    )
+
+
 def filter_candidates(img, objs, frame_w, frame_h, frame_id):
     kept = []
     rows = []
@@ -591,6 +618,9 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
         geometry_ok = pass_geometry(obj, frame_w, frame_h)
         if not geometry_ok:
             rows.append((idx, obj, False, False, 0.0, 0.0))
+            continue
+        if is_aim_marker_box(obj):
+            rows.append((idx, obj, True, False, 0.0, 0.0))
             continue
         x = max(0, int(obj.x))
         y = max(0, int(obj.y))

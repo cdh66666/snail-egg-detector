@@ -1,7 +1,8 @@
-"""Compact, repeatable visual target for MaixCam gimbal tuning.
+"""Compact, repeatable visual target for MaixCam gimbal tuning and capture.
 
-The runner reads raster images directly from a PPTX file, moves one image over
-deterministic trajectories, and records the requested screen position to CSV.
+The runner reads raster images from a PPTX file or image directory, moves one
+image over deterministic trajectories, and records the requested screen
+position to CSV.
 It uses only Tkinter and Pillow so it can run on a normal Windows training PC.
 """
 
@@ -57,6 +58,22 @@ def load_pptx_images(path: Path) -> list[TargetFrame]:
     return frames
 
 
+def load_image_dir(path: Path) -> list[TargetFrame]:
+    frames: list[TargetFrame] = []
+    for image_path in sorted(path.iterdir()):
+        if not image_path.is_file() or image_path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+            continue
+        try:
+            image = Image.open(image_path).convert("RGB")
+            if image.width >= 64 and image.height >= 64:
+                frames.append(TargetFrame(image_path.name, image))
+        except Exception as exc:
+            print("SKIP,%s,%s" % (image_path, exc))
+    if not frames:
+        raise RuntimeError("No usable raster images found in %s" % path)
+    return frames
+
+
 def crop_frames_to_detections(
     frames: list[TargetFrame], model_path: Path, margin: float
 ) -> list[TargetFrame]:
@@ -107,7 +124,7 @@ def crop_frames_to_detections(
 class TargetRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.frames = load_pptx_images(args.pptx)
+        self.frames = load_pptx_images(args.pptx) if args.pptx else load_image_dir(args.image_dir)
         if args.model is not None:
             self.frames = crop_frames_to_detections(self.frames, args.model, args.crop_margin)
         self.random = random.Random(args.seed)
@@ -338,7 +355,9 @@ class TargetRunner:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Repeatable desktop-pet target for MaixCam gimbal tuning")
-    parser.add_argument("--pptx", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--pptx", type=Path)
+    source.add_argument("--image-dir", type=Path)
     parser.add_argument("--mode", choices=("sequence", "center", "horizontal", "vertical", "rectangle", "smooth_random"), default="sequence")
     parser.add_argument("--duration", type=float, default=0.0, help="0 keeps running after the sequence")
     parser.add_argument("--seed", type=int, default=20260714)
@@ -365,8 +384,10 @@ def parse_args() -> argparse.Namespace:
     default_log = Path("runs/gimbal_target/target_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--log", type=Path, default=default_log)
     args = parser.parse_args()
-    if not args.pptx.is_file():
+    if args.pptx is not None and not args.pptx.is_file():
         parser.error("PPTX does not exist: %s" % args.pptx)
+    if args.image_dir is not None and not args.image_dir.is_dir():
+        parser.error("image directory does not exist: %s" % args.image_dir)
     if args.model is not None and not args.model.is_file():
         parser.error("model does not exist: %s" % args.model)
     if args.period_x <= 0.0 or args.period_y <= 0.0:
