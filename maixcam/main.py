@@ -8,10 +8,10 @@ from maix import camera, display, image, nn, app, time, pwm, pinmap
 # Put the MUD and model file under /root/models/ on the MaixCam.
 
 MODEL = "/root/models/snail_eggs_yolov8n_640x480.mud"
-CONF_TH = 0.38
+CONF_TH = 0.20
 IOU_TH = 0.35
 MAX_TARGETS = 32
-MIN_MODEL_CONF = 0.38
+MIN_MODEL_CONF = 0.20
 STRONG_MODEL_CONF = 0.38
 LOW_CONF_MIN_PINK_RATIO = 0.035
 LOW_CONF_MIN_AREA = 18
@@ -127,14 +127,18 @@ MAX_COLOR_CHECKS = 36
 REQUIRE_STABLE_FRAMES = 2
 # Keep a short prediction window when the detector misses a frame. At about
 # 19 FPS this is roughly 0.3 seconds, long enough to bridge transient misses.
-TRACK_MAX_MISSES = 6
-TRACK_PREDICT_MAX_MISSES = 4
+TRACK_MAX_MISSES = 24
+TRACK_PREDICT_MAX_MISSES = 12
+LOCK_REACQUIRE_RADIUS_PX = 40
+LOCK_RELEASE_MISSING_FRAMES = 150
 TRACK_MATCH_DISTANCE_SCALE = 1.35
 TRACK_KF_PROCESS_NOISE = 2.0
 TRACK_KF_MEASUREMENT_NOISE = 16.0
 # 0 means automatically lock the first stable track; set a positive ID to
 # lock a specific track later when the gimbal controller is connected.
 LOCK_TARGET_ID = 0
+PRIMARY_TARGET_POLICY = "leftmost"
+PRIMARY_COLUMN_TOLERANCE_PX = 40
 WARMUP_FRAMES = 6
 
 if SPEED_PROFILE == "full_frame":
@@ -178,6 +182,9 @@ HEADLESS_FLAG = "/root/snail_egg/headless"
 _tracks = []
 _next_track_id = 1
 _locked_track_id = 0
+_locked_last_center = None
+_locked_missing_frames = 0
+_primary_center = None
 _tile_scan_index = 0
 _memory = []
 _last_tile_info = "0/0"
@@ -805,21 +812,67 @@ def update_tracks(objs):
 
 
 def select_primary_target(objs):
-    global _locked_track_id
+    global _locked_track_id, _locked_last_center, _locked_missing_frames, _primary_center
+    if PRIMARY_TARGET_POLICY == "leftmost":
+        fresh = [obj for obj in objs if not getattr(obj, "predicted", False)]
+        if not fresh:
+            return None
+        if _primary_center is not None:
+            px, py = _primary_center
+            chosen = min(
+                fresh,
+                key=lambda obj: (obj_center(obj)[0] - px) ** 2 + (obj_center(obj)[1] - py) ** 2,
+            )
+            cx, cy = obj_center(chosen)
+            if ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 > LOCK_REACQUIRE_RADIUS_PX:
+                return None
+            _primary_center = (cx, cy)
+            _locked_track_id = getattr(chosen, "track_id", 0)
+            return chosen
+        # Egg masses are stationary and do not cross each other. Their
+        # relative horizontal ordering therefore survives camera motion and is
+        # more stable than detector track IDs that may be rebuilt after misses.
+        min_x = min(obj_center(obj)[0] for obj in fresh)
+        left_column = [obj for obj in fresh if obj_center(obj)[0] <= min_x + PRIMARY_COLUMN_TOLERANCE_PX]
+        chosen = sorted(left_column, key=lambda obj: obj_center(obj)[1])[0]
+        _locked_track_id = getattr(chosen, "track_id", 0)
+        _primary_center = obj_center(chosen)
+        _locked_last_center = _primary_center
+        _locked_missing_frames = 0
+        return chosen
     ids = [getattr(obj, "track_id", 0) for obj in objs]
     if LOCK_TARGET_ID > 0:
         _locked_track_id = LOCK_TARGET_ID if LOCK_TARGET_ID in ids else 0
-    elif _locked_track_id not in ids:
-        if objs:
-            # Lock the first stable target by score; this remains fixed while
-            # the target is briefly occluded or missed by the detector.
-            chosen = sorted(objs, key=lambda obj: obj.score, reverse=True)[0]
-            _locked_track_id = getattr(chosen, "track_id", 0)
-        else:
-            _locked_track_id = 0
     for obj in objs:
         if getattr(obj, "track_id", 0) == _locked_track_id:
+            _locked_last_center = obj_center(obj)
+            _locked_missing_frames = 0
             return obj
+    if _locked_track_id > 0:
+        _locked_missing_frames += 1
+        if _locked_last_center is not None and objs:
+            lx, ly = _locked_last_center
+            nearby = sorted(
+                objs,
+                key=lambda obj: (obj_center(obj)[0] - lx) ** 2 + (obj_center(obj)[1] - ly) ** 2,
+            )
+            chosen = nearby[0]
+            cx, cy = obj_center(chosen)
+            if ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5 <= LOCK_REACQUIRE_RADIUS_PX:
+                _locked_track_id = getattr(chosen, "track_id", 0)
+                _locked_last_center = (cx, cy)
+                _locked_missing_frames = 0
+                return chosen
+        if _locked_missing_frames < LOCK_RELEASE_MISSING_FRAMES:
+            return None
+        _locked_track_id = 0
+        _locked_last_center = None
+    if objs:
+        chosen = sorted(objs, key=lambda obj: obj.score, reverse=True)[0]
+        _locked_track_id = getattr(chosen, "track_id", 0)
+        _locked_last_center = obj_center(chosen)
+        _locked_missing_frames = 0
+        return chosen
     return None
 
 

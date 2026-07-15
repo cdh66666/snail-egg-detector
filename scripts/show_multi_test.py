@@ -13,8 +13,14 @@ def main():
     parser.add_argument("--images", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=45)
     parser.add_argument("--interval-ms", type=int, default=2500)
+    parser.add_argument("--x", type=int, default=20)
+    parser.add_argument("--y", type=int, default=20)
     args = parser.parse_args()
-    paths = sorted(args.images.glob("multi_*"))
+    paths = sorted(
+        path
+        for path in args.images.iterdir()
+        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    )
     random.Random(20260714).shuffle(paths)
     if not paths:
         raise SystemExit("No multi-target images found")
@@ -23,7 +29,7 @@ def main():
     root.title("multi-target test")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.geometry("420x315+20+20")
+    root.geometry("420x315+%d+%d" % (args.x, args.y))
     label = tk.Label(root, bg="black", borderwidth=0)
     label.pack(fill="both", expand=True)
     state = {"index": 0, "photo": None}
