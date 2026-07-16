@@ -279,8 +279,14 @@ class TargetRunner:
         now = self.elapsed()
         if now >= self.next_waypoint:
             self.random_goal = [
-                self.random.uniform(self.args.center_x - 0.25, self.args.center_x + 0.25),
-                self.random.uniform(self.args.center_y - 0.22, self.args.center_y + 0.22),
+                self.random.uniform(
+                    self.args.center_x - self.args.amplitude_x,
+                    self.args.center_x + self.args.amplitude_x,
+                ),
+                self.random.uniform(
+                    self.args.center_y - self.args.amplitude_y,
+                    self.args.center_y + self.args.amplitude_y,
+                ),
             ]
             self.next_waypoint = now + self.random.uniform(4.5, 7.0)
             if self.args.cycle_images:

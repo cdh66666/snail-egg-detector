@@ -94,7 +94,7 @@
         "${workspaceFolder}/scripts/maix_remote.ps1",
         "install-autostart",
         "--app-id",
-        "cdh1_",
+        "snail_egg",
         "--reboot"
       ],
       "problemMatcher": []

@@ -1,4 +1,4 @@
-"""Capture a safe +/-45 degree horizontal scan, then disable both servos."""
+"""Capture a safe 60..120 degree horizontal scan, then disable both servos."""
 
 import os
 import time as pytime
@@ -9,8 +9,8 @@ from maix import camera, pinmap, pwm
 PAN_PWM_ID = 6
 TILT_PWM_ID = 7
 CENTER = 90
-MIN_ANGLE = 45
-MAX_ANGLE = 135
+MIN_ANGLE = 60
+MAX_ANGLE = 120
 OUT_DIR = "/root/snail_egg/scan"
 
 
@@ -31,7 +31,7 @@ try:
     tilt = pwm.PWM(TILT_PWM_ID, freq=50, duty=duty(CENTER), enable=True)
     cam = camera.Camera(640, 480, buff_num=1)
     pytime.sleep(1.0)
-    for offset in (-45, -30, -15, 0, 15, 30, 45):
+    for offset in (-30, -20, -10, 0, 10, 20, 30):
         pan.duty(duty(CENTER + offset))
         tilt.duty(duty(CENTER))
         pytime.sleep(1.0)

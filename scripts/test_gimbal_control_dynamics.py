@@ -68,6 +68,14 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[max(0, math.ceil(fraction * len(ordered)) - 1)]
 
 
+def soften_deadzone(error: float, deadzone: float) -> float:
+    magnitude = abs(error)
+    if magnitude <= deadzone:
+        return 0.0
+    scaled = (magnitude - deadzone) / max(0.001, 1.0 - deadzone)
+    return scaled if error > 0.0 else -scaled
+
+
 def simulate(cfg: dict[str, float]) -> dict[str, float]:
     # Plant values are conservatively fitted to the July 14 hardware log:
     # 21.8 image pixels per pan degree and 0.8 s effective camera/servo lag.
@@ -84,8 +92,7 @@ def simulate(cfg: dict[str, float]) -> dict[str, float]:
         disturbance = 50.0 * math.sin(2.0 * math.pi * now / 10.0)
         error_px = disturbance + observed_shift
         error = error_px / 320.0
-        if abs(error) < cfg["GIMBAL_DEADZONE_X"]:
-            error = 0.0
+        error = soften_deadzone(error, cfg["GIMBAL_DEADZONE_X"])
         step = axis.step(error, dt)
         angle += step
         observed_shift += (21.8 * angle - observed_shift) * (1.0 - math.exp(-dt / 0.8))
@@ -110,8 +117,7 @@ def simulate_static_settle(cfg: dict[str, float]) -> float:
     for index in range(int(8.0 / dt)):
         error_px = -138.0 + observed_shift
         error = error_px / 320.0
-        if abs(error) < cfg["GIMBAL_DEADZONE_X"]:
-            error = 0.0
+        error = soften_deadzone(error, cfg["GIMBAL_DEADZONE_X"])
         angle += axis.step(error, dt)
         observed_shift += (21.8 * angle - observed_shift) * (1.0 - math.exp(-dt / 0.8))
         if abs(error_px) <= 12.0:

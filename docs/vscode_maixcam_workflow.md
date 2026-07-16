@@ -53,13 +53,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\maix_remote.ps1 depl
 ## 5. 安装为开机自启
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\maix_remote.ps1 install-autostart --app-id cdh1_ --reboot
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\maix_remote.ps1 install-autostart --app-id snail_egg --reboot
 ```
 
 这会写入：
 
 ```text
-/maixapp/apps/cdh1_/main.py
+/maixapp/apps/snail_egg/main.py
 /maixapp/auto_start.txt
 /root/models/snail_eggs_yolov8n_640x480.mud
 /root/models/snail_eggs_yolov8n_640x480.cvimodel

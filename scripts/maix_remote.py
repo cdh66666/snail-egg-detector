@@ -295,6 +295,14 @@ def reboot_board(args):
         print(f"reboot sent or connection dropped: {exc}")
 
 
+def exec_remote(args):
+    ssh = connect(args)
+    try:
+        run_checked(ssh, args.remote_command, timeout=args.timeout)
+    finally:
+        ssh.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deploy and run the snail egg detector on MaixCam.")
     parser.add_argument("--host", default=None)
@@ -320,7 +328,7 @@ def main():
     p_deploy_run.set_defaults(kill_existing=True)
 
     p_autostart = sub.add_parser("install-autostart")
-    p_autostart.add_argument("--app-id", default="cdh1_")
+    p_autostart.add_argument("--app-id", default="snail_egg")
     p_autostart.add_argument("--skip-models", action="store_true")
     p_autostart.add_argument("--reboot", action="store_true")
     p_autostart.add_argument("--no-kill", dest="kill_existing", action="store_false")
@@ -333,6 +341,10 @@ def main():
     p_debug.add_argument("--local-dir", type=Path, default=ROOT / "runs" / "maix_debug" / "latest")
 
     sub.add_parser("reboot")
+
+    p_exec = sub.add_parser("exec")
+    p_exec.add_argument("remote_command")
+    p_exec.add_argument("--timeout", type=float, default=20)
 
     args = parser.parse_args()
     try:
@@ -352,6 +364,8 @@ def main():
             download_debug(args)
         elif args.command == "reboot":
             reboot_board(args)
+        elif args.command == "exec":
+            exec_remote(args)
     except (paramiko.SSHException, socket.error, OSError) as exc:
         print(f"MaixCam connection failed: {exc}", file=sys.stderr)
         raise SystemExit(1)
