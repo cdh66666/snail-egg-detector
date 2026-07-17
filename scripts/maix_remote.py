@@ -13,6 +13,7 @@ import paramiko
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_PY = ROOT / "maixcam" / "main.py"
+WEB_CONTROL_PY = ROOT / "maixcam" / "web_control.py"
 PREVIEW_PY = ROOT / "maixcam" / "preview.py"
 MODEL_DIR = ROOT / "release" / "maixcam_copy_to_device" / "root" / "models"
 
@@ -132,6 +133,8 @@ def deploy(args, ssh=None):
         sftp = ssh.open_sftp()
         try:
             upload_file(sftp, MAIN_PY, f"{args.remote_dir}/main.py")
+            if WEB_CONTROL_PY.exists():
+                upload_file(sftp, WEB_CONTROL_PY, f"{args.remote_dir}/web_control.py")
             if not args.skip_models:
                 for model in model_files():
                     upload_file(sftp, model, f"/root/models/{model.name}")

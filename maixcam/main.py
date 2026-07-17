@@ -3,6 +3,10 @@ import os
 import time as pytime
 
 from maix import camera, display, image, nn, app, time, pwm, pinmap, gpio
+try:
+    from web_control import WebControl
+except Exception:
+    WebControl = None
 
 
 # Copy this file to MaixVision as main.py after converting the ONNX model to MUD.
@@ -37,6 +41,11 @@ AIM_RELAY_STARTUP_TEST_CYCLES = 1
 CLOSED_LOOP_AIM_FLAG = "/root/snail_egg/enable_closed_loop_aim"
 AIM_SCAN_FLAG = "/root/snail_egg/enable_aim_scan"
 CYCLE_TARGETS_FLAG = "/root/snail_egg/cycle_all_targets"
+COLOR_ONLY_FLAG = "/root/snail_egg/enable_color_only"
+COLOR_ONLY_THRESHOLDS = [[10, 115, 15, 127, -15, 127]]
+COLOR_ONLY_MIN_PIXELS = 12
+COLOR_ONLY_MIN_AREA = 18
+COLOR_ONLY_MIN_PINK_RATIO = 0.04
 AIM_DOT_LAB_THRESHOLDS = [[20, 100, 35, 127, -20, 127]]
 AIM_DOT_MIN_PIXELS = 1
 AIM_DOT_MAX_PIXELS = 420
@@ -235,6 +244,7 @@ DEBUG_SAVE_EVERY_N_FRAMES = 15
 DEBUG_MAX_SAVES = 6
 MANUAL_CAPTURE_EVERY_N_FRAMES = 60
 MANUAL_CAPTURE_MAX_SAVES = 4
+WEB_CONTROL_PORT = 8000
 # Default to visual output for MaixVision/device use. The VSCode SSH helper
 # creates /root/snail_egg/headless before running so automated tests do not
 # block on display.Display().
@@ -427,6 +437,10 @@ def aim_relay_decision(fresh_target, detected_frames, missing_frames):
 
 def cycle_targets_requested():
     return aim_scan_requested() and file_exists(CYCLE_TARGETS_FLAG)
+
+
+def color_only_requested():
+    return file_exists(COLOR_ONLY_FLAG)
 
 
 def gimbal_pwm_requested():
@@ -1657,6 +1671,44 @@ def crop_tile(img, x, y, w, h):
             return None
 
 
+def detect_color_only_frame(img):
+    """Broad pink-candidate detector used only by the comparison mode."""
+    try:
+        blobs = img.find_blobs(
+            COLOR_ONLY_THRESHOLDS,
+            x_stride=2,
+            y_stride=2,
+            area_threshold=COLOR_ONLY_MIN_AREA,
+            pixels_threshold=COLOR_ONLY_MIN_PIXELS,
+            merge=True,
+            margin=2,
+        )
+    except Exception as e:
+        print("COLOR_ONLY_ERROR,%s" % e)
+        return 0, [], 0.0, 0.0, []
+    candidates = []
+    rows = []
+    best_pink = 0.0
+    best_red = 0.0
+    for idx, blob in enumerate(blobs):
+        x, y, w, h = [int(blob[i]) for i in range(4)]
+        pixels = int(blob[4])
+        obj = DetectedBox(x, y, w, h, 0.60 + min(0.39, pixels / 1000.0))
+        geometry_ok = pass_geometry(obj, FRAME_W, FRAME_H)
+        if not geometry_ok or is_aim_marker_box(obj):
+            rows.append((idx, obj, geometry_ok, False, 0.0, 0.0))
+            continue
+        color_ok, pink_ratio, red_ratio = color_gate(img, x, y, w, h)
+        color_ok = color_ok and pink_ratio >= COLOR_ONLY_MIN_PINK_RATIO
+        best_pink = max(best_pink, pink_ratio)
+        best_red = max(best_red, red_ratio)
+        rows.append((idx, obj, geometry_ok, color_ok, pink_ratio, red_ratio))
+        if color_ok:
+            candidates.append(obj)
+    candidates = merge_overlaps(candidates)
+    return len(blobs), candidates, best_pink, best_red, rows
+
+
 def remember_detections(new_objs):
     global _memory
     next_memory = []
@@ -1686,6 +1738,9 @@ def remember_detections(new_objs):
 
 def detect_frame(detector, img, frame_id):
     global _tile_scan_index, _last_tile_info
+    if color_only_requested():
+        _last_tile_info = "COLOR_ONLY"
+        return detect_color_only_frame(img)
     frame_w = FRAME_W
     frame_h = FRAME_H
     tile_w = detector.input_width()
@@ -1739,6 +1794,13 @@ gimbal_tracker = init_gimbal_tracker(gimbal)
 aim_relay = init_aim_relay()
 aim_dot_detector = AimDotDetector()
 aim_waypoint_planner = AimWaypointPlanner()
+web_control = None
+if WebControl is not None:
+    try:
+        web_control = WebControl(port=WEB_CONTROL_PORT)
+        web_control.start()
+    except Exception as e:
+        print("WEB_CONTROL_ERROR,%s" % e)
 if aim_relay:
     atexit.register(aim_relay.close)
 print(
@@ -1864,6 +1926,10 @@ while not app.need_exit():
     primary_id = getattr(primary_obj, "aim_lock_id", getattr(primary_obj, "track_id", 0)) if primary_obj else 0
     fresh_aim_present = bool(primary_obj is not None and not getattr(primary_obj, "predicted", False))
     fresh_egg_present = bool(candidates)
+    if web_control is not None:
+        web_mode, web_pan, web_tilt, web_aim_override, web_estop = web_control.get_control()
+    else:
+        web_mode, web_pan, web_tilt, web_aim_override, web_estop = "auto", 0.0, 0.0, None, False
     if fresh_egg_present:
         aim_detect_frames += 1
         aim_missing_frames = 0
@@ -1871,7 +1937,11 @@ while not app.need_exit():
         aim_detect_frames = 0
         aim_missing_frames += 1
     if aim_relay:
-        relay_decision = aim_relay_decision(fresh_egg_present, aim_detect_frames, aim_missing_frames)
+        if web_estop or web_aim_override is False:
+            relay_decision = False
+        else:
+            # A web "ON" request never bypasses the whole-view egg safety gate.
+            relay_decision = aim_relay_decision(fresh_egg_present, aim_detect_frames, aim_missing_frames)
         if relay_decision is not None:
             aim_relay.request(relay_decision)
         aim_relay.update(pytime.time())
@@ -1887,14 +1957,22 @@ while not app.need_exit():
         mark_target_completed(completed_track_id)
     control_status = "OFF"
     if gimbal_tracker is not None:
-        control_status = gimbal_tracker.update(
-            primary_obj,
-            FRAME_W,
-            FRAME_H,
-            pytime.time(),
-            aim_dot=control_aim_dot,
-            waypoint=aim_waypoint,
-        )
+        if web_estop or web_mode == "hold":
+            gimbal_tracker.hold()
+            control_status = "WEB,HOLD"
+        elif web_mode == "manual":
+            gimbal.set_offsets(web_pan, web_tilt, "WEB")
+            control_status = "WEB,MANUAL,PAN,%.1f,TILT,%.1f" % (web_pan, web_tilt)
+        else:
+            if web_mode == "auto":
+                control_status = gimbal_tracker.update(
+                    primary_obj,
+                    FRAME_W,
+                    FRAME_H,
+                    pytime.time(),
+                    aim_dot=control_aim_dot,
+                    waypoint=aim_waypoint,
+                )
         if control_status.startswith("TRACK,") or control_status.startswith("PREDICT,"):
             print("AIM,%s" % control_status)
         elif frame_id % GIMBAL_LOG_EVERY_N_FRAMES == 0 and control_status != "HOLD,RATE":
@@ -1911,6 +1989,23 @@ while not app.need_exit():
             print("SAVE_RAW_ERROR,%d,%s" % (frame_id, e))
 
     fps_now = time.fps()
+    if web_control is not None:
+        if web_control.consume_frame_request():
+            try:
+                img.save(web_control.snapshot_path)
+            except Exception as e:
+                print("WEB_SNAPSHOT_ERROR,%s" % e)
+            web_control.publish_frame()
+        web_control.update_status({
+            "fps": round(float(fps_now), 2),
+            "raw": raw_count,
+            "candidates": len(candidates),
+            "eggs": len(targets),
+            "primary": primary_id,
+            "relay": aim_relay.label() if aim_relay else "disabled",
+            "dot": "fresh" if aim_dot is not None and aim_dot.fresh else "lost",
+            "web_url": "http://<maixcam-ip>:%d/?token=%s" % (WEB_CONTROL_PORT, web_control.token),
+        })
     img.draw_string(2, 2, "FPS %.1f" % fps_now, image.COLOR_GREEN)
     status_label = "WARM" if frame_id < WARMUP_FRAMES else "EGGS"
     img.draw_string(2, 18, "M%d RAW %d CAND %d %s %d LOCK %d" % (RUN_MODE, raw_count, len(candidates), status_label, len(targets), primary_id),
@@ -1937,6 +2032,8 @@ while not app.need_exit():
         dot_label = "OPEN LOOP"
     aim_label = "%s %s" % (aim_relay.label() if aim_relay else "AIM DISABLED", dot_label)
     img.draw_string(2, 50, "%s %s" % (gimbal_label, aim_label), image.COLOR_BLUE if gimbal_tracker else image.COLOR_RED)
+    if web_control is not None:
+        img.draw_string(2, 66, "WEB :8000 token %s" % web_control.token, image.COLOR_BLUE)
 
     if aim_dot is not None:
         dot_x, dot_y = int(aim_dot.x), int(aim_dot.y)
@@ -2054,4 +2151,6 @@ if gimbal:
     gimbal.close()
 if aim_relay:
     aim_relay.close()
+if web_control is not None:
+    web_control.stop()
 print("YOLO SNAIL EGG DETECTOR STOP")
