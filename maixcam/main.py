@@ -122,6 +122,7 @@ GIMBAL_TILT_SIGN = -1.0
 GIMBAL_MIN_STABLE = 3
 GIMBAL_MIN_SCORE = 0.28
 GIMBAL_LOG_EVERY_N_FRAMES = 10
+AIM_LOG_EVERY_N_FRAMES = 5
 
 # 0 = raw YOLO debug: draw every model detection, no color filtering.
 # 1 = color debug: raw boxes are yellow, pink-passed boxes are green.
@@ -235,7 +236,7 @@ else:
 # if you prefer higher FPS and can tolerate one-frame image delay.
 DUAL_BUFF = False
 
-PRINT_EVERY_N_FRAMES = 10
+PRINT_EVERY_N_FRAMES = 30
 STAT_EVERY_N_FRAMES = 30
 DEBUG_DIR = "/root/snail_egg/debug"
 DEBUG_CAPTURE_FLAG = "/root/snail_egg/capture_frames"
@@ -243,6 +244,8 @@ DEBUG_CAPTURE_ONCE_FLAG = "/root/snail_egg/capture_once"
 DEBUG_OVERLAY_STREAM_FLAG = "/root/snail_egg/capture_overlay_stream"
 DEBUG_OVERLAY_STREAM_EVERY_N_FRAMES = 3
 DEBUG_OVERLAY_STREAM_MAX_SAVES = 120
+TELEMETRY_FLAG = "/root/snail_egg/enable_telemetry_file"
+TELEMETRY_PATH = "/root/snail_egg/telemetry.csv"
 DEBUG_SAVE_EVERY_N_FRAMES = 15
 DEBUG_MAX_SAVES = 6
 MANUAL_CAPTURE_EVERY_N_FRAMES = 60
@@ -419,6 +422,16 @@ def file_exists(path):
         return os.path.exists(path)
     except Exception:
         return False
+
+
+def write_telemetry(line):
+    if not file_exists(TELEMETRY_FLAG):
+        return
+    try:
+        with open(TELEMETRY_PATH, "a") as telemetry_file:
+            telemetry_file.write(line + "\n")
+    except Exception as e:
+        print("TELEMETRY_ERROR,%s" % e)
 
 
 def closed_loop_aim_requested():
@@ -1976,7 +1989,10 @@ while not app.need_exit():
                     aim_dot=control_aim_dot,
                     waypoint=aim_waypoint,
                 )
-        if control_status.startswith("TRACK,") or control_status.startswith("PREDICT,"):
+        if (
+            (control_status.startswith("TRACK,") or control_status.startswith("PREDICT,"))
+            and frame_id % AIM_LOG_EVERY_N_FRAMES == 0
+        ):
             print("AIM,%s" % control_status)
         elif frame_id % GIMBAL_LOG_EVERY_N_FRAMES == 0 and control_status != "HOLD,RATE":
             print("AIM,%s" % control_status)
@@ -2093,10 +2109,11 @@ while not app.need_exit():
             )
 
     if frame_id % STAT_EVERY_N_FRAMES == 0:
-        print(
-            "STAT,%d,FPS,%.1f,RAW,%d,CAND,%d,EGGS,%d,TILE,%s"
-            % (frame_id, fps_now, raw_count, len(candidates), len(targets), _last_tile_info)
+        stat_line = "STAT,%d,FPS,%.1f,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
+            frame_id, fps_now, raw_count, len(candidates), len(targets), _last_tile_info
         )
+        print(stat_line)
+        write_telemetry(stat_line)
 
     if RUN_MODE == 3 and frame_id % PRINT_EVERY_N_FRAMES == 0:
         print(
