@@ -21,12 +21,12 @@ LOW_CONF_MIN_AREA = 18
 AIM_RELAY_PIN = "A15"
 AIM_RELAY_GPIO = "GPIOA15"
 AIM_RELAY_DISABLE_FLAG = "/root/snail_egg/disable_aim_relay"
+AIM_RELAY_NO_TARGET_TEST_FLAG = "/root/snail_egg/test_no_target_safety"
 AIM_RELAY_STARTUP_TEST_DONE_FLAG = "/root/snail_egg/aim_relay_startup_test_done"
 AIM_RELAY_ON_STABLE_FRAMES = 3
-# Keep the harmless aiming light on across detector dropouts. Gimbal motion
-# still stops on the first missing frame; this delay only avoids needless
-# button cycling while the same locked target is being reacquired.
-AIM_RELAY_OFF_MISSING_FRAMES = 150
+# Fail closed on the first frame without a fresh YOLO-confirmed egg mass.
+# Predicted/Kalman-only boxes never keep the red aiming light enabled.
+AIM_RELAY_OFF_MISSING_FRAMES = 1
 AIM_RELAY_PULSE_S = 0.20
 AIM_RELAY_STARTUP_TEST_ON_S = 1.0
 AIM_RELAY_STARTUP_TEST_CYCLES = 1
@@ -407,6 +407,15 @@ def closed_loop_aim_requested():
 
 def aim_scan_requested():
     return closed_loop_aim_requested() and file_exists(AIM_SCAN_FLAG)
+
+
+def aim_relay_decision(fresh_target, detected_frames, missing_frames):
+    """Return True/False for a relay transition, or None to keep its state."""
+    if not fresh_target or missing_frames >= AIM_RELAY_OFF_MISSING_FRAMES:
+        return False
+    if detected_frames >= AIM_RELAY_ON_STABLE_FRAMES:
+        return True
+    return None
 
 
 def gimbal_pwm_requested():
@@ -1740,6 +1749,8 @@ while not app.need_exit():
         print("TRACE,%d,DETECT_OK,%d" % (frame_id, raw_count))
     stable = update_tracks(candidates)
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
+    if file_exists(AIM_RELAY_NO_TARGET_TEST_FLAG):
+        targets = []
     primary_obj = select_primary_target([item[0] for item in targets])
     primary_id = getattr(primary_obj, "aim_lock_id", getattr(primary_obj, "track_id", 0)) if primary_obj else 0
     fresh_aim_present = bool(primary_obj is not None and not getattr(primary_obj, "predicted", False))
@@ -1750,10 +1761,9 @@ while not app.need_exit():
         aim_detect_frames = 0
         aim_missing_frames += 1
     if aim_relay:
-        if aim_detect_frames >= AIM_RELAY_ON_STABLE_FRAMES:
-            aim_relay.request(True)
-        elif aim_missing_frames >= AIM_RELAY_OFF_MISSING_FRAMES:
-            aim_relay.request(False)
+        relay_decision = aim_relay_decision(fresh_aim_present, aim_detect_frames, aim_missing_frames)
+        if relay_decision is not None:
+            aim_relay.request(relay_decision)
         aim_relay.update(pytime.time())
     aim_waypoint = aim_waypoint_planner.point(
         primary_obj,

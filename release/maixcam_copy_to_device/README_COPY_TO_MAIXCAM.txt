@@ -16,7 +16,7 @@ MaixCam 福寿螺卵识别与云台跟踪部署包
         A19/PWM7 俯仰，80-120 度
   红色瞄准灯：A15/GPIOA15；开按两次，关按一次
   主目标：优先面积大、置信度高、靠近画面中心且不贴边的稳定卵团
-          原目标连续约 5 秒无法恢复时自动切换下一团
+  红色辅助光：连续 3 帧新鲜识别才开启；首个无新鲜识别帧立即关闭
   瞄准：相机检测低功率红点并闭环跟随；固定参考点仅作降级
   框内扫描：闭环稳定后按九点路径移动低功率红点
 
@@ -72,6 +72,7 @@ MaixCam 福寿螺卵识别与云台跟踪部署包
   python scripts/test_closed_loop_aim.py
   python scripts/test_target_lock_persistence.py
   python scripts/test_gimbal_control_dynamics.py
+  python scripts/test_aim_relay_safety.py
 
 安全要求：
   舵机使用独立稳压 5 V 电源并与 MaixCam 共地。程序只自动控制低功率红色

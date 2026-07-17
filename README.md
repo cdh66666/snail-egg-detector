@@ -39,7 +39,7 @@ release/maixcam_copy_to_device.zip
 - 跟踪期间不因相邻卵团瞬时出现而切换目标；原目标连续约 5 秒无法恢复时切换下一团。
 - 云台 10 Hz 限速控制，包含死区软化、速度、加速度和机械角度限幅。
 - 低功率红点 RGB 峰值检测、闭环瞄准和锁定框内九点扫描。
-- 瞄准灯启动状态同步、短时漏检保持和长时间失锁关闭；高功率执行器不在代码控制范围内。
+- 瞄准灯启动状态同步；只有连续 3 帧新鲜识别才开启，首个无新鲜识别帧立即关闭；高功率执行器不在代码控制范围内。
 - 运行时标志文件可启用、干跑或紧急禁用云台，不必修改代码。
 - Windows、macOS 和 Linux 均可通过 SSH 部署。
 
@@ -226,6 +226,7 @@ AIM,TRACK,<lock_id>,EX,<x_error>,EY,<y_error>,PAN,<offset>,TILT,<offset>,REF,<do
 python scripts/test_closed_loop_aim.py
 python scripts/test_target_lock_persistence.py
 python scripts/test_gimbal_control_dynamics.py
+python scripts/test_aim_relay_safety.py
 ```
 
 ## 训练复现
