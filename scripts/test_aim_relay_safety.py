@@ -33,10 +33,14 @@ def main():
     assert ns["AIM_RELAY_OFF_MISSING_FRAMES"] == 1
     assert ns["AIM_RELAY_NO_TARGET_TEST_FLAG"].endswith("test_no_target_safety")
 
-    # Startup and unstable detections cannot enable the light.
+    # Startup and unstable whole-view detections cannot enable the light.
     assert decide(False, 0, 1) is False
     assert decide(True, 1, 0) is None
     assert decide(True, 2, 0) is None
+    assert decide(True, 3, 0) is True
+
+    # The relay decision is independent of which target is selected as primary:
+    # any fresh valid egg in the view keeps the light eligible to stay on.
     assert decide(True, 3, 0) is True
 
     # One missing frame, including a Kalman-only prediction, fails closed.

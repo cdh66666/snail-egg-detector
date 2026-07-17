@@ -24,8 +24,9 @@ AIM_RELAY_DISABLE_FLAG = "/root/snail_egg/disable_aim_relay"
 AIM_RELAY_NO_TARGET_TEST_FLAG = "/root/snail_egg/test_no_target_safety"
 AIM_RELAY_STARTUP_TEST_DONE_FLAG = "/root/snail_egg/aim_relay_startup_test_done"
 AIM_RELAY_ON_STABLE_FRAMES = 3
-# Fail closed on the first frame without a fresh YOLO-confirmed egg mass.
-# Predicted/Kalman-only boxes never keep the red aiming light enabled.
+# Keep the harmless red aiming light on while any fresh valid egg detection is
+# present anywhere in the camera view. It is not tied to the selected primary
+# target. If the whole view has no fresh valid egg detection, turn it off.
 AIM_RELAY_OFF_MISSING_FRAMES = 1
 AIM_RELAY_PULSE_S = 0.20
 AIM_RELAY_STARTUP_TEST_ON_S = 1.0
@@ -1862,14 +1863,15 @@ while not app.need_exit():
     primary_obj = select_primary_target([item[0] for item in targets])
     primary_id = getattr(primary_obj, "aim_lock_id", getattr(primary_obj, "track_id", 0)) if primary_obj else 0
     fresh_aim_present = bool(primary_obj is not None and not getattr(primary_obj, "predicted", False))
-    if fresh_aim_present:
+    fresh_egg_present = bool(candidates)
+    if fresh_egg_present:
         aim_detect_frames += 1
         aim_missing_frames = 0
     else:
         aim_detect_frames = 0
         aim_missing_frames += 1
     if aim_relay:
-        relay_decision = aim_relay_decision(fresh_aim_present, aim_detect_frames, aim_missing_frames)
+        relay_decision = aim_relay_decision(fresh_egg_present, aim_detect_frames, aim_missing_frames)
         if relay_decision is not None:
             aim_relay.request(relay_decision)
         aim_relay.update(pytime.time())
