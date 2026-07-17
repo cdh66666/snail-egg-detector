@@ -22,6 +22,7 @@ ASSIGNMENTS = {
     "_locked_last_size",
     "_locked_missing_frames",
     "_primary_center",
+    "_completed_track_ids",
 }
 
 
@@ -37,6 +38,7 @@ def load_namespace():
             selected.append(node)
     namespace = {}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(MAIN), "exec"), namespace)
+    namespace["cycle_targets_requested"] = lambda: False
     return namespace
 
 

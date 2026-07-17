@@ -2,7 +2,7 @@
 
 ## 目标与边界
 
-系统在多团福寿螺卵中锁定一个稳定主目标，用摄像头内可见的低功率红色辅助瞄准点形成闭环，并在目标框内执行受限九点扫描：
+系统在多团福寿螺卵中锁定一个稳定主目标，用摄像头内可见的低功率红色辅助瞄准点形成闭环，并在目标框内执行轮廓优先的安全扫描：
 
 ```text
 YOLO 检测 -> 过滤与多目标跟踪 -> 主目标锁定
@@ -23,6 +23,7 @@ YOLO 检测 -> 过滤与多目标跟踪 -> 主目标锁定
 5. 发生短时漏检时保持当前位置，不用预测框驱动舵机。
 6. 检测恢复后先尝试在原位置附近重新绑定，减少相邻卵团之间跳转。
 7. 原目标连续约 5 秒无法重新绑定、且存在其他有效目标时，释放旧锁并选择下一团。
+8. 扫描优先在 YOLO 框内吸附粉色像素样本，样本不足时使用内缩椭圆九点，不使用框角。
 
 ## 红点闭环
 
@@ -33,19 +34,19 @@ ex = target_x - red_dot_x
 ey = target_y - red_dot_y
 ```
 
-红点暂时不可见时保持当前舵机角度；持续失效后回到经过标定的固定参考点搜索，不盲目继续移动。`/root/snail_egg/enable_aim_scan` 会在红点到达当前点并稳定后，才切换到目标框内下一个九点位置。
+红点暂时不可见时保持当前舵机角度；持续失效后回到经过标定的固定参考点搜索，不盲目继续移动。红点继电器采用失效关闭：连续 3 帧新鲜 YOLO 目标才开启，首个无新鲜目标帧立即关闭。`/root/snail_egg/enable_aim_scan` 会在红点到达当前点并稳定后，才切换到下一个轮廓点。
 
 固定参考点只用于启动和降级，不再作为主要瞄准依据。显示器近距离测试可创建 `/root/snail_egg/screen_tracking_test`，正式约 1 m 工作时必须删除该文件。
 
 ## 当前控制参数
 
 ```python
-GIMBAL_CONTROL_HZ = 10.0
+GIMBAL_CONTROL_HZ = 20.0
 GIMBAL_DEADZONE_X = 0.018
 GIMBAL_DEADZONE_Y = 0.022
-GIMBAL_MAX_STEP_DEG = 0.5
-GIMBAL_MAX_RATE_DEG_S = 5.0
-GIMBAL_MAX_ACCEL_DEG_S2 = 10.0
+GIMBAL_MAX_STEP_DEG = 1.5
+GIMBAL_MAX_RATE_DEG_S = 15.0
+GIMBAL_MAX_ACCEL_DEG_S2 = 30.0
 GIMBAL_PAN_MIN_DEG = 60
 GIMBAL_PAN_MAX_DEG = 120
 GIMBAL_TILT_MIN_DEG = 80
@@ -94,4 +95,4 @@ python scripts/test_target_lock_persistence.py
 python scripts/test_gimbal_control_dynamics.py
 ```
 
-当前真机基准中，正常显示约为 `5.35 FPS`，末 20 次闭环更新的平均归一化误差约为水平 `0.0015`、垂直 `0.0145`。录制 JPEG 调试帧会额外降低帧率，不代表正常显示性能。
+稳定版本真机约为 `5.35 FPS`。双缓冲理论上可提高吞吐，但本机实测在相机缓冲初始化阶段不稳定，因此发布版保持 `DUAL_BUFF=False`。本轮优化提高的是云台接近速度、漏检续航和扫描效率，不以牺牲识别稳定性换取虚假的 FPS。

@@ -18,7 +18,7 @@ MaixCam 福寿螺卵识别与云台跟踪部署包
   主目标：优先面积大、置信度高、靠近画面中心且不贴边的稳定卵团
   红色辅助光：连续 3 帧新鲜识别才开启；首个无新鲜识别帧立即关闭
   瞄准：相机检测低功率红点并闭环跟随；固定参考点仅作降级
-  框内扫描：闭环稳定后按九点路径移动低功率红点
+  框内扫描：优先按框内粉色轮廓点移动；不足时按内缩椭圆九点
 
 部署但不设置自启动：
   mkdir -p /root/snail_egg /root/models
@@ -46,6 +46,10 @@ MaixCam 福寿螺卵识别与云台跟踪部署包
 
 中心闭环稳定后启用框内扫描：
   touch /root/snail_egg/enable_aim_scan
+
+测试当前画面内的多团卵并逐一遍历：
+  touch /root/snail_egg/enable_aim_scan /root/snail_egg/cycle_all_targets
+  测试结束后：rm -f /root/snail_egg/cycle_all_targets
 
 关闭扫描但保留中心闭环：
   rm -f /root/snail_egg/enable_aim_scan

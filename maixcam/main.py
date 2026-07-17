@@ -35,6 +35,7 @@ AIM_RELAY_STARTUP_TEST_CYCLES = 1
 # It is runtime opt-in so a missing/misconfigured dot can never move the gimbal.
 CLOSED_LOOP_AIM_FLAG = "/root/snail_egg/enable_closed_loop_aim"
 AIM_SCAN_FLAG = "/root/snail_egg/enable_aim_scan"
+CYCLE_TARGETS_FLAG = "/root/snail_egg/cycle_all_targets"
 AIM_DOT_LAB_THRESHOLDS = [[20, 100, 35, 127, -20, 127]]
 AIM_DOT_MIN_PIXELS = 1
 AIM_DOT_MAX_PIXELS = 420
@@ -54,10 +55,12 @@ AIM_DOT_MAX_JUMP_PX = 65
 AIM_DOT_FILTER_ALPHA = 0.55
 AIM_DOT_STALE_FRAMES = 8
 AIM_DOT_LOG_EVERY_N_FRAMES = 10
-AIM_DOT_CONTROL_TOLERANCE_PX = 7
-AIM_SCAN_SETTLE_FRAMES = 4
-AIM_SCAN_DWELL_S = 0.30
-AIM_SCAN_MARGIN_RATIO = 0.28
+AIM_DOT_CONTROL_TOLERANCE_PX = 9
+AIM_SCAN_SETTLE_FRAMES = 2
+AIM_SCAN_DWELL_S = 0.12
+AIM_SCAN_MARGIN_RATIO = 0.44
+AIM_SCAN_CONTOUR_GRID = 9
+AIM_SCAN_CONTOUR_REFRESH_FRAMES = 5
 
 # Basic gimbal control. On the current wiring A18/PWM6 is pan and
 # A19/PWM7 is tilt. Every command is clamped to the axis-specific limits
@@ -87,13 +90,13 @@ GIMBAL_PAN_PWM_ID = 6
 GIMBAL_TILT_PWM_ID = 7
 # Control loop is slower than the detector on purpose. The detector/display
 # can stay near 19 FPS while the hobby servos receive smooth 10 Hz updates.
-GIMBAL_CONTROL_HZ = 10.0
+GIMBAL_CONTROL_HZ = 20.0
 GIMBAL_DEADZONE_X = 0.018
 GIMBAL_DEADZONE_Y = 0.022
-GIMBAL_MAX_STEP_DEG = 0.5
-GIMBAL_MAX_RATE_DEG_S = 5.0
-GIMBAL_MAX_ACCEL_DEG_S2 = 10.0
-GIMBAL_ERROR_FILTER_TAU_S = 0.15
+GIMBAL_MAX_STEP_DEG = 1.5
+GIMBAL_MAX_RATE_DEG_S = 15.0
+GIMBAL_MAX_ACCEL_DEG_S2 = 30.0
+GIMBAL_ERROR_FILTER_TAU_S = 0.08
 # In the velocity controller KP maps normalized image error to deg/s.
 GIMBAL_PAN_KP = 52.0
 GIMBAL_PAN_KI = 0.0
@@ -182,11 +185,12 @@ LOCK_REACQUIRE_MAX_COST = 60.0
 # take over, while still bridging ordinary one- or two-frame detector misses.
 LOCK_RELEASE_MISSING_FRAMES = 25
 TRACK_MATCH_DISTANCE_SCALE = 1.35
-TRACK_MATCH_MIN_DISTANCE_PX = 52.0
+TRACK_MATCH_MIN_DISTANCE_PX = 90.0
 TRACK_KF_PROCESS_NOISE = 2.0
 TRACK_KF_MEASUREMENT_NOISE = 16.0
-TRACK_MAX_VELOCITY_PX = 18.0
+TRACK_MAX_VELOCITY_PX = 54.0
 GIMBAL_PREDICT_MAX_MISSES = 4
+GIMBAL_COAST_MAX_MISSES = 2
 # 0 means automatically lock the first stable track; set a positive ID to
 # lock a specific track later when the gimbal controller is connected.
 LOCK_TARGET_ID = 0
@@ -243,6 +247,8 @@ _locked_last_size = None
 _locked_missing_frames = 0
 _primary_center = None
 _last_aim_dot = None
+_previous_aim_dot = None
+_completed_track_ids = set()
 
 
 class AimRelay:
@@ -416,6 +422,10 @@ def aim_relay_decision(fresh_target, detected_frames, missing_frames):
     if detected_frames >= AIM_RELAY_ON_STABLE_FRAMES:
         return True
     return None
+
+
+def cycle_targets_requested():
+    return aim_scan_requested() and file_exists(CYCLE_TARGETS_FLAG)
 
 
 def gimbal_pwm_requested():
@@ -604,11 +614,11 @@ class GimbalTracker:
         if predicted and getattr(target, "misses", GIMBAL_PREDICT_MAX_MISSES + 1) > GIMBAL_PREDICT_MAX_MISSES:
             self.reset()
             return "HOLD,PREDICTION_EXPIRED"
-        if predicted:
-            # Preserve filter/controller state across a brief detector miss,
-            # but never steer a laser platform from extrapolation alone.
+        if predicted and getattr(target, "misses", GIMBAL_COAST_MAX_MISSES + 1) > GIMBAL_COAST_MAX_MISSES:
+            # Coast through at most two detector frames. Longer extrapolation
+            # holds position until a fresh YOLO observation returns.
             self.hold()
-            return "HOLD,PREDICT,%d" % target.track_id
+            return "HOLD,PREDICT_LIMIT,%d" % target.track_id
         if getattr(target, "track_id", 0) <= 0:
             self.hold()
             return "HOLD,NO_TRACK_ID"
@@ -1000,18 +1010,18 @@ class AimDotDetector:
 
 
 class AimWaypointPlanner:
-    """Generate a bounded low-power aiming path inside the locked egg box."""
+    """Generate a YOLO-gated, color-refined path inside the locked egg mass."""
 
     PATTERN = (
         (0.0, 0.0),
-        (-1.0, -1.0),
         (0.0, -1.0),
-        (1.0, -1.0),
+        (0.707, -0.707),
         (1.0, 0.0),
-        (1.0, 1.0),
+        (0.707, 0.707),
         (0.0, 1.0),
-        (-1.0, 1.0),
+        (-0.707, 0.707),
         (-1.0, 0.0),
+        (-0.707, -0.707),
     )
 
     def __init__(self):
@@ -1019,14 +1029,80 @@ class AimWaypointPlanner:
         self.index = 0
         self.settled_frames = 0
         self.settled_since = 0.0
+        self.frame_counter = 0
+        self.pattern = self.PATTERN
+        self.completed_track_id = 0
 
     def reset(self):
         self.track_id = 0
         self.index = 0
         self.settled_frames = 0
         self.settled_since = 0.0
+        self.frame_counter = 0
+        self.pattern = self.PATTERN
+        self.completed_track_id = 0
 
-    def point(self, target, aim_dot, now, scan_enabled):
+    def _refine_pattern(self, target, img):
+        """Snap the inset ellipse to pink samples inside a YOLO-confirmed box."""
+        if img is None or getattr(target, "predicted", False):
+            return self.pattern
+        cx = target.x + target.w * 0.5
+        cy = target.y + target.h * 0.5
+        half_w = max(2.0, target.w * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
+        half_h = max(2.0, target.h * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
+        inset_x = max(1.0, target.w * 0.12)
+        inset_y = max(1.0, target.h * 0.12)
+        x0 = max(0, int(target.x + inset_x))
+        y0 = max(0, int(target.y + inset_y))
+        x1 = min(FRAME_W - 1, int(target.x + target.w - inset_x))
+        y1 = min(FRAME_H - 1, int(target.y + target.h - inset_y))
+        step_x = max(1, (x1 - x0) // max(1, AIM_SCAN_CONTOUR_GRID - 1))
+        step_y = max(1, (y1 - y0) // max(1, AIM_SCAN_CONTOUR_GRID - 1))
+        samples = []
+        try:
+            yy = y0
+            while yy <= y1:
+                xx = x0
+                while xx <= x1:
+                    r, g, b = pixel_to_rgb(img.get_pixel(xx, yy))
+                    if pink_pixel(r, g, b) and not red_bad_pixel(r, g, b):
+                        samples.append((float(xx), float(yy)))
+                    xx += step_x
+                yy += step_y
+        except Exception:
+            return self.PATTERN
+        if len(samples) < 3:
+            return self.PATTERN
+
+        refined = []
+        used = set()
+        for nx, ny in self.PATTERN:
+            nominal_x = cx + nx * half_w
+            nominal_y = cy + ny * half_h
+            ranked = sorted(
+                enumerate(samples),
+                key=lambda item: (item[1][0] - nominal_x) ** 2 + (item[1][1] - nominal_y) ** 2,
+            )
+            chosen_index, chosen = ranked[0]
+            for candidate_index, candidate in ranked:
+                if candidate_index not in used:
+                    chosen_index, chosen = candidate_index, candidate
+                    break
+            used.add(chosen_index)
+            refined.append(
+                (
+                    max(-1.0, min(1.0, (chosen[0] - cx) / half_w)),
+                    max(-1.0, min(1.0, (chosen[1] - cy) / half_h)),
+                )
+            )
+        return tuple(refined)
+
+    def take_completed_track(self):
+        track_id = self.completed_track_id
+        self.completed_track_id = 0
+        return track_id
+
+    def point(self, target, aim_dot, now, scan_enabled, img=None):
         if target is None:
             self.settled_frames = 0
             return None
@@ -1036,10 +1112,18 @@ class AimWaypointPlanner:
             self.index = 0
             self.settled_frames = 0
             self.settled_since = now
+            self.frame_counter = 0
+            self.pattern = self.PATTERN
         if not scan_enabled:
             self.index = 0
 
-        nx, ny = self.PATTERN[self.index]
+        self.frame_counter += 1
+        if scan_enabled and (
+            self.frame_counter == 1 or self.frame_counter % AIM_SCAN_CONTOUR_REFRESH_FRAMES == 0
+        ):
+            self.pattern = self._refine_pattern(target, img)
+
+        nx, ny = self.pattern[self.index]
         half_w = max(2.0, target.w * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
         half_h = max(2.0, target.h * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
         point = (target.x + target.w * 0.5 + nx * half_w, target.y + target.h * 0.5 + ny * half_h)
@@ -1055,7 +1139,9 @@ class AimWaypointPlanner:
                     self.settled_frames >= AIM_SCAN_SETTLE_FRAMES
                     and now - self.settled_since >= AIM_SCAN_DWELL_S
                 ):
-                    self.index = (self.index + 1) % len(self.PATTERN)
+                    self.index = (self.index + 1) % len(self.pattern)
+                    if self.index == 0 and cycle_targets_requested():
+                        self.completed_track_id = track_id
                     self.settled_frames = 0
                     self.settled_since = now
             else:
@@ -1357,10 +1443,28 @@ def update_tracks(objs):
     return deduped
 
 
+def mark_target_completed(track_id):
+    global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center
+    if track_id <= 0:
+        return
+    _completed_track_ids.add(track_id)
+    if _locked_track_id == track_id:
+        _locked_track_id = 0
+        _locked_last_center = None
+        _locked_last_size = None
+        _locked_missing_frames = 0
+        _primary_center = None
+    print("TARGET,COMPLETE,%d,TOTAL,%d" % (track_id, len(_completed_track_ids)))
+
+
 def select_primary_target(objs):
     global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center
+    if not cycle_targets_requested() and _completed_track_ids:
+        _completed_track_ids.clear()
     if PRIMARY_TARGET_POLICY in ("leftmost", "robust_center"):
         fresh = [obj for obj in objs if not getattr(obj, "predicted", False)]
+        if cycle_targets_requested():
+            fresh = [obj for obj in fresh if getattr(obj, "track_id", 0) not in _completed_track_ids]
         locked_fresh = [obj for obj in fresh if getattr(obj, "track_id", 0) == _locked_track_id]
         locked_predicted = [
             obj
@@ -1702,6 +1806,10 @@ while not app.need_exit():
     )
     aim_dot = aim_dot_detector.detect(img, dot_enabled)
     _last_aim_dot = aim_dot
+    # YOLO dual buffering returns the previous frame's detections. Pair them
+    # with the previous red-dot measurement so closed-loop error stays aligned.
+    control_aim_dot = _previous_aim_dot if DUAL_BUFF else aim_dot
+    _previous_aim_dot = aim_dot
     if frame_id % AIM_DOT_LOG_EVERY_N_FRAMES == 0:
         if aim_dot is None:
             print("DOT,NONE,ENABLED,%d" % int(dot_enabled))
@@ -1767,10 +1875,14 @@ while not app.need_exit():
         aim_relay.update(pytime.time())
     aim_waypoint = aim_waypoint_planner.point(
         primary_obj,
-        aim_dot,
+        control_aim_dot,
         pytime.time(),
         bool(aim_relay is not None and aim_relay.logical_on and aim_scan_requested()),
+        img=img,
     )
+    completed_track_id = aim_waypoint_planner.take_completed_track()
+    if completed_track_id > 0:
+        mark_target_completed(completed_track_id)
     control_status = "OFF"
     if gimbal_tracker is not None:
         control_status = gimbal_tracker.update(
@@ -1778,7 +1890,7 @@ while not app.need_exit():
             FRAME_W,
             FRAME_H,
             pytime.time(),
-            aim_dot=aim_dot,
+            aim_dot=control_aim_dot,
             waypoint=aim_waypoint,
         )
         if control_status.startswith("TRACK,") or control_status.startswith("PREDICT,"):

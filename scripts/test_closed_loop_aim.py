@@ -32,6 +32,8 @@ NAMES = {
     "AIM_SCAN_SETTLE_FRAMES",
     "AIM_SCAN_DWELL_S",
     "AIM_SCAN_MARGIN_RATIO",
+    "AIM_SCAN_CONTOUR_GRID",
+    "AIM_SCAN_CONTOUR_REFRESH_FRAMES",
 }
 
 
@@ -43,7 +45,11 @@ def load_namespace():
             targets = {target.id for target in node.targets if isinstance(target, ast.Name)}
             if targets & NAMES:
                 selected.append(node)
-        elif isinstance(node, ast.FunctionDef) and node.name == "pixel_to_rgb":
+        elif isinstance(node, ast.FunctionDef) and node.name in {
+            "pixel_to_rgb",
+            "pink_pixel",
+            "red_bad_pixel",
+        }:
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name in {
             "AimDot",
@@ -55,6 +61,7 @@ def load_namespace():
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(MAIN), "exec"), ns)
     ns["ACTIVE_AIM_X"] = ns["FIXED_AIM_X"]
     ns["ACTIVE_AIM_Y"] = ns["FIXED_AIM_Y"]
+    ns["cycle_targets_requested"] = lambda: False
     return ns
 
 

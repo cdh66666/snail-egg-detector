@@ -70,12 +70,12 @@ rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run \
 当前基准参数：
 
 ```python
-GIMBAL_CONTROL_HZ = 10.0
+GIMBAL_CONTROL_HZ = 20.0
 GIMBAL_DEADZONE_X = 0.018
 GIMBAL_DEADZONE_Y = 0.022
-GIMBAL_MAX_STEP_DEG = 0.5
-GIMBAL_MAX_RATE_DEG_S = 5.0
-GIMBAL_MAX_ACCEL_DEG_S2 = 10.0
+GIMBAL_MAX_STEP_DEG = 1.5
+GIMBAL_MAX_RATE_DEG_S = 15.0
+GIMBAL_MAX_ACCEL_DEG_S2 = 30.0
 ```
 
 ## 验收标准
@@ -84,6 +84,7 @@ GIMBAL_MAX_ACCEL_DEG_S2 = 10.0
 - 相邻卵团出现时不随意换锁；检测器 ID 重建时可在原位置附近重新绑定。
 - 原目标持续遮挡约 5 秒后，能够自动释放旧锁并选择下一团有效目标。
 - 红点测量新鲜时闭环误差持续收敛，扫描点切换前必须进入 `7 px` 到达范围。
+- 扫描优先使用框内粉色轮廓点，轮廓不足时使用内缩椭圆九点，不使用框角。
 - 框内扫描点始终位于锁定目标框的安全内缩区域。
 - 水平角始终在 `60–120°`，俯仰角始终在 `80–120°`。
 - 正常显示帧率与关闭调试录帧时的基准相比无明显下降。
