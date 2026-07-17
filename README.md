@@ -17,11 +17,12 @@
 | 推理方式 | 全画面单次推理，不使用逐帧切片 |
 | 默认模型阈值 | `0.20`，再经过颜色、尺寸和形状安全过滤 |
 | 多目标显示 | 全部目标标框，按左上到右下显示 ID |
-| 主目标策略 | 首次锁定最左列上方目标，短时漏检保持同一目标 |
+| 主目标策略 | 优先锁定面积较大、置信度高、靠近画面中心且不贴边的目标 |
 | 云台范围 | 水平 `60–120°`，俯仰 `80–120°`，中心均为 `90°` |
 | 云台接线 | A18/PWM6 水平，A19/PWM7 俯仰 |
 | 红色瞄准灯 | A15/GPIOA15；开启按键脉冲两次，关闭一次 |
-| 1 m 瞄准参考点 | `(324, 270)`，适用于右偏 10 mm、下偏 60 mm 的固定安装 |
+| 瞄准反馈 | 相机内检测低功率红点，闭环移动到锁定框内；固定点仅作降级参考 |
+| 参考实测 | 正常显示约 `5.35 FPS`；红点末 20 次平均归一化误差 `0.0015 / 0.0145` |
 
 `maixcam/main.py` 是设备程序的唯一源码基线。以下发布目录是它的可部署镜像：
 
@@ -37,11 +38,14 @@ release/maixcam_copy_to_device.zip
 - 多目标卡尔曼状态估计、稳定帧确认、短时漏检保轨和重复框合并。
 - 跟踪期间不因相邻卵团瞬时出现而切换目标。
 - 云台 10 Hz 限速控制，包含死区软化、速度、加速度和机械角度限幅。
-- 红色瞄准灯与检测状态联动；高功率执行器不在代码控制范围内。
+- 低功率红点 RGB 峰值检测、闭环瞄准和锁定框内九点扫描。
+- 瞄准灯启动状态同步、短时漏检保持和长时间失锁关闭；高功率执行器不在代码控制范围内。
 - 运行时标志文件可启用、干跑或紧急禁用云台，不必修改代码。
 - Windows、macOS 和 Linux 均可通过 SSH 部署。
 
 ![检测流程](assets/diagrams/pipeline.svg)
+
+[查看 MaixCam 红点闭环与框内扫描实机演示](assets/demos/closed_loop_scan_demo.mp4)
 
 ## 快速体验
 
@@ -81,7 +85,7 @@ python scripts/yolo_detect_media.py path/to/video.mp4 \
 Windows PowerShell：
 
 ```powershell
-$env:MAIXCAM_HOST='192.168.10.110'
+$env:MAIXCAM_HOST='192.168.x.x'
 $env:MAIXCAM_PASSWORD='root'
 python scripts\maix_remote.py probe
 python scripts\maix_remote.py deploy-run
@@ -90,7 +94,7 @@ python scripts\maix_remote.py deploy-run
 macOS / Linux：
 
 ```bash
-export MAIXCAM_HOST=192.168.10.110
+export MAIXCAM_HOST=192.168.x.x
 export MAIXCAM_PASSWORD=root
 python3 scripts/maix_remote.py probe
 python3 scripts/maix_remote.py deploy-run
@@ -145,7 +149,7 @@ MaixCam 的 3.3 V 引脚给舵机供电。
 发布版默认不输出舵机 PWM。先启用干跑，只观察控制日志：
 
 ```bash
-ssh root@192.168.10.110 '
+ssh root@192.168.x.x '
   mkdir -p /root/snail_egg &&
   touch /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run
 '
@@ -154,18 +158,33 @@ ssh root@192.168.10.110 '
 确认目标锁定、方向和限幅后再启用真实云台：
 
 ```bash
-ssh root@192.168.10.110 '
+ssh root@192.168.x.x '
   rm -f /root/snail_egg/gimbal_dry_run /root/snail_egg/disable_gimbal &&
-  touch /root/snail_egg/enable_gimbal_tracking
+  touch /root/snail_egg/enable_gimbal_tracking /root/snail_egg/enable_closed_loop_aim
 '
+```
+
+中心闭环稳定后，启用低功率红点在锁定框内扫描：
+
+```bash
+ssh root@192.168.x.x '
+  touch /root/snail_egg/enable_aim_scan
+'
+```
+
+关闭框内扫描但保留中心闭环：
+
+```bash
+rm -f /root/snail_egg/enable_aim_scan
 ```
 
 紧急禁用：
 
 ```bash
-ssh root@192.168.10.110 '
+ssh root@192.168.x.x '
   touch /root/snail_egg/disable_gimbal &&
-  rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run
+  rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run \
+        /root/snail_egg/enable_closed_loop_aim /root/snail_egg/enable_aim_scan
 '
 ```
 
@@ -178,8 +197,9 @@ ssh root@192.168.10.110 '
 touch /root/snail_egg/disable_aim_relay
 ```
 
-首次启动测试完成标志为 `/root/snail_egg/aim_relay_startup_test_done`。删除该文件后，
-下次启动会再次执行一次 1 秒的红色瞄准灯开关测试。
+程序每次启动先按一次按钮同步到关闭状态；检测稳定目标后按两次开启。首次启动测试
+完成标志为 `/root/snail_egg/aim_relay_startup_test_done`。删除该文件后，下次启动会在
+状态同步后额外执行一次 1 秒红色瞄准灯开关测试。
 
 更完整的控制方法和验收标准见：
 
@@ -193,10 +213,20 @@ touch /root/snail_egg/disable_aim_relay
 ```text
 STAT,<frame>,FPS,<fps>,RAW,<raw_count>,CAND,<candidate_count>,EGGS,<target_count>,TILE,<tile_info>
 EGG,<id>,<cx>,<cy>,<x>,<y>,<w>,<h>,<score>,<cx_norm>,<cy_norm>
+DOT,<x>,<y>,SCORE,<score>,FRESH,<0|1>,MISSES,<count>
+AIM,TRACK,<lock_id>,EX,<x_error>,EY,<y_error>,PAN,<offset>,TILT,<offset>,REF,<dot_x>,<dot_y>,DES,<aim_x>,<aim_y>,RAWID,<track_id>
 ```
 
 其中 `id` 是当前帧左上到右下的显示编号；`cx/cy` 是像素中心；
 `cx_norm/cy_norm` 是 0 到 1 的归一化中心坐标。
+
+关键主机回归测试：
+
+```bash
+python scripts/test_closed_loop_aim.py
+python scripts/test_target_lock_persistence.py
+python scripts/test_gimbal_control_dynamics.py
+```
 
 ## 训练复现
 

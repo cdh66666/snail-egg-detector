@@ -23,10 +23,41 @@ AIM_RELAY_GPIO = "GPIOA15"
 AIM_RELAY_DISABLE_FLAG = "/root/snail_egg/disable_aim_relay"
 AIM_RELAY_STARTUP_TEST_DONE_FLAG = "/root/snail_egg/aim_relay_startup_test_done"
 AIM_RELAY_ON_STABLE_FRAMES = 3
-AIM_RELAY_OFF_MISSING_FRAMES = 12
+# Keep the harmless aiming light on across detector dropouts. Gimbal motion
+# still stops on the first missing frame; this delay only avoids needless
+# button cycling while the same locked target is being reacquired.
+AIM_RELAY_OFF_MISSING_FRAMES = 150
 AIM_RELAY_PULSE_S = 0.20
 AIM_RELAY_STARTUP_TEST_ON_S = 1.0
 AIM_RELAY_STARTUP_TEST_CYCLES = 1
+
+# Closed-loop aiming uses the visible low-power red dot as measured feedback.
+# It is runtime opt-in so a missing/misconfigured dot can never move the gimbal.
+CLOSED_LOOP_AIM_FLAG = "/root/snail_egg/enable_closed_loop_aim"
+AIM_SCAN_FLAG = "/root/snail_egg/enable_aim_scan"
+AIM_DOT_LAB_THRESHOLDS = [[20, 100, 35, 127, -20, 127]]
+AIM_DOT_MIN_PIXELS = 1
+AIM_DOT_MAX_PIXELS = 420
+AIM_DOT_MIN_SIDE = 1
+AIM_DOT_MAX_SIDE = 32
+AIM_DOT_MIN_RED = 120
+# The GC4653 capture measured the real spot at RGB roughly (176, 98, 122):
+# red dominance is only about 54 after auto white balance. Spatial and size
+# gates below provide the stronger discrimination from pink egg pixels.
+AIM_DOT_MIN_DOMINANCE = 45
+AIM_DOT_MIN_DOMINANCE_RATIO = 0.30
+AIM_DOT_MIN_LOCAL_CONTRAST = 12
+AIM_DOT_RGB_STRIDE = 7
+AIM_DOT_RGB_REFRESH_FRAMES = 3
+AIM_DOT_EXPECTED_RADIUS_PX = 70
+AIM_DOT_MAX_JUMP_PX = 65
+AIM_DOT_FILTER_ALPHA = 0.55
+AIM_DOT_STALE_FRAMES = 8
+AIM_DOT_LOG_EVERY_N_FRAMES = 10
+AIM_DOT_CONTROL_TOLERANCE_PX = 7
+AIM_SCAN_SETTLE_FRAMES = 4
+AIM_SCAN_DWELL_S = 0.30
+AIM_SCAN_MARGIN_RATIO = 0.28
 
 # Basic gimbal control. On the current wiring A18/PWM6 is pan and
 # A19/PWM7 is tilt. Every command is clamped to the axis-specific limits
@@ -57,8 +88,8 @@ GIMBAL_TILT_PWM_ID = 7
 # Control loop is slower than the detector on purpose. The detector/display
 # can stay near 19 FPS while the hobby servos receive smooth 10 Hz updates.
 GIMBAL_CONTROL_HZ = 10.0
-GIMBAL_DEADZONE_X = 0.040
-GIMBAL_DEADZONE_Y = 0.050
+GIMBAL_DEADZONE_X = 0.018
+GIMBAL_DEADZONE_Y = 0.022
 GIMBAL_MAX_STEP_DEG = 0.5
 GIMBAL_MAX_RATE_DEG_S = 5.0
 GIMBAL_MAX_ACCEL_DEG_S2 = 10.0
@@ -144,7 +175,8 @@ REQUIRE_STABLE_FRAMES = 2
 # 19 FPS this is roughly 0.3 seconds, long enough to bridge transient misses.
 TRACK_MAX_MISSES = 24
 TRACK_PREDICT_MAX_MISSES = 12
-LOCK_REACQUIRE_RADIUS_PX = 100
+LOCK_REACQUIRE_RADIUS_PX = 75
+LOCK_REACQUIRE_MAX_COST = 60.0
 LOCK_RELEASE_MISSING_FRAMES = 150
 TRACK_MATCH_DISTANCE_SCALE = 1.35
 TRACK_MATCH_MIN_DISTANCE_PX = 52.0
@@ -155,7 +187,7 @@ GIMBAL_PREDICT_MAX_MISSES = 4
 # 0 means automatically lock the first stable track; set a positive ID to
 # lock a specific track later when the gimbal controller is connected.
 LOCK_TARGET_ID = 0
-PRIMARY_TARGET_POLICY = "leftmost"
+PRIMARY_TARGET_POLICY = "robust_center"
 PRIMARY_COLUMN_TOLERANCE_PX = 40
 WARMUP_FRAMES = 6
 
@@ -204,8 +236,10 @@ _tracks = []
 _next_track_id = 1
 _locked_track_id = 0
 _locked_last_center = None
+_locked_last_size = None
 _locked_missing_frames = 0
 _primary_center = None
+_last_aim_dot = None
 
 
 class AimRelay:
@@ -223,6 +257,14 @@ class AimRelay:
         self.deadline = 0.0
         self.closed = False
         print("AIM_RELAY_INIT,%s,%s" % (AIM_RELAY_PIN, AIM_RELAY_GPIO))
+        # The aiming-light controller is button driven and exposes no state
+        # feedback. The proven hardware protocol starts every session with one
+        # press to establish OFF before any later two-press ON command.
+        self._blocking_set(False)
+        self.desired_on = False
+        self.transition_target = False
+        self.phase = "IDLE"
+        print("AIM_RELAY_STARTUP_SYNC,OFF")
         if file_exists(AIM_RELAY_STARTUP_TEST_DONE_FLAG):
             print("AIM_RELAY_STARTUP_TEST,SKIP,DONE")
         else:
@@ -245,8 +287,7 @@ class AimRelay:
         self.logical_on = bool(target_on)
 
     def _startup_test(self):
-        # Synchronize to off, then visibly flash the red aiming light twice.
-        self._blocking_set(False)
+        # State was synchronized to off in __init__; visibly flash once.
         safe_sleep(0.3)
         for cycle in range(AIM_RELAY_STARTUP_TEST_CYCLES):
             self._blocking_set(True)
@@ -355,6 +396,14 @@ def file_exists(path):
         return os.path.exists(path)
     except Exception:
         return False
+
+
+def closed_loop_aim_requested():
+    return file_exists(CLOSED_LOOP_AIM_FLAG)
+
+
+def aim_scan_requested():
+    return closed_loop_aim_requested() and file_exists(AIM_SCAN_FLAG)
 
 
 def gimbal_pwm_requested():
@@ -512,10 +561,19 @@ class GimbalTracker:
         self.pan_offset = 0.0
         self.tilt_offset = 0.0
         self.last_update = 0.0
+        self.hold_frames = 0
 
     def reset(self):
         self.pan.reset()
         self.tilt.reset()
+        self.hold_frames = 0
+
+    def hold(self):
+        # Stop adding motion while preserving the filtered error history. This
+        # avoids a derivative kick when a briefly hidden target returns.
+        self.pan.velocity = 0.0
+        self.tilt.velocity = 0.0
+        self.hold_frames += 1
 
     @staticmethod
     def soften_deadzone(error, deadzone):
@@ -526,9 +584,9 @@ class GimbalTracker:
         scaled = (magnitude - deadzone) / max(0.001, 1.0 - deadzone)
         return scaled if error > 0.0 else -scaled
 
-    def update(self, target, frame_w, frame_h, now):
+    def update(self, target, frame_w, frame_h, now, aim_dot=None, waypoint=None):
         if target is None:
-            self.reset()
+            self.hold()
             return "HOLD,NO_FRESH_TARGET"
         predicted = getattr(target, "predicted", False)
         if predicted and getattr(target, "misses", GIMBAL_PREDICT_MAX_MISSES + 1) > GIMBAL_PREDICT_MAX_MISSES:
@@ -537,16 +595,22 @@ class GimbalTracker:
         if predicted:
             # Preserve filter/controller state across a brief detector miss,
             # but never steer a laser platform from extrapolation alone.
+            self.hold()
             return "HOLD,PREDICT,%d" % target.track_id
         if getattr(target, "track_id", 0) <= 0:
-            self.reset()
+            self.hold()
             return "HOLD,NO_TRACK_ID"
         if getattr(target, "stable", 0) < GIMBAL_MIN_STABLE:
-            self.reset()
+            self.hold()
             return "HOLD,UNSTABLE"
         if not predicted and (getattr(target, "misses", 1) != 0 or getattr(target, "score", 0.0) < ACTIVE_GIMBAL_MIN_SCORE):
-            self.reset()
+            self.hold()
             return "HOLD,QUALITY"
+
+        closed_loop = closed_loop_aim_requested()
+        if closed_loop and (aim_dot is None or not getattr(aim_dot, "fresh", False)):
+            self.hold()
+            return "HOLD,DOT_MISSING"
 
         interval = 1.0 / GIMBAL_CONTROL_HZ
         if self.last_update > 0.0 and now - self.last_update < interval:
@@ -554,20 +618,24 @@ class GimbalTracker:
         dt = interval if self.last_update <= 0.0 else max(0.001, now - self.last_update)
         self.last_update = now
 
-        cx = target.x + target.w * 0.5
-        cy = target.y + target.h * 0.5
-        reference_x = ACTIVE_AIM_X
-        reference_y = ACTIVE_AIM_Y
-        error_x = (cx - reference_x) / max(1.0, frame_w * 0.5)
-        error_y = (cy - reference_y) / max(1.0, frame_h * 0.5)
+        if waypoint is None:
+            desired_x = target.x + target.w * 0.5
+            desired_y = target.y + target.h * 0.5
+        else:
+            desired_x, desired_y = waypoint
+        reference_x = aim_dot.x if closed_loop else ACTIVE_AIM_X
+        reference_y = aim_dot.y if closed_loop else ACTIVE_AIM_Y
+        error_x = (desired_x - reference_x) / max(1.0, frame_w * 0.5)
+        error_y = (desired_y - reference_y) / max(1.0, frame_h * 0.5)
         error_x = self.soften_deadzone(error_x, GIMBAL_DEADZONE_X)
         error_y = self.soften_deadzone(error_y, GIMBAL_DEADZONE_Y)
 
         self.pan_offset = clamp_pan_offset(self.pan_offset + self.pan.step(error_x, dt))
         self.tilt_offset = clamp_tilt_offset(self.tilt_offset + self.tilt.step(error_y, dt))
+        self.hold_frames = 0
         self.gimbal.set_offsets(self.pan_offset, self.tilt_offset, "TRACK")
         state = "PREDICT" if predicted else "TRACK"
-        return "%s,%d,EX,%.3f,EY,%.3f,PAN,%.2f,TILT,%.2f,REF,%d,%d,RAWID,%d" % (
+        return "%s,%d,EX,%.3f,EY,%.3f,PAN,%.2f,TILT,%.2f,REF,%d,%d,DES,%d,%d,RAWID,%d" % (
             state,
             getattr(target, "aim_lock_id", target.track_id),
             error_x,
@@ -576,6 +644,8 @@ class GimbalTracker:
             self.tilt_offset,
             int(reference_x),
             int(reference_y),
+            int(desired_x),
+            int(desired_y),
             target.track_id,
         )
 
@@ -703,6 +773,285 @@ def pixel_to_rgb(px):
         return 0, 0, 0
 
 
+class AimDot:
+    def __init__(self, x, y, score, fresh=True, misses=0):
+        self.x = float(x)
+        self.y = float(y)
+        self.score = float(score)
+        self.fresh = bool(fresh)
+        self.misses = int(misses)
+
+
+class AimDotDetector:
+    """Detect and smooth the low-power red aiming dot in the camera image."""
+
+    def __init__(self):
+        self.x = None
+        self.y = None
+        self.score = 0.0
+        self.misses = AIM_DOT_STALE_FRAMES + 1
+        self.debug_frames = 0
+        self.rgb_locked = False
+
+    @staticmethod
+    def _red_score(img, x, y, w, h):
+        best = None
+        # A laser spot often has a white center and a saturated red halo.
+        # Sample a small grid and keep the strongest red-dominant pixel.
+        for fy in (0.20, 0.50, 0.80):
+            for fx in (0.20, 0.50, 0.80):
+                px = max(0, min(FRAME_W - 1, int(x + w * fx)))
+                py = max(0, min(FRAME_H - 1, int(y + h * fy)))
+                r, g, b = pixel_to_rgb(img.get_pixel(px, py))
+                dominance = r - max(g, b)
+                score = r + 2.0 * dominance
+                if best is None or score > best[0]:
+                    best = (score, r, dominance)
+        return best if best is not None else (0.0, 0, 0)
+
+    @staticmethod
+    def _pixel_metrics(img, x, y):
+        r, g, b = pixel_to_rgb(img.get_pixel(int(x), int(y)))
+        dominance = r - max(g, b)
+        ratio = dominance / float(max(1, r))
+        return r + 2.0 * dominance, r, dominance, ratio
+
+    def _rgb_peak_candidate(self, img, center_x, center_y, radius, stride=AIM_DOT_RGB_STRIDE):
+        # MaixPy LAB blobs can fragment a laser halo on textured/pink surfaces.
+        # A sparse search in a tiny optical-axis ROI is deterministic and much
+        # cheaper than scanning the full 640x480 image in Python.
+        x0 = max(0, int(center_x - radius))
+        y0 = max(0, int(center_y - radius))
+        x1 = min(FRAME_W - 1, int(center_x + radius))
+        y1 = min(FRAME_H - 1, int(center_y + radius))
+        best = None
+        best_any = None
+        for py in range(y0, y1 + 1, stride):
+            for px in range(x0, x1 + 1, stride):
+                score, red_value, dominance, ratio_value = self._pixel_metrics(img, px, py)
+                if best_any is None or score > best_any[0]:
+                    best_any = (score, red_value, dominance, ratio_value, px, py)
+                if (
+                    red_value < AIM_DOT_MIN_RED
+                    or dominance < AIM_DOT_MIN_DOMINANCE
+                    or ratio_value < AIM_DOT_MIN_DOMINANCE_RATIO
+                ):
+                    continue
+                dx = px - center_x
+                dy = py - center_y
+                ranked_score = score - (dx * dx + dy * dy) ** 0.5 * 0.25
+                if best is None or ranked_score > best[0]:
+                    best = (ranked_score, px, py)
+
+        if best is None:
+            return None, best_any
+
+        _, peak_x, peak_y = best
+        _, _, peak_dominance, _ = self._pixel_metrics(img, peak_x, peak_y)
+        surround_dominance = []
+        for ox, oy in ((-10, 0), (10, 0), (0, -10), (0, 10), (-7, -7), (7, -7), (7, 7), (-7, 7)):
+            sx = max(0, min(FRAME_W - 1, peak_x + ox))
+            sy = max(0, min(FRAME_H - 1, peak_y + oy))
+            _, _, local_dominance, _ = self._pixel_metrics(img, sx, sy)
+            surround_dominance.append(local_dominance)
+        mean_surround = sum(surround_dominance) / float(len(surround_dominance))
+        if peak_dominance - mean_surround < AIM_DOT_MIN_LOCAL_CONTRAST:
+            return None, best_any
+
+        weighted_x = 0.0
+        weighted_y = 0.0
+        total_weight = 0.0
+        peak_score = 0.0
+        for py in range(max(0, peak_y - 5), min(FRAME_H, peak_y + 6)):
+            for px in range(max(0, peak_x - 5), min(FRAME_W, peak_x + 6)):
+                score, red_value, dominance, ratio_value = self._pixel_metrics(img, px, py)
+                if (
+                    red_value >= AIM_DOT_MIN_RED
+                    and dominance >= AIM_DOT_MIN_DOMINANCE
+                    and ratio_value >= AIM_DOT_MIN_DOMINANCE_RATIO
+                ):
+                    weight = max(1.0, float(dominance - AIM_DOT_MIN_DOMINANCE + 1))
+                    weighted_x += px * weight
+                    weighted_y += py * weight
+                    total_weight += weight
+                    peak_score = max(peak_score, score)
+        if total_weight <= 0.0:
+            return None, best_any
+        return (peak_score, weighted_x / total_weight, weighted_y / total_weight), best_any
+
+    def detect(self, img, enabled):
+        if not enabled:
+            self.misses = AIM_DOT_STALE_FRAMES + 1
+            return None
+        self.debug_frames += 1
+        rgb_refresh = (not self.rgb_locked) or self.debug_frames % AIM_DOT_RGB_REFRESH_FRAMES == 0
+        if self.rgb_locked and not rgb_refresh:
+            if self.x is not None and self.misses <= AIM_DOT_STALE_FRAMES:
+                return AimDot(self.x, self.y, self.score, self.misses == 0, self.misses)
+            return None
+
+        blobs = []
+        try:
+            tracking_previous = self.x is not None and self.misses <= AIM_DOT_STALE_FRAMES
+            radius = AIM_DOT_MAX_JUMP_PX if tracking_previous else AIM_DOT_EXPECTED_RADIUS_PX
+            center_x = self.x if tracking_previous else ACTIVE_AIM_X
+            center_y = self.y if tracking_previous else ACTIVE_AIM_Y
+            roi_x = max(0, int(center_x - radius))
+            roi_y = max(0, int(center_y - radius))
+            roi_w = min(FRAME_W - roi_x, int(radius * 2))
+            roi_h = min(FRAME_H - roi_y, int(radius * 2))
+            if not self.rgb_locked:
+                blobs = img.find_blobs(
+                    AIM_DOT_LAB_THRESHOLDS,
+                    roi=[roi_x, roi_y, roi_w, roi_h],
+                    x_stride=1,
+                    y_stride=1,
+                    area_threshold=AIM_DOT_MIN_PIXELS,
+                    pixels_threshold=AIM_DOT_MIN_PIXELS,
+                    merge=False,
+                )
+        except Exception as e:
+            print("AIM_DOT_ERROR,%s" % e)
+            blobs = []
+
+        candidates = []
+        expected_x = self.x if tracking_previous else ACTIVE_AIM_X
+        expected_y = self.y if tracking_previous else ACTIVE_AIM_Y
+        for blob in blobs:
+            x, y, w, h = int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
+            pixels = int(blob[4])
+            if w < AIM_DOT_MIN_SIDE or h < AIM_DOT_MIN_SIDE:
+                continue
+            if w > AIM_DOT_MAX_SIDE or h > AIM_DOT_MAX_SIDE:
+                continue
+            if pixels < AIM_DOT_MIN_PIXELS or pixels > AIM_DOT_MAX_PIXELS:
+                continue
+            cx = float(blob[5])
+            cy = float(blob[6])
+            dx = cx - expected_x
+            dy = cy - expected_y
+            distance = (dx * dx + dy * dy) ** 0.5
+            if not tracking_previous and distance > AIM_DOT_EXPECTED_RADIUS_PX:
+                continue
+            if tracking_previous and distance > AIM_DOT_MAX_JUMP_PX:
+                continue
+            red_score, red_value, dominance = self._red_score(img, x, y, w, h)
+            dominance_ratio = dominance / float(max(1, red_value))
+            if (
+                red_value < AIM_DOT_MIN_RED
+                or dominance < AIM_DOT_MIN_DOMINANCE
+                or dominance_ratio < AIM_DOT_MIN_DOMINANCE_RATIO
+            ):
+                continue
+            compactness = pixels / float(max(1, w * h))
+            score = red_score + compactness * 30.0 - distance * 0.25
+            candidates.append((score, cx, cy))
+
+        # The real spot has a white core and locally dominant red halo. Always
+        # let a sparse fixed-axis RGB peak override LAB fragments, which can be
+        # confused by pink egg granules after the spot reaches the target.
+        rgb_peak, fallback_debug = self._rgb_peak_candidate(
+            img,
+            ACTIVE_AIM_X,
+            ACTIVE_AIM_Y,
+            AIM_DOT_EXPECTED_RADIUS_PX,
+        )
+        if rgb_peak is not None:
+            self.rgb_locked = True
+            candidates = [rgb_peak]
+        elif self.rgb_locked:
+            candidates = []
+
+        if self.debug_frames % AIM_DOT_LOG_EVERY_N_FRAMES == 0 and fallback_debug is not None:
+            score, red_value, dominance, ratio_value, px, py = fallback_debug
+            print(
+                "DOT_RGB_PEAK,%d,%d,R,%d,DOM,%d,RATIO,%.3f,SCORE,%.1f,BLOBS,%d"
+                % (px, py, red_value, dominance, ratio_value, score, len(blobs))
+            )
+
+        if candidates:
+            score, cx, cy = max(candidates, key=lambda item: item[0])
+            if self.x is None or self.misses > AIM_DOT_STALE_FRAMES:
+                self.x, self.y = cx, cy
+            else:
+                alpha = AIM_DOT_FILTER_ALPHA
+                self.x += alpha * (cx - self.x)
+                self.y += alpha * (cy - self.y)
+            self.score = score
+            self.misses = 0
+            return AimDot(self.x, self.y, score, True, 0)
+
+        self.misses += 1
+        if self.x is not None and self.misses <= AIM_DOT_STALE_FRAMES:
+            return AimDot(self.x, self.y, self.score, False, self.misses)
+        return None
+
+
+class AimWaypointPlanner:
+    """Generate a bounded low-power aiming path inside the locked egg box."""
+
+    PATTERN = (
+        (0.0, 0.0),
+        (-1.0, -1.0),
+        (0.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (-1.0, 0.0),
+    )
+
+    def __init__(self):
+        self.track_id = 0
+        self.index = 0
+        self.settled_frames = 0
+        self.settled_since = 0.0
+
+    def reset(self):
+        self.track_id = 0
+        self.index = 0
+        self.settled_frames = 0
+        self.settled_since = 0.0
+
+    def point(self, target, aim_dot, now, scan_enabled):
+        if target is None:
+            self.settled_frames = 0
+            return None
+        track_id = getattr(target, "track_id", 0)
+        if track_id != self.track_id:
+            self.track_id = track_id
+            self.index = 0
+            self.settled_frames = 0
+            self.settled_since = now
+        if not scan_enabled:
+            self.index = 0
+
+        nx, ny = self.PATTERN[self.index]
+        half_w = max(2.0, target.w * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
+        half_h = max(2.0, target.h * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
+        point = (target.x + target.w * 0.5 + nx * half_w, target.y + target.h * 0.5 + ny * half_h)
+
+        if scan_enabled and aim_dot is not None and getattr(aim_dot, "fresh", False):
+            dx = aim_dot.x - point[0]
+            dy = aim_dot.y - point[1]
+            if (dx * dx + dy * dy) ** 0.5 <= AIM_DOT_CONTROL_TOLERANCE_PX:
+                self.settled_frames += 1
+                if self.settled_frames == 1:
+                    self.settled_since = now
+                if (
+                    self.settled_frames >= AIM_SCAN_SETTLE_FRAMES
+                    and now - self.settled_since >= AIM_SCAN_DWELL_S
+                ):
+                    self.index = (self.index + 1) % len(self.PATTERN)
+                    self.settled_frames = 0
+                    self.settled_since = now
+            else:
+                self.settled_frames = 0
+                self.settled_since = now
+        return point
+
+
 def color_gate(img, x, y, w, h):
     if not ENABLE_COLOR_GATE or RUN_MODE == 0:
         return True, 1.0, 0.0
@@ -764,9 +1113,11 @@ def is_aim_marker_box(obj):
         return False
     cx = int(obj.x) + w // 2
     cy = int(obj.y) + h // 2
+    marker_x = _last_aim_dot.x if _last_aim_dot is not None else ACTIVE_AIM_X
+    marker_y = _last_aim_dot.y if _last_aim_dot is not None else ACTIVE_AIM_Y
     return (
-        abs(cx - ACTIVE_AIM_X) <= AIM_MARKER_REJECT_RADIUS_PX
-        and abs(cy - ACTIVE_AIM_Y) <= AIM_MARKER_REJECT_RADIUS_PX
+        abs(cx - marker_x) <= AIM_MARKER_REJECT_RADIUS_PX
+        and abs(cy - marker_y) <= AIM_MARKER_REJECT_RADIUS_PX
     )
 
 
@@ -780,7 +1131,9 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
         if not geometry_ok:
             rows.append((idx, obj, False, False, 0.0, 0.0))
             continue
-        if not SCREEN_TEST_MODE and is_aim_marker_box(obj):
+        # In monitor mode, reject only the actually measured dot. Outdoors,
+        # retain the calibrated fixed-point fallback for startup frames.
+        if ((_last_aim_dot is not None or not SCREEN_TEST_MODE) and is_aim_marker_box(obj)):
             rows.append((idx, obj, True, False, 0.0, 0.0))
             continue
         x = max(0, int(obj.x))
@@ -989,40 +1342,103 @@ def update_tracks(objs):
         and track["misses"] <= TRACK_PREDICT_MAX_MISSES
     ]
     deduped = dedupe_track_objects(visible)
-    if objs:
-        deduped = deduped[:len(objs)]
     return deduped
 
 
 def select_primary_target(objs):
-    global _locked_track_id, _locked_last_center, _locked_missing_frames, _primary_center
-    if PRIMARY_TARGET_POLICY == "leftmost":
+    global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center
+    if PRIMARY_TARGET_POLICY in ("leftmost", "robust_center"):
         fresh = [obj for obj in objs if not getattr(obj, "predicted", False)]
-        locked = [obj for obj in objs if getattr(obj, "track_id", 0) == _locked_track_id]
-        if locked:
-            chosen = locked[0]
-            if getattr(chosen, "predicted", False) and getattr(chosen, "misses", 99) > GIMBAL_PREDICT_MAX_MISSES:
-                return None
+        locked_fresh = [obj for obj in fresh if getattr(obj, "track_id", 0) == _locked_track_id]
+        locked_predicted = [
+            obj
+            for obj in objs
+            if getattr(obj, "track_id", 0) == _locked_track_id and getattr(obj, "predicted", False)
+        ]
+        if locked_fresh:
+            chosen = locked_fresh[0]
             chosen.aim_lock_id = 1
             _primary_center = obj_center(chosen)
-            if not getattr(chosen, "predicted", False):
-                _locked_last_center = _primary_center
-                _locked_missing_frames = 0
+            _locked_last_center = _primary_center
+            _locked_last_size = (chosen.w, chosen.h)
+            _locked_missing_frames = 0
             return chosen
         if not fresh:
+            if locked_predicted and getattr(locked_predicted[0], "misses", 99) <= GIMBAL_PREDICT_MAX_MISSES:
+                locked_predicted[0].aim_lock_id = 1
+                return locked_predicted[0]
             return None
         if _locked_track_id > 0:
             _locked_missing_frames += 1
-            if _locked_missing_frames <= AIM_RELAY_OFF_MISSING_FRAMES:
+            if _locked_last_center is not None and fresh:
+                lx, ly = _locked_last_center
+                lw, lh = _locked_last_size if _locked_last_size is not None else (1.0, 1.0)
+                reacquire = []
+                for obj in fresh:
+                    cx, cy = obj_center(obj)
+                    distance = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+                    width_ratio = obj.w / max(1.0, lw)
+                    height_ratio = obj.h / max(1.0, lh)
+                    old_aspect = lw / max(1.0, lh)
+                    new_aspect = obj.w / max(1.0, obj.h)
+                    aspect_ratio = new_aspect / max(0.01, old_aspect)
+                    if (
+                        distance <= LOCK_REACQUIRE_RADIUS_PX
+                        and 0.45 <= width_ratio <= 2.2
+                        and 0.45 <= height_ratio <= 2.2
+                        and 0.45 <= aspect_ratio <= 2.0
+                    ):
+                        size_cost = abs(1.0 - width_ratio) + abs(1.0 - height_ratio)
+                        shape_cost = abs(1.0 - aspect_ratio)
+                        reacquire.append((distance + 18.0 * size_cost + 24.0 * shape_cost, obj))
+                if reacquire:
+                    best_reacquire = min(reacquire, key=lambda item: item[0])
+                    if best_reacquire[0] <= LOCK_REACQUIRE_MAX_COST:
+                        chosen = best_reacquire[1]
+                        _locked_track_id = getattr(chosen, "track_id", 0)
+                        chosen.aim_lock_id = 1
+                        _primary_center = obj_center(chosen)
+                        _locked_last_center = _primary_center
+                        _locked_last_size = (chosen.w, chosen.h)
+                        _locked_missing_frames = 0
+                        print(
+                            "LOCK,REACQUIRE,%d,%d,%d,COST,%.1f"
+                            % (_locked_track_id, _primary_center[0], _primary_center[1], best_reacquire[0])
+                        )
+                        return chosen
+            if locked_predicted and getattr(locked_predicted[0], "misses", 99) <= GIMBAL_PREDICT_MAX_MISSES:
+                locked_predicted[0].aim_lock_id = 1
+                return locked_predicted[0]
+            if _locked_missing_frames <= LOCK_RELEASE_MISSING_FRAMES:
                 return None
-        # Reacquire the same semantic anchor: top target in the leftmost column.
-        min_x = min(obj_center(obj)[0] for obj in fresh)
-        left_column = [obj for obj in fresh if obj_center(obj)[0] <= min_x + PRIMARY_COLUMN_TOLERANCE_PX]
-        chosen = sorted(left_column, key=lambda obj: obj_center(obj)[1])[0]
+            print("LOCK,RELEASE,%d,MISSES,%d" % (_locked_track_id, _locked_missing_frames))
+            _locked_track_id = 0
+        if PRIMARY_TARGET_POLICY == "leftmost":
+            min_x = min(obj_center(obj)[0] for obj in fresh)
+            left_column = [obj for obj in fresh if obj_center(obj)[0] <= min_x + PRIMARY_COLUMN_TOLERANCE_PX]
+            chosen = sorted(left_column, key=lambda obj: obj_center(obj)[1])[0]
+        else:
+            # Prefer a large, confident, central mass. It survives camera
+            # motion and a bright aiming spot much better than a tiny edge box.
+            def robust_score(obj):
+                cx, cy = obj_center(obj)
+                dx = (cx - FRAME_W * 0.5) / max(1.0, FRAME_W * 0.5)
+                dy = (cy - FRAME_H * 0.5) / max(1.0, FRAME_H * 0.5)
+                center_weight = max(0.25, 1.25 - (dx * dx + dy * dy) ** 0.5)
+                border_weight = 0.35 if (
+                    obj.x <= 4
+                    or obj.y <= 4
+                    or obj.x + obj.w >= FRAME_W - 4
+                    or obj.y + obj.h >= FRAME_H - 4
+                ) else 1.0
+                return obj.w * obj.h * (0.5 + obj.score) * center_weight * border_weight
+
+            chosen = max(fresh, key=robust_score)
         _locked_track_id = getattr(chosen, "track_id", 0)
         chosen.aim_lock_id = 1
         _primary_center = obj_center(chosen)
         _locked_last_center = _primary_center
+        _locked_last_size = (chosen.w, chosen.h)
         _locked_missing_frames = 0
         return chosen
     ids = [getattr(obj, "track_id", 0) for obj in objs]
@@ -1204,6 +1620,8 @@ print("YOLO SNAIL EGG DETECTOR BOOT")
 gimbal = init_gimbal()
 gimbal_tracker = init_gimbal_tracker(gimbal)
 aim_relay = init_aim_relay()
+aim_dot_detector = AimDotDetector()
+aim_waypoint_planner = AimWaypointPlanner()
 if aim_relay:
     atexit.register(aim_relay.close)
 print(
@@ -1261,6 +1679,31 @@ while not app.need_exit():
     if RUN_MODE == 3 and frame_id < 3:
         print("TRACE,%d,READ_BEGIN" % frame_id)
     img = cam.read()
+    dot_enabled = bool(
+        closed_loop_aim_requested()
+        and aim_relay is not None
+        # Do not look for feedback while the two button pulses are still
+        # changing the physical light state; pink image detail can otherwise
+        # become the initial dot anchor before the real spot exists.
+        and aim_relay.logical_on
+        and aim_relay.phase == "IDLE"
+    )
+    aim_dot = aim_dot_detector.detect(img, dot_enabled)
+    _last_aim_dot = aim_dot
+    if frame_id % AIM_DOT_LOG_EVERY_N_FRAMES == 0:
+        if aim_dot is None:
+            print("DOT,NONE,ENABLED,%d" % int(dot_enabled))
+        else:
+            print(
+                "DOT,%d,%d,SCORE,%.1f,FRESH,%d,MISSES,%d"
+                % (
+                    int(aim_dot.x),
+                    int(aim_dot.y),
+                    aim_dot.score,
+                    int(aim_dot.fresh),
+                    aim_dot.misses,
+                )
+            )
     if RUN_MODE == 3 and frame_id < 3:
         print("TRACE,%d,READ_OK" % frame_id)
         try:
@@ -1296,7 +1739,7 @@ while not app.need_exit():
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
     primary_obj = select_primary_target([item[0] for item in targets])
     primary_id = getattr(primary_obj, "aim_lock_id", getattr(primary_obj, "track_id", 0)) if primary_obj else 0
-    fresh_aim_present = any(not getattr(item[0], "predicted", False) for item in targets)
+    fresh_aim_present = bool(primary_obj is not None and not getattr(primary_obj, "predicted", False))
     if fresh_aim_present:
         aim_detect_frames += 1
         aim_missing_frames = 0
@@ -1309,9 +1752,22 @@ while not app.need_exit():
         elif aim_missing_frames >= AIM_RELAY_OFF_MISSING_FRAMES:
             aim_relay.request(False)
         aim_relay.update(pytime.time())
+    aim_waypoint = aim_waypoint_planner.point(
+        primary_obj,
+        aim_dot,
+        pytime.time(),
+        bool(aim_relay is not None and aim_relay.logical_on and aim_scan_requested()),
+    )
     control_status = "OFF"
     if gimbal_tracker is not None:
-        control_status = gimbal_tracker.update(primary_obj, FRAME_W, FRAME_H, pytime.time())
+        control_status = gimbal_tracker.update(
+            primary_obj,
+            FRAME_W,
+            FRAME_H,
+            pytime.time(),
+            aim_dot=aim_dot,
+            waypoint=aim_waypoint,
+        )
         if control_status.startswith("TRACK,") or control_status.startswith("PREDICT,"):
             print("AIM,%s" % control_status)
         elif frame_id % GIMBAL_LOG_EVERY_N_FRAMES == 0 and control_status != "HOLD,RATE":
@@ -1346,8 +1802,22 @@ while not app.need_exit():
         gimbal_label = "GIMBAL HOLD PRED"
     else:
         gimbal_label = "GIMBAL TRACK %d" % primary_id
-    aim_label = aim_relay.label() if aim_relay else "AIM DISABLED"
+    if aim_dot is not None:
+        dot_label = "DOT" if aim_dot.fresh else "DOT HOLD"
+    elif closed_loop_aim_requested():
+        dot_label = "DOT LOST"
+    else:
+        dot_label = "OPEN LOOP"
+    aim_label = "%s %s" % (aim_relay.label() if aim_relay else "AIM DISABLED", dot_label)
     img.draw_string(2, 50, "%s %s" % (gimbal_label, aim_label), image.COLOR_BLUE if gimbal_tracker else image.COLOR_RED)
+
+    if aim_dot is not None:
+        dot_x, dot_y = int(aim_dot.x), int(aim_dot.y)
+        draw_cross(img, dot_x, dot_y, image.COLOR_RED if aim_dot.fresh else image.COLOR_YELLOW)
+        img.draw_rect(dot_x - 5, dot_y - 5, 10, 10, color=image.COLOR_RED, thickness=1)
+    if aim_waypoint is not None:
+        waypoint_x, waypoint_y = int(aim_waypoint[0]), int(aim_waypoint[1])
+        draw_cross(img, waypoint_x, waypoint_y, image.COLOR_BLUE)
 
     if RUN_MODE == 0:
         raw_targets = sort_targets([row[1] for row in candidate_rows], FRAME_H)

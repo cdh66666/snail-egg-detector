@@ -15,7 +15,9 @@ MaixCam 福寿螺卵识别与云台跟踪部署包
   云台：A18/PWM6 水平，60-120 度
         A19/PWM7 俯仰，80-120 度
   红色瞄准灯：A15/GPIOA15；开按两次，关按一次
-  1 m 参考点：(324,270)，对应右偏 10 mm、下偏 60 mm 的固定安装
+  主目标：优先面积大、置信度高、靠近画面中心且不贴边的稳定卵团
+  瞄准：相机检测低功率红点并闭环跟随；固定参考点仅作降级
+  框内扫描：闭环稳定后按九点路径移动低功率红点
 
 部署但不设置自启动：
   mkdir -p /root/snail_egg /root/models
@@ -39,11 +41,18 @@ MaixCam 福寿螺卵识别与云台跟踪部署包
 
 确认方向、供电和限幅后启用真实输出：
   rm -f /root/snail_egg/gimbal_dry_run /root/snail_egg/disable_gimbal
-  touch /root/snail_egg/enable_gimbal_tracking
+  touch /root/snail_egg/enable_gimbal_tracking /root/snail_egg/enable_closed_loop_aim
+
+中心闭环稳定后启用框内扫描：
+  touch /root/snail_egg/enable_aim_scan
+
+关闭扫描但保留中心闭环：
+  rm -f /root/snail_egg/enable_aim_scan
 
 紧急禁用：
   touch /root/snail_egg/disable_gimbal
-  rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run
+  rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run \
+        /root/snail_egg/enable_closed_loop_aim /root/snail_egg/enable_aim_scan
 
 约 0.35 m 显示器测试：
   touch /root/snail_egg/screen_tracking_test
@@ -54,9 +63,15 @@ MaixCam 福寿螺卵识别与云台跟踪部署包
 禁用红色瞄准灯：
   touch /root/snail_egg/disable_aim_relay
 
-让下次启动重新执行一次红灯开关测试：
+每次启动先按一次同步到关闭状态；检测到稳定目标后按两次开启。让下次启动
+额外执行一次 1 秒红灯开关测试：
   rm -f /root/snail_egg/aim_relay_startup_test_done
 
+主机回归测试：
+  python scripts/test_closed_loop_aim.py
+  python scripts/test_target_lock_persistence.py
+  python scripts/test_gimbal_control_dynamics.py
+
 安全要求：
-  舵机使用独立稳压 5 V 电源并与 MaixCam 共地。高功率激光必须由人工控制，
-  并配置物理使能、急停和遮光措施。首次调试必须断开高功率激光。
+  舵机使用独立稳压 5 V 电源并与 MaixCam 共地。程序只自动控制低功率红色
+  辅助瞄准光。高功率激光必须由人工控制，并配置物理使能、急停和遮光措施。

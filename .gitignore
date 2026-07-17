@@ -22,6 +22,7 @@ models/*hardneg*
 *.mkv
 *.wmv
 *.m4v
+!assets/demos/*.mp4
 
 # Editor and OS noise
 .DS_Store
