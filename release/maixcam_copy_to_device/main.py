@@ -52,12 +52,15 @@ AIM_DOT_MAX_PIXELS = 420
 AIM_DOT_MIN_SIDE = 1
 AIM_DOT_MAX_SIDE = 32
 AIM_DOT_MIN_RED = 120
-# The GC4653 capture measured the real spot at RGB roughly (176, 98, 122):
-# red dominance is only about 54 after auto white balance. Spatial and size
-# gates below provide the stronger discrimination from pink egg pixels.
+# The live GC4653 test measured the visible spot at R=176..181 with red
+# dominance 37..46 and ratio 0.20..0.26 after display/camera white balance.
+# Position, local contrast, size and jump gates provide the stronger
+# discrimination from broad pink egg regions.
 AIM_DOT_MIN_DOMINANCE = 45
 AIM_DOT_MIN_DOMINANCE_RATIO = 0.30
-AIM_DOT_MIN_LOCAL_CONTRAST = 12
+AIM_DOT_RGB_MIN_DOMINANCE = 30
+AIM_DOT_RGB_MIN_DOMINANCE_RATIO = 0.17
+AIM_DOT_MIN_LOCAL_CONTRAST = 8
 AIM_DOT_RGB_STRIDE = 7
 AIM_DOT_RGB_REFRESH_FRAMES = 3
 AIM_DOT_EXPECTED_RADIUS_PX = 70
@@ -870,8 +873,8 @@ class AimDotDetector:
                     best_any = (score, red_value, dominance, ratio_value, px, py)
                 if (
                     red_value < AIM_DOT_MIN_RED
-                    or dominance < AIM_DOT_MIN_DOMINANCE
-                    or ratio_value < AIM_DOT_MIN_DOMINANCE_RATIO
+                    or dominance < AIM_DOT_RGB_MIN_DOMINANCE
+                    or ratio_value < AIM_DOT_RGB_MIN_DOMINANCE_RATIO
                 ):
                     continue
                 dx = px - center_x
@@ -904,10 +907,10 @@ class AimDotDetector:
                 score, red_value, dominance, ratio_value = self._pixel_metrics(img, px, py)
                 if (
                     red_value >= AIM_DOT_MIN_RED
-                    and dominance >= AIM_DOT_MIN_DOMINANCE
-                    and ratio_value >= AIM_DOT_MIN_DOMINANCE_RATIO
+                    and dominance >= AIM_DOT_RGB_MIN_DOMINANCE
+                    and ratio_value >= AIM_DOT_RGB_MIN_DOMINANCE_RATIO
                 ):
-                    weight = max(1.0, float(dominance - AIM_DOT_MIN_DOMINANCE + 1))
+                    weight = max(1.0, float(dominance - AIM_DOT_RGB_MIN_DOMINANCE + 1))
                     weighted_x += px * weight
                     weighted_y += py * weight
                     total_weight += weight
