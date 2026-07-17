@@ -177,7 +177,10 @@ TRACK_MAX_MISSES = 24
 TRACK_PREDICT_MAX_MISSES = 12
 LOCK_REACQUIRE_RADIUS_PX = 75
 LOCK_REACQUIRE_MAX_COST = 60.0
-LOCK_RELEASE_MISSING_FRAMES = 150
+# The deployed 640x480 pipeline runs at about 5 FPS. Release a target after
+# roughly five seconds of failed reacquisition so another visible egg mass can
+# take over, while still bridging ordinary one- or two-frame detector misses.
+LOCK_RELEASE_MISSING_FRAMES = 25
 TRACK_MATCH_DISTANCE_SCALE = 1.35
 TRACK_MATCH_MIN_DISTANCE_PX = 52.0
 TRACK_KF_PROCESS_NOISE = 2.0

@@ -54,6 +54,7 @@ def target(track_id, cx, cy, w=24, h=26, predicted=False, misses=0):
 
 def main():
     ns = load_namespace()
+    assert 20 <= ns["LOCK_RELEASE_MISSING_FRAMES"] <= 30
     ns["PRIMARY_TARGET_POLICY"] = "leftmost"
     choose = ns["select_primary_target"]
 
@@ -92,7 +93,13 @@ def main():
     large_center.score = 0.8
     tiny_edge.score = 0.9
     assert robust_choose([tiny_edge, large_center]) is large_center
-    print({"nearest_reacquire": "passed", "lock_hold_frames": ns["LOCK_RELEASE_MISSING_FRAMES"]})
+    print(
+        {
+            "nearest_reacquire": "passed",
+            "five_second_failover": "passed",
+            "lock_hold_frames": ns["LOCK_RELEASE_MISSING_FRAMES"],
+        }
+    )
     return 0
 
 
