@@ -21,8 +21,8 @@ MODEL = "/root/models/snail_eggs_yolo11n_320x224_v26.mud"
 USE_FAST_MODEL = True
 FAST_MODEL_IS_YOLO11 = True
 # Run inference at the maintenance floor, but only expose high-confidence
-# detections for initial selection. A manually selected target may continue at
-# the lower threshold only inside its previous ROI.
+# detections for initial selection. A selected target may continue at the lower
+# threshold only when the measurement agrees with its predicted trajectory.
 CONF_TH = 0.10
 IOU_TH = 0.35
 MAX_TARGETS = 32
@@ -255,6 +255,12 @@ TRACK_ASSOC_MAX_SIZE_RATIO = 1.9
 TRACK_KF_PROCESS_NOISE = 2.0
 TRACK_KF_MEASUREMENT_NOISE = 16.0
 TRACK_MAX_VELOCITY_PX = 27.0 if USE_FAST_MODEL else 54.0
+# Track velocity is stored in pixels per nominal camera frame. Folding the
+# measured loop interval into prediction prevents a slow inference or a burst
+# of web encoding work from looking like several identical camera frames.
+TRACK_REFERENCE_FPS = 20.0
+TRACK_MIN_DT_FRAMES = 0.35
+TRACK_MAX_DT_FRAMES = 2.50
 GIMBAL_PREDICT_MAX_MISSES = 12
 GIMBAL_COAST_MAX_MISSES = 2
 # 0 means automatically lock the first stable track; set a positive ID to
@@ -1621,22 +1627,27 @@ class ScalarKalman:
         self.p01 = 0.0
         self.p11 = 9.0
 
-    def predict(self):
-        self.pos += self.vel
+    def predict(self, dt_frames=1.0):
+        dt_frames = max(TRACK_MIN_DT_FRAMES, min(TRACK_MAX_DT_FRAMES, float(dt_frames)))
+        self.pos += self.vel * dt_frames
         self.vel = max(-TRACK_MAX_VELOCITY_PX, min(TRACK_MAX_VELOCITY_PX, self.vel))
         old_p01 = self.p01
-        self.p00 = self.p00 + 2.0 * old_p01 + self.p11 + TRACK_KF_PROCESS_NOISE
-        self.p01 = old_p01 + self.p11
-        self.p11 += TRACK_KF_PROCESS_NOISE * 0.25
+        process_scale = max(0.5, dt_frames)
+        self.p00 = self.p00 + 2.0 * dt_frames * old_p01 + dt_frames * dt_frames * self.p11 + TRACK_KF_PROCESS_NOISE * process_scale
+        self.p01 = old_p01 + dt_frames * self.p11
+        self.p11 += TRACK_KF_PROCESS_NOISE * 0.25 * process_scale
 
     def shift(self, delta):
         # Known camera motion changes image position, not target velocity.
         self.pos += float(delta)
 
-    def update(self, measurement):
+    def update(self, measurement, measurement_noise=None):
         measurement = float(measurement)
         innovation = measurement - self.pos
-        innovation_cov = self.p00 + TRACK_KF_MEASUREMENT_NOISE
+        if measurement_noise is None:
+            measurement_noise = TRACK_KF_MEASUREMENT_NOISE
+        measurement_noise = max(1.0, float(measurement_noise))
+        innovation_cov = self.p00 + measurement_noise
         if innovation_cov <= 0.0:
             return
         k0 = self.p00 / innovation_cov
@@ -1666,6 +1677,12 @@ def track_object(track, predicted):
     x, y, w, h = track_box(track)
     score = track["score"] if not predicted else max(0.0, track["score"] * 0.98)
     return DetectedBox(x, y, w, h, score, track["id"], predicted, track["stable"], track["misses"])
+
+
+def measurement_noise_for_score(score):
+    """Make weak, trajectory-gated boxes observe without pulling hard."""
+    weakness = max(0.0, DISCOVERY_MODEL_CONF - float(score)) / max(0.01, DISCOVERY_MODEL_CONF)
+    return TRACK_KF_MEASUREMENT_NOISE * (1.0 + 2.5 * min(1.0, weakness))
 
 
 def dedupe_track_objects(objs):
@@ -1799,7 +1816,7 @@ def track_match_cost(obj, track):
     return cost
 
 
-def update_tracks(objs):
+def update_tracks(objs, dt_frames=1.0):
     global _tracks, _track_last_pan_offset, _track_last_tilt_offset
     current_pan, current_tilt = current_gimbal_offsets()
     if _track_last_pan_offset is None:
@@ -1816,10 +1833,10 @@ def update_tracks(objs):
     for track in _tracks:
         track["cx"].shift(camera_dx)
         track["cy"].shift(camera_dy)
-        track["cx"].predict()
-        track["cy"].predict()
-        track["w"].predict()
-        track["h"].predict()
+        track["cx"].predict(dt_frames)
+        track["cy"].predict(dt_frames)
+        track["w"].predict(dt_frames)
+        track["h"].predict(dt_frames)
 
     pairs = []
     for det_idx, obj in enumerate(objs):
@@ -1839,10 +1856,11 @@ def update_tracks(objs):
         track = _tracks[track_idx]
         used_detections.add(det_idx)
         used_tracks.add(track_idx)
-        track["cx"].update(obj_center(obj)[0])
-        track["cy"].update(obj_center(obj)[1])
-        track["w"].update(max(2, obj.w))
-        track["h"].update(max(2, obj.h))
+        measurement_noise = measurement_noise_for_score(obj.score)
+        track["cx"].update(obj_center(obj)[0], measurement_noise)
+        track["cy"].update(obj_center(obj)[1], measurement_noise)
+        track["w"].update(max(2, obj.w), measurement_noise * 1.25)
+        track["h"].update(max(2, obj.h), measurement_noise * 1.25)
         track["score"] = obj.score
         track["stable"] += 1
         track["age"] += 1
@@ -2331,6 +2349,7 @@ detect_window_frames = 0
 detect_fps = 0.0
 print("INIT,LOOP_START")
 profile_clock = getattr(pytime, "monotonic", pytime.time)
+track_clock_last = profile_clock()
 closed_loop_enabled_runtime = closed_loop_aim_requested()
 no_target_test_runtime = file_exists(AIM_RELAY_NO_TARGET_TEST_FLAG)
 capture_once_runtime = file_exists(DEBUG_CAPTURE_ONCE_FLAG)
@@ -2339,6 +2358,12 @@ overlay_stream_runtime = file_exists(DEBUG_OVERLAY_STREAM_FLAG)
 
 while not app.need_exit():
     profile_loop_start = profile_clock()
+    track_elapsed = max(0.0, profile_loop_start - track_clock_last)
+    track_clock_last = profile_loop_start
+    track_dt_frames = max(
+        TRACK_MIN_DT_FRAMES,
+        min(TRACK_MAX_DT_FRAMES, track_elapsed * TRACK_REFERENCE_FPS),
+    )
     _overlay_text_enabled = (frame_id % OVERLAY_TEXT_EVERY_N_FRAMES) == 0
     web_snapshot_requested = False
     _web_overlay_enabled = ENABLE_DISPLAY
@@ -2470,7 +2495,7 @@ while not app.need_exit():
             print("MANUAL_CAPTURE_ERROR,%s" % e)
     if RUN_MODE == 3 and frame_id < 3:
         print("TRACE,%d,DETECT_OK,%d" % (frame_id, raw_count))
-    stable = update_tracks(candidates)
+    stable = update_tracks(candidates, track_dt_frames)
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
     if no_target_test_runtime:
         targets = []
@@ -2860,8 +2885,8 @@ while not app.need_exit():
         draw_cross(img, int(ghost_cx), int(ghost_cy), image.COLOR_YELLOW)
 
     if frame_id % STAT_EVERY_N_FRAMES == 0:
-        stat_line = "STAT,%d,LOOP_FPS,%.1f,DETECT_HZ,%.1f,STREAM_FPS,%.1f,YOLO_FRAME,%d,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
-            frame_id, fps_now, detect_fps, stream_fps, last_yolo_frame,
+        stat_line = "STAT,%d,LOOP_FPS,%.1f,DETECT_HZ,%.1f,STREAM_FPS,%.1f,TRACK_DT,%.2f,YOLO_FRAME,%d,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
+            frame_id, fps_now, detect_fps, stream_fps, track_dt_frames, last_yolo_frame,
             last_raw_count, last_candidate_count, len(targets), _last_tile_info
         )
         print(stat_line)

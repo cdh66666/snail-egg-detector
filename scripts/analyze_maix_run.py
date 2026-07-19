@@ -11,6 +11,7 @@ from pathlib import Path
 STAT_RE = re.compile(
     r"STAT,(\d+),(?:FPS|LOOP_FPS),([0-9.]+),"
     r"(?:DETECT_HZ,([0-9.]+),STREAM_FPS,([0-9.]+),)?"
+    r"(?:TRACK_DT,([0-9.]+),)?"
     r"(?:YOLO_FRAME,\d+,)?RAW,(\d+),CAND,(\d+),EGGS,(\d+),TILE,(.*)"
 )
 DOT_RE = re.compile(r"DOT,(-?\d+),(-?\d+),SCORE,([0-9.]+),FRESH,(\d),MISSES,(\d+)")
@@ -57,7 +58,8 @@ def main() -> None:
             stats.append({
                 "frame": int(match[1]), "fps": float(match[2]),
                 "detect_hz": float(match[3] or 0.0), "stream_fps": float(match[4] or 0.0),
-                "raw": int(match[5]), "cand": int(match[6]), "eggs": int(match[7]), "tile": match[8],
+                "track_dt_frames": float(match[5] or 1.0),
+                "raw": int(match[6]), "cand": int(match[7]), "eggs": int(match[8]), "tile": match[9],
             })
         match = DOT_RE.search(line)
         if match:
@@ -116,6 +118,9 @@ def main() -> None:
         "fps_max": max((x["fps"] for x in stats), default=0.0),
         "detect_hz_mean": round(sum(x["detect_hz"] for x in stats) / len(stats), 3) if stats else 0.0,
         "stream_publish_hz_mean": round(sum(x["stream_fps"] for x in stats) / len(stats), 3) if stats else 0.0,
+        "track_dt_frames_mean": round(sum(x["track_dt_frames"] for x in stats) / len(stats), 3) if stats else 0.0,
+        "track_dt_frames_min": min((x["track_dt_frames"] for x in stats), default=0.0),
+        "track_dt_frames_max": max((x["track_dt_frames"] for x in stats), default=0.0),
         "raw_mean": round(sum(x["raw"] for x in stats) / len(stats), 3) if stats else 0.0,
         "candidate_mean": round(sum(x["cand"] for x in stats) / len(stats), 3) if stats else 0.0,
         "egg_mean": round(sum(x["eggs"] for x in stats) / len(stats), 3) if stats else 0.0,

@@ -20,10 +20,13 @@ def load_namespace():
         "track_box",
         "track_match_cost",
         "gimbal_image_shift",
+        "measurement_noise_for_score",
     }
     selected = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted]
     ns = {
         "TRACK_MAX_VELOCITY_PX": 27.0,
+        "TRACK_MIN_DT_FRAMES": 0.35,
+        "TRACK_MAX_DT_FRAMES": 2.50,
         "TRACK_KF_PROCESS_NOISE": 2.0,
         "TRACK_KF_MEASUREMENT_NOISE": 16.0,
         "TRACK_MATCH_MIN_DISTANCE_PX": 45.0,
@@ -81,9 +84,25 @@ def main():
     assert abs(dx + 5.0 * pixels_per_pan) < 1e-6
     assert abs(dy) < 1e-6
 
+    # Variable loop intervals must scale prediction distance instead of
+    # treating a slow iteration as exactly one camera frame.
+    kalman = ns["ScalarKalman"](0)
+    kalman.vel = 10.0
+    kalman.predict(2.0)
+    assert abs(kalman.pos - 20.0) < 1e-6
+
+    # A weak but accepted measurement observes the trajectory without pulling
+    # it as hard as a high-confidence detection.
+    strong = ns["ScalarKalman"](0)
+    weak = ns["ScalarKalman"](0)
+    strong.update(20.0, ns["measurement_noise_for_score"](0.35))
+    weak.update(20.0, ns["measurement_noise_for_score"](0.10))
+    assert ns["measurement_noise_for_score"](0.10) > ns["measurement_noise_for_score"](0.35)
+    assert abs(weak.pos) < abs(strong.pos)
+
     source = MAIN.read_text(encoding="utf-8")
     assert "obj.score >= birth_threshold" in source
-    print({"weak_selected_update": "passed", "weak_track_birth_blocked": "passed", "gimbal_compensation": "passed"})
+    print({"weak_selected_update": "passed", "weak_track_birth_blocked": "passed", "gimbal_compensation": "passed", "variable_dt_prediction": "passed", "weak_measurement_damping": "passed"})
 
 
 if __name__ == "__main__":
