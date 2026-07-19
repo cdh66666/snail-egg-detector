@@ -1,6 +1,6 @@
 [basic]
 type = cvimodel
-model = snail_eggs_yolo11n_320x224_v26.cvimodel
+model = snail_eggs_yolo11n_320x224_v6.cvimodel
 
 [extra]
 model_type = yolo11

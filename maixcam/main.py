@@ -17,12 +17,12 @@ except Exception:
 # Copy this file to MaixVision as main.py after converting the ONNX model to MUD.
 # Put the MUD and model file under /root/models/ on the MaixCam.
 
-MODEL = "/root/models/snail_eggs_yolo11n_320x224_v26.mud"
+MODEL = "/root/models/snail_eggs_yolo11n_320x224_v6.mud"
 USE_FAST_MODEL = True
 FAST_MODEL_IS_YOLO11 = True
 # Run inference at the maintenance floor, but only expose high-confidence
-# detections for initial selection. A selected target may continue at the lower
-# threshold only when the measurement agrees with its predicted trajectory.
+# detections for initial selection. A manually selected target may continue at
+# the lower threshold only inside its previous ROI.
 CONF_TH = 0.10
 IOU_TH = 0.35
 MAX_TARGETS = 32
@@ -249,18 +249,9 @@ LOCK_RELEASE_MISSING_FRAMES = 25
 LOCK_SWITCH_MISSING_FRAMES = 6
 TRACK_MATCH_DISTANCE_SCALE = 1.35
 TRACK_MATCH_MIN_DISTANCE_PX = 45.0 if USE_FAST_MODEL else 90.0
-TRACK_ASSOC_MAX_COST = 1.45
-TRACK_LOCKED_LOW_ASSOC_MAX_COST = 0.92
-TRACK_ASSOC_MAX_SIZE_RATIO = 1.9
 TRACK_KF_PROCESS_NOISE = 2.0
 TRACK_KF_MEASUREMENT_NOISE = 16.0
 TRACK_MAX_VELOCITY_PX = 27.0 if USE_FAST_MODEL else 54.0
-# Track velocity is stored in pixels per nominal camera frame. Folding the
-# measured loop interval into prediction prevents a slow inference or a burst
-# of web encoding work from looking like several identical camera frames.
-TRACK_REFERENCE_FPS = 20.0
-TRACK_MIN_DT_FRAMES = 0.35
-TRACK_MAX_DT_FRAMES = 2.50
 GIMBAL_PREDICT_MAX_MISSES = 12
 GIMBAL_COAST_MAX_MISSES = 2
 # 0 means automatically lock the first stable track; set a positive ID to
@@ -290,15 +281,17 @@ elif SPEED_PROFILE == "fast":
 else:
     print("WARN,UNKNOWN_SPEED_PROFILE,%s" % SPEED_PROFILE)
 
-# The updated MaixPy runtime supports asynchronous YOLO11 inference. Two camera
-# buffers plus NPU dual buffering overlap capture, inference and control.
+# The updated MaixPy runtime supports asynchronous YOLO11 inference. Triple
+# camera buffering plus NPU dual buffering keeps capture, inference and the
+# control loop overlapped instead of serializing all three stages.
 DUAL_BUFF = True
 # YOLO inference is the expensive stage. The tracker/control/display loop runs
 # on every camera frame; YOLO refreshes the tracks periodically. A value of 1
 # restores detector-on-every-frame behavior for accuracy comparisons.
-# Detection accuracy and stable association take priority. Run YOLO on every
-# frame by default; real device PROF data decides whether a stride is needed.
-DETECT_EVERY_N_FRAMES = 1
+# Refresh YOLO every other camera frame and use the constant-velocity tracker
+# for the intervening frame. This preserves a 10+ Hz detector cadence while
+# allowing the control loop to run substantially faster and more smoothly.
+DETECT_EVERY_N_FRAMES = 2
 
 # Per-target serial logging is useful during a lab trace but blocks the
 # MaixVision UART in normal operation. Structured STAT/PROF telemetry remains.
@@ -339,10 +332,6 @@ _locked_last_size = None
 _locked_missing_frames = 0
 _primary_center = None
 _manual_lock_active = False
-_track_last_pan_offset = None
-_track_last_tilt_offset = None
-_pending_detection_pan_offset = None
-_pending_detection_tilt_offset = None
 _last_aim_dot = None
 _previous_aim_dot = None
 
@@ -1584,15 +1573,28 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
                 print("PIX,%d,%d,%d,%d,%s,%d,%d,%d" % (frame_id, idx, sx, sy, str(px), r0, g0, b0))
             except Exception as e:
                 print("PIX_ERROR,%d,%d,%s" % (frame_id, idx, e))
-        # Keep weak measurements only when they already agree with the locked
-        # trajectory prediction. This is a track gate, not a low-threshold ROI.
-        score_ok = obj.score >= ACTIVE_MIN_MODEL_CONF
-        if score_ok and not SCREEN_TEST_MODE and obj.score < DISCOVERY_MODEL_CONF:
-            locked_track = next((track for track in _tracks if track["id"] == _locked_track_id), None)
-            score_ok = locked_track is not None and track_match_cost(obj, locked_track) is not None
-        if not score_ok:
-            rows.append((idx, obj, True, False, 0.0, 0.0))
-            continue
+        score_ok = obj.score >= (SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else DISCOVERY_MODEL_CONF)
+        if (
+            not score_ok
+            and _manual_lock_active
+            and _locked_last_center is not None
+            and _locked_last_size is not None
+            and obj.score >= LOCK_MAINTAIN_MODEL_CONF
+        ):
+            cx = x + w * 0.5
+            cy = y + h * 0.5
+            last_w = max(2.0, float(_locked_last_size[0]))
+            last_h = max(2.0, float(_locked_last_size[1]))
+            radius_x = max(14.0, last_w * 0.85)
+            radius_y = max(12.0, last_h * 0.85)
+            width_ratio = max(w / last_w, last_w / max(2.0, w))
+            height_ratio = max(h / last_h, last_h / max(2.0, h))
+            score_ok = (
+                abs(cx - _locked_last_center[0]) <= radius_x
+                and abs(cy - _locked_last_center[1]) <= radius_y
+                and width_ratio <= 1.8
+                and height_ratio <= 1.8
+            )
         color_checks = STRONG_COLOR_CHECKS if obj.score >= STRONG_MODEL_CONF else LOW_CONF_COLOR_CHECKS
         ok, pink_ratio, red_ratio = color_gate(img, x, y, w, h, color_checks)
         rows.append((idx, obj, True, ok, pink_ratio, red_ratio))
@@ -1627,27 +1629,18 @@ class ScalarKalman:
         self.p01 = 0.0
         self.p11 = 9.0
 
-    def predict(self, dt_frames=1.0):
-        dt_frames = max(TRACK_MIN_DT_FRAMES, min(TRACK_MAX_DT_FRAMES, float(dt_frames)))
-        self.pos += self.vel * dt_frames
+    def predict(self):
+        self.pos += self.vel
         self.vel = max(-TRACK_MAX_VELOCITY_PX, min(TRACK_MAX_VELOCITY_PX, self.vel))
         old_p01 = self.p01
-        process_scale = max(0.5, dt_frames)
-        self.p00 = self.p00 + 2.0 * dt_frames * old_p01 + dt_frames * dt_frames * self.p11 + TRACK_KF_PROCESS_NOISE * process_scale
-        self.p01 = old_p01 + dt_frames * self.p11
-        self.p11 += TRACK_KF_PROCESS_NOISE * 0.25 * process_scale
+        self.p00 = self.p00 + 2.0 * old_p01 + self.p11 + TRACK_KF_PROCESS_NOISE
+        self.p01 = old_p01 + self.p11
+        self.p11 += TRACK_KF_PROCESS_NOISE * 0.25
 
-    def shift(self, delta):
-        # Known camera motion changes image position, not target velocity.
-        self.pos += float(delta)
-
-    def update(self, measurement, measurement_noise=None):
+    def update(self, measurement):
         measurement = float(measurement)
         innovation = measurement - self.pos
-        if measurement_noise is None:
-            measurement_noise = TRACK_KF_MEASUREMENT_NOISE
-        measurement_noise = max(1.0, float(measurement_noise))
-        innovation_cov = self.p00 + measurement_noise
+        innovation_cov = self.p00 + TRACK_KF_MEASUREMENT_NOISE
         if innovation_cov <= 0.0:
             return
         k0 = self.p00 / innovation_cov
@@ -1677,12 +1670,6 @@ def track_object(track, predicted):
     x, y, w, h = track_box(track)
     score = track["score"] if not predicted else max(0.0, track["score"] * 0.98)
     return DetectedBox(x, y, w, h, score, track["id"], predicted, track["stable"], track["misses"])
-
-
-def measurement_noise_for_score(score):
-    """Make weak, trajectory-gated boxes observe without pulling hard."""
-    weakness = max(0.0, DISCOVERY_MODEL_CONF - float(score)) / max(0.01, DISCOVERY_MODEL_CONF)
-    return TRACK_KF_MEASUREMENT_NOISE * (1.0 + 2.5 * min(1.0, weakness))
 
 
 def dedupe_track_objects(objs):
@@ -1728,41 +1715,6 @@ def new_track(obj):
     return track
 
 
-def current_gimbal_offsets():
-    controller = globals().get("gimbal")
-    if controller is None:
-        return 0.0, 0.0
-    return (
-        float(getattr(controller, "pan_offset", 0.0)),
-        float(getattr(controller, "tilt_offset", 0.0)),
-    )
-
-
-def gimbal_image_shift(from_pan, from_tilt, to_pan, to_tilt):
-    pixels_per_pan_deg = FRAME_W / CAMERA_H_FOV_DEG
-    pixels_per_tilt_deg = FRAME_H / CAMERA_V_FOV_DEG
-    dx = -(float(to_pan) - float(from_pan)) * pixels_per_pan_deg / GIMBAL_PAN_SIGN
-    dy = -(float(to_tilt) - float(from_tilt)) * pixels_per_tilt_deg / GIMBAL_TILT_SIGN
-    return dx, dy
-
-
-def shift_measurements_to_current_frame(objs, dx, dy):
-    if abs(dx) < 0.01 and abs(dy) < 0.01:
-        return objs
-    shifted = []
-    for obj in objs:
-        shifted.append(
-            DetectedBox(
-                int(round(obj.x + dx)),
-                int(round(obj.y + dy)),
-                int(obj.w),
-                int(obj.h),
-                float(obj.score),
-            )
-        )
-    return shifted
-
-
 def track_match_cost(obj, track):
     predicted_box = track_box(track)
     measured_box = (int(obj.x), int(obj.y), int(obj.w), int(obj.h))
@@ -1774,69 +1726,18 @@ def track_match_cost(obj, track):
     distance = (dx * dx + dy * dy) ** 0.5
     scale = max(TRACK_MATCH_MIN_DISTANCE_PX, max(predicted_box[2], predicted_box[3]) * TRACK_MATCH_DISTANCE_SCALE)
     overlap = box_iou(measured_box, predicted_box)
-    width_ratio = max(
-        measured_box[2] / max(2.0, predicted_box[2]),
-        predicted_box[2] / max(2.0, measured_box[2]),
-    )
-    height_ratio = max(
-        measured_box[3] / max(2.0, predicted_box[3]),
-        predicted_box[3] / max(2.0, measured_box[3]),
-    )
-    predicted_aspect = predicted_box[2] / max(2.0, predicted_box[3])
-    measured_aspect = measured_box[2] / max(2.0, measured_box[3])
-    aspect_ratio = max(
-        measured_aspect / max(0.05, predicted_aspect),
-        predicted_aspect / max(0.05, measured_aspect),
-    )
-    if max(width_ratio, height_ratio, aspect_ratio) > TRACK_ASSOC_MAX_SIZE_RATIO:
+    if overlap < 0.02 and distance > scale:
         return None
-    sigma_x = max(3.0, (track["cx"].p00 + TRACK_KF_MEASUREMENT_NOISE) ** 0.5)
-    sigma_y = max(3.0, (track["cy"].p00 + TRACK_KF_MEASUREMENT_NOISE) ** 0.5)
-    normalized_innovation = ((dx / sigma_x) ** 2 + (dy / sigma_y) ** 2) ** 0.5
-    if overlap < 0.02 and (distance > scale or normalized_innovation > 3.5):
-        return None
-    size_cost = (width_ratio - 1.0) + (height_ratio - 1.0)
-    shape_cost = aspect_ratio - 1.0
-    confidence_penalty = max(0.0, DISCOVERY_MODEL_CONF - obj.score) / max(0.01, DISCOVERY_MODEL_CONF)
-    cost = (
-        min(2.0, normalized_innovation / 3.0) * 0.42
-        + (1.0 - overlap) * 0.30
-        + min(2.0, size_cost) * 0.16
-        + min(1.0, shape_cost) * 0.07
-        + confidence_penalty * 0.05
-    )
-    low_measurement = obj.score < DISCOVERY_MODEL_CONF
-    if low_measurement:
-        if not _manual_lock_active or track["id"] != _locked_track_id:
-            return None
-        if cost > TRACK_LOCKED_LOW_ASSOC_MAX_COST:
-            return None
-    elif cost > TRACK_ASSOC_MAX_COST:
-        return None
-    return cost
+    return distance / scale + (1.0 - overlap) * 0.65
 
 
-def update_tracks(objs, dt_frames=1.0):
-    global _tracks, _track_last_pan_offset, _track_last_tilt_offset
-    current_pan, current_tilt = current_gimbal_offsets()
-    if _track_last_pan_offset is None:
-        _track_last_pan_offset = current_pan
-        _track_last_tilt_offset = current_tilt
-    camera_dx, camera_dy = gimbal_image_shift(
-        _track_last_pan_offset,
-        _track_last_tilt_offset,
-        current_pan,
-        current_tilt,
-    )
-    _track_last_pan_offset = current_pan
-    _track_last_tilt_offset = current_tilt
+def update_tracks(objs):
+    global _tracks
     for track in _tracks:
-        track["cx"].shift(camera_dx)
-        track["cy"].shift(camera_dy)
-        track["cx"].predict(dt_frames)
-        track["cy"].predict(dt_frames)
-        track["w"].predict(dt_frames)
-        track["h"].predict(dt_frames)
+        track["cx"].predict()
+        track["cy"].predict()
+        track["w"].predict()
+        track["h"].predict()
 
     pairs = []
     for det_idx, obj in enumerate(objs):
@@ -1856,11 +1757,10 @@ def update_tracks(objs, dt_frames=1.0):
         track = _tracks[track_idx]
         used_detections.add(det_idx)
         used_tracks.add(track_idx)
-        measurement_noise = measurement_noise_for_score(obj.score)
-        track["cx"].update(obj_center(obj)[0], measurement_noise)
-        track["cy"].update(obj_center(obj)[1], measurement_noise)
-        track["w"].update(max(2, obj.w), measurement_noise * 1.25)
-        track["h"].update(max(2, obj.h), measurement_noise * 1.25)
+        track["cx"].update(obj_center(obj)[0])
+        track["cy"].update(obj_center(obj)[1])
+        track["w"].update(max(2, obj.w))
+        track["h"].update(max(2, obj.h))
         track["score"] = obj.score
         track["stable"] += 1
         track["age"] += 1
@@ -1881,9 +1781,8 @@ def update_tracks(objs, dt_frames=1.0):
             track["obj"] = track_object(track, True)
             next_tracks.append(track)
 
-    birth_threshold = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else DISCOVERY_MODEL_CONF
     for det_idx, obj in enumerate(objs):
-        if det_idx not in used_detections and obj.score >= birth_threshold:
+        if det_idx not in used_detections:
             next_tracks.append(new_track(obj))
 
     _tracks = next_tracks
@@ -2349,7 +2248,6 @@ detect_window_frames = 0
 detect_fps = 0.0
 print("INIT,LOOP_START")
 profile_clock = getattr(pytime, "monotonic", pytime.time)
-track_clock_last = profile_clock()
 closed_loop_enabled_runtime = closed_loop_aim_requested()
 no_target_test_runtime = file_exists(AIM_RELAY_NO_TARGET_TEST_FLAG)
 capture_once_runtime = file_exists(DEBUG_CAPTURE_ONCE_FLAG)
@@ -2358,12 +2256,6 @@ overlay_stream_runtime = file_exists(DEBUG_OVERLAY_STREAM_FLAG)
 
 while not app.need_exit():
     profile_loop_start = profile_clock()
-    track_elapsed = max(0.0, profile_loop_start - track_clock_last)
-    track_clock_last = profile_loop_start
-    track_dt_frames = max(
-        TRACK_MIN_DT_FRAMES,
-        min(TRACK_MAX_DT_FRAMES, track_elapsed * TRACK_REFERENCE_FPS),
-    )
     _overlay_text_enabled = (frame_id % OVERLAY_TEXT_EVERY_N_FRAMES) == 0
     web_snapshot_requested = False
     _web_overlay_enabled = ENABLE_DISPLAY
@@ -2438,18 +2330,6 @@ while not app.need_exit():
         print("TRACE,%d,DETECT_BEGIN" % frame_id)
     if run_detection:
         raw_count, candidates, best_pink_ratio, best_red_ratio, candidate_rows = detect_frame(detector, img, frame_id)
-        capture_pan, capture_tilt = current_gimbal_offsets()
-        if DUAL_BUFF:
-            if _pending_detection_pan_offset is not None:
-                measurement_dx, measurement_dy = gimbal_image_shift(
-                    _pending_detection_pan_offset,
-                    _pending_detection_tilt_offset,
-                    capture_pan,
-                    capture_tilt,
-                )
-                candidates = shift_measurements_to_current_frame(candidates, measurement_dx, measurement_dy)
-            _pending_detection_pan_offset = capture_pan
-            _pending_detection_tilt_offset = capture_tilt
         detect_window_frames += 1
         detect_elapsed = pytime.time() - detect_window_start
         if detect_elapsed >= 1.0:
@@ -2495,7 +2375,7 @@ while not app.need_exit():
             print("MANUAL_CAPTURE_ERROR,%s" % e)
     if RUN_MODE == 3 and frame_id < 3:
         print("TRACE,%d,DETECT_OK,%d" % (frame_id, raw_count))
-    stable = update_tracks(candidates, track_dt_frames)
+    stable = update_tracks(candidates)
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
     if no_target_test_runtime:
         targets = []
@@ -2885,9 +2765,8 @@ while not app.need_exit():
         draw_cross(img, int(ghost_cx), int(ghost_cy), image.COLOR_YELLOW)
 
     if frame_id % STAT_EVERY_N_FRAMES == 0:
-        stat_line = "STAT,%d,LOOP_FPS,%.1f,DETECT_HZ,%.1f,STREAM_FPS,%.1f,TRACK_DT,%.2f,YOLO_FRAME,%d,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
-            frame_id, fps_now, detect_fps, stream_fps, track_dt_frames, last_yolo_frame,
-            last_raw_count, last_candidate_count, len(targets), _last_tile_info
+        stat_line = "STAT,%d,LOOP_FPS,%.1f,YOLO_FRAME,%d,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
+            frame_id, fps_now, last_yolo_frame, last_raw_count, last_candidate_count, len(targets), _last_tile_info
         )
         print(stat_line)
         write_telemetry(stat_line)
