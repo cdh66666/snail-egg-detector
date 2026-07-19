@@ -1584,12 +1584,10 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
                 print("PIX,%d,%d,%d,%d,%s,%d,%d,%d" % (frame_id, idx, sx, sy, str(px), r0, g0, b0))
             except Exception as e:
                 print("PIX_ERROR,%d,%d,%s" % (frame_id, idx, e))
-        # Keep weak measurements only when they already agree with the locked
-        # trajectory prediction. This is a track gate, not a low-threshold ROI.
+        # Keep the model/color gate independent of track coordinates. With NPU
+        # dual buffering this box still belongs to the previous capture; track
+        # association must happen only after gimbal/time alignment below.
         score_ok = obj.score >= ACTIVE_MIN_MODEL_CONF
-        if score_ok and not SCREEN_TEST_MODE and obj.score < DISCOVERY_MODEL_CONF:
-            locked_track = next((track for track in _tracks if track["id"] == _locked_track_id), None)
-            score_ok = locked_track is not None and track_match_cost(obj, locked_track) is not None
         if not score_ok:
             rows.append((idx, obj, True, False, 0.0, 0.0))
             continue
@@ -1608,6 +1606,12 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
             # This branch is opt-in and never changes the outdoor profile.
             color_ok = True
         elif score_ok and obj.score >= STRONG_MODEL_CONF:
+            color_ok = not red_reject
+        elif score_ok and _manual_lock_active:
+            # A weak box is not allowed to create a target, but a selected
+            # trajectory may need it under shade or washed-out light. Defer
+            # the positive color decision until post-alignment association;
+            # retain only the strong red-object rejection here.
             color_ok = not red_reject
         else:
             color_ok = ok and pink_ratio >= LOW_CONF_MIN_PINK_RATIO and area >= LOW_CONF_MIN_AREA
@@ -1838,6 +1842,8 @@ def update_tracks(objs, dt_frames=1.0):
         track["w"].predict(dt_frames)
         track["h"].predict(dt_frames)
 
+    for obj in objs:
+        obj.associated_track_id = 0
     pairs = []
     for det_idx, obj in enumerate(objs):
         for track_idx, track in enumerate(_tracks):
@@ -1856,6 +1862,7 @@ def update_tracks(objs, dt_frames=1.0):
         track = _tracks[track_idx]
         used_detections.add(det_idx)
         used_tracks.add(track_idx)
+        obj.associated_track_id = track["id"]
         measurement_noise = measurement_noise_for_score(obj.score)
         track["cx"].update(obj_center(obj)[0], measurement_noise)
         track["cy"].update(obj_center(obj)[1], measurement_noise)
@@ -1895,6 +1902,20 @@ def update_tracks(objs, dt_frames=1.0):
     ]
     deduped = dedupe_track_objects(visible)
     return deduped
+
+
+def fresh_detection_for_safety(objs):
+    """Count only discoverable boxes or weak boxes tied to the selected track."""
+    for obj in objs:
+        if obj.score >= DISCOVERY_MODEL_CONF:
+            return True
+        if (
+            _manual_lock_active
+            and _locked_track_id > 0
+            and getattr(obj, "associated_track_id", 0) == _locked_track_id
+        ):
+            return True
+    return False
 
 
 def clear_target_lock():
@@ -2586,7 +2607,7 @@ while not app.need_exit():
             selected_lock_state = "approach_hold"
     elif web_mode != "selected":
         selected_loss_detections = 0
-    fresh_egg_present = bool(candidates)
+    fresh_egg_present = fresh_detection_for_safety(candidates)
     if run_detection:
         if fresh_egg_present:
             aim_detect_frames += 1

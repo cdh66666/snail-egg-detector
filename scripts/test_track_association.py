@@ -21,6 +21,7 @@ def load_namespace():
         "track_match_cost",
         "gimbal_image_shift",
         "measurement_noise_for_score",
+        "fresh_detection_for_safety",
     }
     selected = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted]
     ns = {
@@ -100,9 +101,20 @@ def main():
     assert ns["measurement_noise_for_score"](0.10) > ns["measurement_noise_for_score"](0.35)
     assert abs(weak.pos) < abs(strong.pos)
 
+    safety = ns["fresh_detection_for_safety"]
+    assert safety([SimpleNamespace(score=0.50, associated_track_id=0)])
+    assert safety([SimpleNamespace(score=0.15, associated_track_id=7)])
+    assert not safety([SimpleNamespace(score=0.15, associated_track_id=8)])
+
     source = MAIN.read_text(encoding="utf-8")
     assert "obj.score >= birth_threshold" in source
-    print({"weak_selected_update": "passed", "weak_track_birth_blocked": "passed", "gimbal_compensation": "passed", "variable_dt_prediction": "passed", "weak_measurement_damping": "passed"})
+    filter_body = source[source.index("def filter_candidates"):source.index("class ScalarKalman")]
+    assert "track_match_cost(" not in filter_body
+    assert "elif score_ok and _manual_lock_active:" in filter_body
+    assert "color_ok = not red_reject" in filter_body
+    loop_body = source[source.index("while not app.need_exit()") :]
+    assert loop_body.index("shift_measurements_to_current_frame(") < loop_body.index("stable = update_tracks(")
+    print({"weak_selected_update": "passed", "weak_track_birth_blocked": "passed", "gimbal_compensation": "passed", "variable_dt_prediction": "passed", "weak_measurement_damping": "passed", "aligned_weak_gate": "passed", "safety_gate": "passed"})
 
 
 if __name__ == "__main__":
