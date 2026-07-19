@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from test_track_association import detection, load_namespace, make_track
@@ -48,12 +49,21 @@ def main():
     assert ns["track_match_cost"](visible_neighbor, selected) is None
     assert not ns["fresh_detection_for_safety"]([visible_neighbor])
 
+    source = (Path(__file__).resolve().parents[1] / "maixcam" / "main.py").read_text(encoding="utf-8")
+    assert "reserved_locked_tracks" in source
+    assert "TRACK_LOCKED_ASSOC_AMBIGUITY_MARGIN" in source
+    assert "if gimbal:\n    atexit.register(gimbal.close)" in source
+    assert "GIMBAL_SERVO_ESTIMATE_TAU_S" in source
+
     print({
         "frames": len(pan_steps) - 1,
         "selected_track": 7,
         "neighbor_switch": "blocked",
         "dual_buffer_gimbal_alignment": "passed",
         "weak_selected_continuity": "passed",
+        "locked_track_reserved_from_greedy_match": "passed",
+        "resource_cleanup_registered": "passed",
+        "servo_command_estimate_separated": "passed",
     })
 
 

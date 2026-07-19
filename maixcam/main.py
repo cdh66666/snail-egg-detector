@@ -139,6 +139,12 @@ GIMBAL_TRAJECTORY_MAX_ACCEL_DEG_S2 = 8.0
 GIMBAL_TRAJECTORY_MAX_JERK_DEG_S3 = 40.0
 GIMBAL_TRAJECTORY_POSITION_EPS_DEG = 0.008
 GIMBAL_TRAJECTORY_SPEED_EPS_DEG_S = 0.04
+# Open-loop servos do not report shaft angle. Keep PWM command and estimated
+# physical angle separate so image-motion compensation does not pretend that a
+# newly written duty cycle has already moved the camera. These conservative
+# response values must be refined from supervised real-device telemetry.
+GIMBAL_SERVO_ESTIMATE_TAU_S = 0.25
+GIMBAL_SERVO_ESTIMATE_MAX_SPEED_DEG_S = 90.0
 # Avoid restarting a rest-to-rest quintic segment on every tiny 30 Hz vision
 # update. Frequent replans look fine on a static move but lag badly on a curve.
 GIMBAL_TARGET_REPLAN_EPS_DEG = 0.20
@@ -251,6 +257,8 @@ TRACK_MATCH_DISTANCE_SCALE = 1.35
 TRACK_MATCH_MIN_DISTANCE_PX = 45.0 if USE_FAST_MODEL else 90.0
 TRACK_ASSOC_MAX_COST = 1.45
 TRACK_LOCKED_LOW_ASSOC_MAX_COST = 0.92
+TRACK_LOCKED_STRONG_ASSOC_MAX_COST = 0.72
+TRACK_LOCKED_ASSOC_AMBIGUITY_MARGIN = 0.18
 TRACK_ASSOC_MAX_SIZE_RATIO = 1.9
 TRACK_KF_PROCESS_NOISE = 2.0
 TRACK_KF_MEASUREMENT_NOISE = 16.0
@@ -559,6 +567,7 @@ class LatestJpegStreamer:
         self._latest = None
         self._sequence = 0
         self._stop = False
+        self._closed = False
         self.fps = 0.0
         self.write_ms = 0.0
         self._window_start = pytime.time()
@@ -598,6 +607,9 @@ class LatestJpegStreamer:
                 print("WEB_STREAM_WRITE_ERROR,%s" % e)
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         self._stop = True
         self._ready.set()
         try:
@@ -669,6 +681,8 @@ class Gimbal:
     def __init__(self):
         self.pan_offset = 0
         self.tilt_offset = 0
+        self.command_pan_offset = 0.0
+        self.command_tilt_offset = 0.0
         self.command_count = 0
         pinmap.set_pin_function("A19", "PWM7")
         pinmap.set_pin_function("A18", "PWM6")
@@ -686,6 +700,8 @@ class Gimbal:
         self._trajectory_coefficients = None
         self.motion_phase = "hold"
         self._stop = False
+        self._closed = False
+        self._estimate_last = 0.0
         safe_sleep(GIMBAL_CENTER_SETTLE_S)
         self._thread = threading.Thread(target=self._writer_loop, daemon=True)
         self._thread.start()
@@ -696,8 +712,18 @@ class Gimbal:
         self.pan.duty(servo_duty_from_angle(pan_angle))
         self.tilt.duty(servo_duty_from_angle(tilt_angle))
         self._applied = (pan_offset, tilt_offset)
-        self.pan_offset = pan_offset
-        self.tilt_offset = tilt_offset
+        self.command_pan_offset = pan_offset
+        self.command_tilt_offset = tilt_offset
+
+    def _update_estimated_offsets(self, now):
+        dt = 1.0 / GIMBAL_TRAJECTORY_HZ if self._estimate_last <= 0.0 else max(0.001, now - self._estimate_last)
+        self._estimate_last = now
+        alpha = 1.0 - pow(2.718281828, -dt / max(0.01, GIMBAL_SERVO_ESTIMATE_TAU_S))
+        max_step = GIMBAL_SERVO_ESTIMATE_MAX_SPEED_DEG_S * dt
+        pan_delta = max(-max_step, min(max_step, (self._applied[0] - self.pan_offset) * alpha))
+        tilt_delta = max(-max_step, min(max_step, (self._applied[1] - self.tilt_offset) * alpha))
+        self.pan_offset = clamp_pan_offset(self.pan_offset + pan_delta)
+        self.tilt_offset = clamp_tilt_offset(self.tilt_offset + tilt_delta)
 
     def _writer_loop(self):
         clock = getattr(pytime, "monotonic", pytime.time)
@@ -762,6 +788,7 @@ class Gimbal:
             else:
                 self._velocity = (0.0, 0.0)
                 self._acceleration = (0.0, 0.0)
+            self._update_estimated_offsets(clock())
             tick_elapsed = clock() - tick_start
             safe_sleep(max(0.001, 1.0 / GIMBAL_TRAJECTORY_HZ - tick_elapsed))
 
@@ -791,6 +818,9 @@ class Gimbal:
             self.motion_phase = "hold"
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         # Shutdown must never start an unsolicited sweep. Freeze at the latest
         # applied position, stop the worker, then disable both PWM outputs.
         self.hold()
@@ -1850,19 +1880,11 @@ def update_tracks(objs, dt_frames=1.0):
             cost = track_match_cost(obj, track)
             if cost is not None:
                 pairs.append((cost, det_idx, track_idx))
-    pairs.sort(key=lambda item: item[0])
-
     used_detections = set()
     used_tracks = set()
     next_tracks = []
-    for cost, det_idx, track_idx in pairs:
-        if det_idx in used_detections or track_idx in used_tracks:
-            continue
-        obj = objs[det_idx]
-        track = _tracks[track_idx]
-        used_detections.add(det_idx)
-        used_tracks.add(track_idx)
-        obj.associated_track_id = track["id"]
+
+    def accept_measurement(track, obj):
         measurement_noise = measurement_noise_for_score(obj.score)
         track["cx"].update(obj_center(obj)[0], measurement_noise)
         track["cy"].update(obj_center(obj)[1], measurement_noise)
@@ -1874,6 +1896,57 @@ def update_tracks(objs, dt_frames=1.0):
         track["misses"] = 0
         track["obj"] = track_object(track, False)
         next_tracks.append(track)
+
+    # A phone-selected track is safety-critical. Reserve it from the ordinary
+    # greedy matcher, otherwise a nearby strong detection can steal its ID when
+    # two egg masses merge or split during camera motion. If two measurements
+    # are nearly equally plausible, coast instead of guessing.
+    reserved_locked_tracks = set()
+    if _manual_lock_active and _locked_track_id > 0:
+        for track_idx, track in enumerate(_tracks):
+            if track["id"] != _locked_track_id:
+                continue
+            reserved_locked_tracks.add(track_idx)
+            locked_pairs = []
+            for det_idx, obj in enumerate(objs):
+                cost = track_match_cost(obj, track)
+                if cost is not None:
+                    locked_pairs.append((cost, det_idx))
+            locked_pairs.sort(key=lambda item: item[0])
+            if locked_pairs:
+                best_cost, best_det_idx = locked_pairs[0]
+                second_cost = locked_pairs[1][0] if len(locked_pairs) > 1 else None
+                best_obj = objs[best_det_idx]
+                max_cost = (
+                    TRACK_LOCKED_STRONG_ASSOC_MAX_COST
+                    if best_obj.score >= DISCOVERY_MODEL_CONF
+                    else TRACK_LOCKED_LOW_ASSOC_MAX_COST
+                )
+                unambiguous = (
+                    second_cost is None
+                    or second_cost - best_cost >= TRACK_LOCKED_ASSOC_AMBIGUITY_MARGIN
+                )
+                if best_cost <= max_cost and unambiguous:
+                    best_obj.associated_track_id = track["id"]
+                    used_detections.add(best_det_idx)
+                    used_tracks.add(track_idx)
+                    accept_measurement(track, best_obj)
+            break
+
+    pairs = [
+        item for item in pairs
+        if item[1] not in used_detections and item[2] not in reserved_locked_tracks
+    ]
+    pairs.sort(key=lambda item: item[0])
+    for cost, det_idx, track_idx in pairs:
+        if det_idx in used_detections or track_idx in used_tracks:
+            continue
+        obj = objs[det_idx]
+        track = _tracks[track_idx]
+        used_detections.add(det_idx)
+        used_tracks.add(track_idx)
+        obj.associated_track_id = track["id"]
+        accept_measurement(track, obj)
 
     for track_idx, track in enumerate(_tracks):
         if track_idx in used_tracks:
@@ -2258,6 +2331,8 @@ def detect_frame(detector, img, frame_id):
 
 print("YOLO SNAIL EGG DETECTOR BOOT")
 gimbal = init_gimbal()
+if gimbal:
+    atexit.register(gimbal.close)
 gimbal_tracker = init_gimbal_tracker(gimbal)
 aim_relay = init_aim_relay()
 aim_dot_detector = AimDotDetector()
@@ -2267,6 +2342,7 @@ if WebControl is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
     try:
         web_control = WebControl(port=WEB_CONTROL_PORT)
         web_control.start()
+        atexit.register(web_control.stop)
     except Exception as e:
         print("WEB_CONTROL_ERROR,%s" % e)
 jpeg_streamer = None
@@ -2275,6 +2351,7 @@ if http is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
         native_streamer = http.JpegStreamer("0.0.0.0", WEB_STREAM_PORT, WEB_STREAM_MAX_CLIENTS)
         native_streamer.start()
         jpeg_streamer = LatestJpegStreamer(native_streamer)
+        atexit.register(jpeg_streamer.close)
         print("WEB_STREAM,LISTEN,0.0.0.0,%d" % WEB_STREAM_PORT)
     except Exception as e:
         jpeg_streamer = None

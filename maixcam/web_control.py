@@ -102,6 +102,7 @@ class WebControl:
         self.last_nudge_time = 0.0
         self.snapshot_requested = False
         self.snapshot_ready = threading.Event()
+        self._stopped = False
         control = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -161,6 +162,9 @@ class WebControl:
         print("WEB_CONTROL,LISTEN,%s,%d" % (self.host, self.port))
 
     def stop(self):
+        if self._stopped:
+            return
+        self._stopped = True
         try:
             self.server.shutdown()
             self.server.server_close()
