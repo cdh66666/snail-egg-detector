@@ -1,83 +1,63 @@
-MaixCam 福寿螺卵识别与云台跟踪部署包
+MaixCAM 福寿螺卵识别与二轴云台部署包
 
-文件：
+当前候选版本
+  检测模型：YOLO11n v26，固定输入 320x224
+  摄像头画面：可独立使用 640x480；模型输入尺寸不等于摄像头输出尺寸
+  发现阈值：0.35
+  锁定保持阈值：0.10，仅作为已点选轨迹的弱测量，不能创建或切换目标
+  目标选择：手机网页点击绿色检测框
+  丢失策略：保持当前位置，不自动跳到相邻目标
+  云台：A18/PWM6 与 A19/PWM7；俯仰 80..120 度，左右 60..120 度，默认 90 度
+  红色辅助瞄准灯：GPIOA15；连续按两次打开，按一次关闭
+  安全规则：整个视野约 2 秒没有有效卵团后关闭辅助瞄准灯
+
+压缩包内容
   main.py
-    -> /maixapp/apps/<app_id>/main.py
+  web_control.py
+  preview.py
+  gimbal_servo_test.py
+  root/models/snail_eggs_yolo11n_320x224_v26.mud
+  root/models/snail_eggs_yolo11n_320x224_v26.cvimodel
 
-  root/models/snail_eggs_yolov8n_640x480.mud
-  root/models/snail_eggs_yolov8n_640x480.cvimodel
-    -> /root/models/
+设备路径
+  /maixapp/apps/snail_egg/main.py
+  /maixapp/apps/snail_egg/web_control.py
+  /maixapp/apps/snail_egg/preview.py
+  /root/models/snail_eggs_yolo11n_320x224_v26.mud
+  /root/models/snail_eggs_yolo11n_320x224_v26.cvimodel
 
-当前配置：
-  摄像头/模型输入：640x480
-  推理：full_frame 全画面单次推理
-  模型阈值：0.20，附加粉色、红色、尺寸和形状过滤
-  云台：A18/PWM6 水平，60-120 度
-        A19/PWM7 俯仰，80-120 度
-  红色瞄准灯：A15/GPIOA15；开按两次，关按一次
-  主目标：优先面积大、置信度高、靠近画面中心且不贴边的稳定卵团
-  红色辅助光：视野内任意有效卵团连续 3 帧才开启；整幅视野无有效卵团才关闭
-  瞄准：相机检测低功率红点并闭环跟随；固定参考点仅作降级
-  框内扫描：优先按框内粉色轮廓点移动；不足时按内缩椭圆九点
-
-部署但不设置自启动：
-  mkdir -p /root/snail_egg /root/models
-  将 main.py 和模型复制到上面的目标路径后，在应用目录运行：
+部署但不设置自启动
+  mkdir -p /maixapp/apps/snail_egg /root/models
+  将 Python 文件复制到 /maixapp/apps/snail_egg/
+  将 MUD 和 CVIMODEL 复制到 /root/models/
+  cd /maixapp/apps/snail_egg
   python main.py
 
-设置自启动：
-  APP_ID=snail_egg
-  mkdir -p /maixapp/apps/$APP_ID
-  cp main.py /maixapp/apps/$APP_ID/main.py
-  printf %s "$APP_ID" > /maixapp/auto_start.txt
+设置自启动
+  printf %s "snail_egg" > /maixapp/auto_start.txt
   sync
   reboot
 
-说明：app_id 是自定义应用目录名，不是固定值。
+取消自启动
+  : > /maixapp/auto_start.txt
+  sync
 
-云台默认不动作。先干跑：
+手机控制
+  程序启动后，在同一网络的手机浏览器打开：
+  http://<MaixCAM-IP>:8080/
+
+紧急停止云台
   mkdir -p /root/snail_egg
-  touch /root/snail_egg/enable_gimbal_tracking
-  touch /root/snail_egg/gimbal_dry_run
-
-确认方向、供电和限幅后启用真实输出：
-  rm -f /root/snail_egg/gimbal_dry_run /root/snail_egg/disable_gimbal
-  touch /root/snail_egg/enable_gimbal_tracking /root/snail_egg/enable_closed_loop_aim
-
-中心闭环稳定后启用框内扫描：
-  touch /root/snail_egg/enable_aim_scan
-
-测试当前画面内的多团卵并逐一遍历：
-  touch /root/snail_egg/enable_aim_scan /root/snail_egg/cycle_all_targets
-  测试结束后：rm -f /root/snail_egg/cycle_all_targets
-
-关闭扫描但保留中心闭环：
-  rm -f /root/snail_egg/enable_aim_scan
-
-紧急禁用：
   touch /root/snail_egg/disable_gimbal
-  rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run \
-        /root/snail_egg/enable_closed_loop_aim /root/snail_egg/enable_aim_scan
 
-约 0.35 m 显示器测试：
-  touch /root/snail_egg/screen_tracking_test
+恢复云台
+  rm -f /root/snail_egg/disable_gimbal
+  touch /root/snail_egg/enable_gimbal_tracking
 
-恢复 1 m 室外参数：
-  rm -f /root/snail_egg/screen_tracking_test
-
-禁用红色瞄准灯：
+禁用红色辅助瞄准灯
   touch /root/snail_egg/disable_aim_relay
 
-每次启动先按一次同步到关闭状态；检测到稳定目标后按两次开启。让下次启动
-额外执行一次 1 秒红灯开关测试：
-  rm -f /root/snail_egg/aim_relay_startup_test_done
-
-主机回归测试：
-  python scripts/test_closed_loop_aim.py
-  python scripts/test_target_lock_persistence.py
-  python scripts/test_gimbal_control_dynamics.py
-  python scripts/test_aim_relay_safety.py
-
-安全要求：
-  舵机使用独立稳压 5 V 电源并与 MaixCam 共地。程序只自动控制低功率红色
-  辅助瞄准光。高功率激光必须由人工控制，并配置物理使能、急停和遮光措施。
+说明
+  app_id 只是自定义应用目录名，本包统一使用 snail_egg。
+  普通 MaixCAM 没有板载 IMU；船体扰动补偿需要外接 IMU 或后续加入全局光流。
+  高功率消杀激光必须由人工控制，并保留物理使能、急停和遮光措施。

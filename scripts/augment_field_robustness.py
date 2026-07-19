@@ -61,15 +61,43 @@ def photometric_variant(img: np.ndarray, rng: random.Random) -> np.ndarray:
     hsv[:, :, 1:] = np.clip(hsv[:, :, 1:], 0, 255)
     out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
+    # Independent channel gains mimic camera auto-white-balance errors and
+    # warm/cool outdoor illumination. This is deliberately train-only.
+    if rng.random() < 0.72:
+        cast = rng.choice(["warm", "cool", "neutral"])
+        gains = {
+            "warm": (rng.uniform(0.68, 0.96), rng.uniform(0.88, 1.08), rng.uniform(1.06, 1.34)),
+            "cool": (rng.uniform(1.06, 1.32), rng.uniform(0.88, 1.08), rng.uniform(0.68, 0.96)),
+            "neutral": (rng.uniform(0.88, 1.12), rng.uniform(0.88, 1.12), rng.uniform(0.88, 1.12)),
+        }[cast]
+        channels = out.astype(np.float32)
+        channels[:, :, 0] *= gains[0]
+        channels[:, :, 1] *= gains[1]
+        channels[:, :, 2] *= gains[2]
+        out = np.clip(channels, 0, 255).astype(np.uint8)
+
     gamma = rng.uniform(0.62, 1.65)
     lut = np.array([((i / 255.0) ** gamma) * 255.0 for i in range(256)], dtype=np.uint8)
     out = cv2.LUT(out, lut)
     if rng.random() < 0.45:
         k = rng.choice([3, 5])
         out = cv2.GaussianBlur(out, (k, k), rng.uniform(0.4, 1.2))
+    if rng.random() < 0.30:
+        k = rng.choice([3, 5, 7])
+        kernel = np.zeros((k, k), dtype=np.float32)
+        if rng.random() < 0.5:
+            kernel[k // 2, :] = 1.0 / k
+        else:
+            kernel[:, k // 2] = 1.0 / k
+        out = cv2.filter2D(out, -1, kernel)
     if rng.random() < 0.40:
         noise = np.random.default_rng(rng.randint(0, 2**31 - 1)).normal(0, rng.uniform(3, 10), out.shape)
         out = np.clip(out.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    if rng.random() < 0.30:
+        quality = rng.randint(38, 78)
+        ok, encoded = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if ok:
+            out = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
     return out
 
 

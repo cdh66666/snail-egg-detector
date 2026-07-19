@@ -1,330 +1,131 @@
-# MaixCam 福寿螺卵实时识别与云台跟踪
+# 福寿螺卵实时识别与二轴云台辅助瞄准
 
-基于 YOLOv8n、MaixPy 和 Sipeed MaixCam 的边缘视觉项目。当前发布版以
-`640x480` 全画面单次推理检测福寿螺卵团，在设备屏幕实时绘制紧框、中心点和
-从左上到右下排列的 ID，并可在明确使能后驱动二轴云台稳定跟踪一团目标。
+本项目面向 Sipeed MaixCAM：用 YOLO11 检测福寿螺卵团，在屏幕或手机网页显示实时画面，可人工选定一个目标后驱动二轴云台缓慢、限幅地移动到目标附近。红色辅助瞄准灯只作为低功率瞄准提示，超过约 2 秒没有任何有效卵团时自动关闭；高功率消杀执行器必须由人工确认和操作。
 
-> 安全边界：程序只自动控制低功率红色瞄准灯和舵机云台。高功率激光必须保持
-> 人工控制，并配置物理使能、急停、遮光和人员确认。首次调试请断开高功率激光。
+## 当前基线
 
-## 当前发布版
+- 设备运行时：MaixPy / MaixCAM。
+- 检测模型：YOLO11n，单类别 `eggs`，MaixCAM 输入 `320x224`，摄像头采集与网页画面可独立配置。
+- 当前发布模型：`v26_union`。它在同口径 1000 帧压力集和 1378 张外部负样本集上均优于 v6；v27 因独立相机召回回落且外部误检增加而淘汰。
+- 检测策略：全画面以 `0.35` 高阈值生成可点击轨迹；人工点选后，`0.10..0.35` 的弱检测只能作为已锁定轨迹的测量，并且必须通过卡尔曼创新量、IoU、尺寸和形状一致性关联。弱检测不能生成新轨迹或切换目标。
+- 运动补偿：跟踪预测使用舵机轨迹线程的实际 pan/tilt 输出作为控制输入，同时补偿 YOLO 双缓冲的一帧测量延迟；普通 MaixCAM 无板载 IMU，船体扰动需外接 IMU 或加入全局光流。
+- 云台控制：独立 50 Hz 线程；俯仰 `80..120 deg`，左右 `60..120 deg`，默认 `90 deg`；两轴使用同一段五次轨迹时间，沿二维直线同步插值，不做“先横后竖”。
+- 跟踪原则：人工选定后保持锁定，不因短时漏检自动跳到相邻目标；丢失时保持当前位置，等待重新选定或人工微调。
+- 网络视频：只保留最新 JPEG，网络慢时丢弃旧帧，避免手机端积压造成越来越大的延迟。
 
-| 项目 | 配置 |
+## 评判标准
+
+统一标准见 [`docs/acceptance_criteria.md`](docs/acceptance_criteria.md)。重要指标包括：
+
+| 类别 | 目标 |
 | --- | --- |
-| 设备 | Sipeed MaixCam / MaixPy |
-| 检测模型 | YOLOv8n，单类别 `eggs` |
-| 摄像头与模型输入 | `640x480` |
-| 推理方式 | 全画面单次推理，不使用逐帧切片 |
-| 默认模型阈值 | `0.20`，再经过颜色、尺寸和形状安全过滤 |
-| 多目标显示 | 全部目标标框，按左上到右下显示 ID |
-| 主目标策略 | 优先锁定面积较大、置信度高、靠近画面中心且不贴边的目标 |
-| 云台范围 | 水平 `60–120°`，俯仰 `80–120°`，中心均为 `90°` |
-| 云台接线 | A18/PWM6 水平，A19/PWM7 俯仰 |
-| 红色瞄准灯 | A15/GPIOA15；开启按键脉冲两次，关闭一次 |
-| 瞄准反馈 | 相机内检测低功率红点，闭环移动到锁定框内；固定点仅作降级参考 |
-| 扫描路径 | YOLO 框内粉色像素轮廓优先；不足时退回内缩椭圆 9 点 |
-| 速度策略 | 远距离快速接近，近目标自动减速；最多允许 2 帧卡尔曼续航 |
-| 参考实测 | 稳定版本约 `5.35 FPS`；双缓冲在本机实测不稳定，已关闭 |
+| 独立测试集召回率 | >= 92% |
+| 独立测试集精确率 | >= 95% |
+| 运动画面连续检测率 | >= 90% |
+| 困难负样本误检 | <= 1 / 1000 帧 |
+| 控制循环 | >= 25 FPS |
+| YOLO 实际刷新 | >= 15 Hz |
+| 云台 PWM | 50 Hz，P95 间隔 18--25 ms |
+| 目标锁定 | 不自动换目标 |
+| 瞄准灯安全 | 视野内约 2 秒无有效卵团后关闭 |
 
-`maixcam/main.py` 是设备程序的唯一源码基线。以下发布目录是它的可部署镜像：
+这些指标必须用独立图片、连续视频和真实设备日志评估，不能用训练图或几张截图代替。
+
+## 目录
 
 ```text
-release/maixcam_copy_to_device/
-release/maixcam_copy_to_device.zip
+maixcam/main.py                         MaixCAM 主程序
+maixcam/web_control.py                  手机网页控制
+models/                                  PC 端训练/评估模型
+data/                                    YOLO 数据集
+scripts/yolo_train.py                   训练脚本
+scripts/evaluate_thresholds.py          精度与阈值评估
+scripts/evaluate_negative_fps.py        困难负样本误检评估
+scripts/evaluate_camera_domain_holdout.py 独立 MaixCAM 域评测
+scripts/audit_real_device_corpus.py    历史实机帧响应/连续性审计
+scripts/test_gimbal_trajectory.py       二维轨迹与限幅测试
+scripts/test_latest_frame_streamer.py   网络视频无积压测试
+docs/acceptance_criteria.md             验收标准
+docs/model_review_20260719.md           本轮模型和评测审计结论
+release/maixcam_copy_to_device/         可上传到设备的文件
 ```
 
-## 功能概览
-
-- 640x480 实时 YOLO 检测，避免切片轮询造成旧框和延迟。
-- 模型分数、粉色比例、红色排除、尺寸和形状联合过滤。
-- 多目标卡尔曼状态估计、稳定帧确认、短时漏检保轨和重复框合并。
-- 跟踪期间不因相邻卵团瞬时出现而切换目标；原目标连续约 5 秒无法恢复时切换下一团。
-- 云台 20 Hz 控制节拍，包含死区软化、速度、加速度和机械角度限幅。
-- 低功率红点 RGB 峰值检测、闭环瞄准和轮廓优先的内缩扫描。
-- 可用 `cycle_all_targets` 测试模式逐一遍历当前可见卵团。
-- 瞄准灯启动状态同步；视野内任意有效卵团连续 3 帧才开启，只有整幅视野没有有效卵团时关闭；高功率执行器不在代码控制范围内。
-- 运行时标志文件可启用、干跑或紧急禁用云台，不必修改代码。
-- Windows、macOS 和 Linux 均可通过 SSH 部署。
-
-![检测流程](assets/diagrams/pipeline.svg)
-
-[查看 MaixCam 红点闭环与框内扫描实机演示](assets/demos/closed_loop_scan_demo.mp4)
-
-## 快速体验
-
-### PC / Mac 图片与视频
-
-要求 Python 3.10 或更高版本。
+## PC 端复现
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+python scripts/yolo_train.py --help
 ```
 
-检测图片：
+训练参数中的 `HEIGHT,WIDTH` 用于声明期望的导出形状；Ultralytics 训练阶段实际使用长边作为 `imgsz`，可配合 `--rect` 保留矩形 batch。脚本会在输出摘要中同时写出 `requested_imgsz`、`effective_train_imgsz` 和 `fixed_export_imgsz`，不再把训练阶段误写成固定非方形输入。
 
-```bash
-python scripts/yolo_detect_media.py path/to/image.jpg \
-  --model models/snail_eggs_yolov8n_640x480.pt \
-  --conf 0.20 --safe-filter
-```
-
-检测视频：
-
-```bash
-python scripts/yolo_detect_media.py path/to/video.mp4 \
-  --model models/snail_eggs_yolov8n_640x480.pt \
-  --conf 0.20 --safe-filter --video-stride 1
-```
-
-结果保存在 `runs/yolo_media/`。该目录默认不提交 Git。
-
-### MaixCam 一键临时运行
-
-先在 MaixCam 的系统设置中连接 Wi-Fi 并开启 SSH，确认电脑和设备处于同一局域网。
-默认 SSH 用户和密码均为 `root`。
-
-Windows PowerShell：
+独立 MaixCAM 域评测（以下示例使用未用于训练的 v9 验证/留出部分）：
 
 ```powershell
-$env:MAIXCAM_HOST='192.168.x.x'
-$env:MAIXCAM_PASSWORD='root'
-python scripts\maix_remote.py probe
-python scripts\maix_remote.py deploy-run
+python scripts\evaluate_camera_domain_holdout.py `
+  --model runs\detect\runs_yolo\snail_eggs_yolo11n_union_v26-2\weights\best.pt `
+  --camera runs\camera_domain_v9 `
+  --report outputs\camera_v9_v26_review.json
 ```
 
-macOS / Linux：
+报告中的 `annotated_box_recall` 是 IoU>=0.5 的标注框召回；`holdout_frame_detection_rate` 是没有框标注时的帧级命中，不能互相替代。历史截图审计同样只报告响应率和连续性代理指标。
+
+训练和评估必须使用未参与训练的 `test` 集；困难负样本用空标签保存。示例：
 
 ```bash
-export MAIXCAM_HOST=192.168.x.x
-export MAIXCAM_PASSWORD=root
-python3 scripts/maix_remote.py probe
-python3 scripts/maix_remote.py deploy-run
+python scripts/evaluate_negative_fps.py \
+  --model runs/detect/runs_yolo/snail_eggs_yolo11n_union_v26-2/weights/best.pt \
+  --negative-dir data/hard_negatives_mixed_v2/images \
+  --imgsz 320 --conf 0.15 --safe-filter
 ```
 
-`deploy-run` 会上传代码和模型并在 SSH 会话中运行，适合首次验收。按 `Ctrl+C`
-停止，不会设置开机自启。
+## MaixCAM 一次运行
 
-## 正式部署与自启动
+先在设备上开启 SSH，并保证电脑与 MaixCAM 在同一局域网。Windows PowerShell：
 
-推荐给应用使用有意义的 ID，例如 `snail_egg`。它只是 `/maixapp/apps/` 下的目录名，
-不是固定名称，也不必写成 `cdh1_`。
+```powershell
+$env:MAIXCAM_HOST = "192.168.x.x"
+$env:MAIXCAM_PASSWORD = "root"
+python scripts\maix_remote.py probe
+python scripts\maix_remote.py deploy --app-id snail_egg --skip-models
+python scripts\maix_remote.py run
+```
+
+发布包位于 [`release/maixcam_copy_to_device`](release/maixcam_copy_to_device)。v26 模型使用独立版本号，避免与旧模型混淆：
+
+```text
+release/maixcam_copy_to_device/root/models/snail_eggs_yolo11n_320x224_v26.mud
+release/maixcam_copy_to_device/root/models/snail_eggs_yolo11n_320x224_v26.cvimodel
+```
+
+部署 v26 时，`maixcam/main.py` 中的 `MODEL` 应为：
+
+```python
+MODEL = "/root/models/snail_eggs_yolo11n_320x224_v26.mud"
+```
+
+首次只运行、不设置自启动；确认画面、检测、目标锁定和云台限幅都通过后，再按需要安装自启动：
 
 ```powershell
 python scripts\maix_remote.py install-autostart --app-id snail_egg --reboot
 ```
 
-只更新程序、不重复上传模型：
+## 安全约束
 
-```powershell
-python scripts\maix_remote.py install-autostart --app-id snail_egg --skip-models --reboot
-```
+1. 舵机必须使用独立 5 V 电源并与 MaixCAM 共地，禁止用 3.3 V 引脚给舵机供电。
+2. 代码只控制低功率红色辅助瞄准灯；高功率激光和消杀执行器保持人工确认。
+3. 未检测到有效卵团约 2 秒，辅助瞄准灯关闭；程序异常时也保持关闭。
+4. 首次上电调试应使用 `gimbal_dry_run`，确认方向和限幅后再接入真实云台。
+5. 设备实际部署必须记录连续日志：`STAT`、`EGG`、`AIM`、`DOT`，不要只看截图。
 
-部署后的关键路径：
+## 官方资料
 
-```text
-/maixapp/apps/snail_egg/main.py
-/root/models/snail_eggs_yolov8n_640x480.mud
-/root/models/snail_eggs_yolov8n_640x480.cvimodel
-/maixapp/auto_start.txt
-```
+- [MaixPy YOLO11 自定义模型](https://wiki.sipeed.com/maixpy/doc/zh/vision/customize_model_yolov8.html)
+- [MaixPy JPEG Streaming](https://wiki.sipeed.com/maixpy/doc/zh/video/jpeg_streaming.html)
+- [MaixPy WebRTC Streaming](https://wiki.sipeed.com/maixpy/doc/zh/video/webrtc_streaming.html)
+- [Ultralytics Training](https://docs.ultralytics.com/modes/train/)
 
-也可以直接复制 `release/maixcam_copy_to_device.zip` 中的文件。完整有线和 SSH
-说明见 [MaixCam SSH 远程控制](docs/ssh_remote_control_maixcam.md) 与
-[VSCode 工作流](docs/vscode_maixcam_workflow.md)。
-
-## 云台与瞄准灯
-
-### 接线
-
-| 功能 | MaixCam 引脚 | 程序接口 |
-| --- | --- | --- |
-| 水平舵机 | A18 | PWM6 |
-| 俯仰舵机 | A19 | PWM7 |
-| 红色瞄准灯继电器 | A15 | GPIOA15 |
-
-舵机必须使用容量足够的独立 5 V 稳压电源，并与 MaixCam 共地。不要直接由
-MaixCam 的 3.3 V 引脚给舵机供电。
-
-### 分级启用
-
-发布版默认不输出舵机 PWM。先启用干跑，只观察控制日志：
-
-```bash
-ssh root@192.168.x.x '
-  mkdir -p /root/snail_egg &&
-  touch /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run
-'
-```
-
-确认目标锁定、方向和限幅后再启用真实云台：
-
-```bash
-ssh root@192.168.x.x '
-  rm -f /root/snail_egg/gimbal_dry_run /root/snail_egg/disable_gimbal &&
-  touch /root/snail_egg/enable_gimbal_tracking /root/snail_egg/enable_closed_loop_aim
-'
-```
-
-中心闭环稳定后，启用低功率红点在锁定框内扫描：
-
-```bash
-ssh root@192.168.x.x '
-  touch /root/snail_egg/enable_aim_scan
-'
-```
-
-测试当前画面内的多团卵并逐一遍历：
-
-```bash
-ssh root@192.168.x.x '
-  touch /root/snail_egg/enable_aim_scan /root/snail_egg/cycle_all_targets
-'
-```
-
-测试结束后恢复单目标锁定：
-
-```bash
-ssh root@192.168.x.x 'rm -f /root/snail_egg/cycle_all_targets'
-```
-
-关闭框内扫描但保留中心闭环：
-
-```bash
-rm -f /root/snail_egg/enable_aim_scan
-```
-
-紧急禁用：
-
-```bash
-ssh root@192.168.x.x '
-  touch /root/snail_egg/disable_gimbal &&
-  rm -f /root/snail_egg/enable_gimbal_tracking /root/snail_egg/gimbal_dry_run \
-        /root/snail_egg/enable_closed_loop_aim /root/snail_egg/enable_aim_scan
-'
-```
-
-屏幕近距离测试与室外 1 m 工作距离是不同标定。仅在约 0.35 m 的显示器测试时
-创建 `/root/snail_egg/screen_tracking_test`；室外运行前必须删除它。
-
-禁用红色瞄准灯继电器：
-
-```bash
-touch /root/snail_egg/disable_aim_relay
-```
-
-程序每次启动先按一次按钮同步到关闭状态；检测稳定目标后按两次开启。首次启动测试
-完成标志为 `/root/snail_egg/aim_relay_startup_test_done`。删除该文件后，下次启动会在
-状态同步后额外执行一次 1 秒红色瞄准灯开关测试。
-
-更完整的控制方法和验收标准见：
-
-- [云台跟踪设计](docs/gimbal_tracking_design.md)
-- [云台动态测试流程](docs/gimbal_tracking_test_protocol.md)
-
-## 运行状态与坐标
-
-设备终端周期输出：
-
-```text
-STAT,<frame>,FPS,<fps>,RAW,<raw_count>,CAND,<candidate_count>,EGGS,<target_count>,TILE,<tile_info>
-EGG,<id>,<cx>,<cy>,<x>,<y>,<w>,<h>,<score>,<cx_norm>,<cy_norm>
-DOT,<x>,<y>,SCORE,<score>,FRESH,<0|1>,MISSES,<count>
-AIM,TRACK,<lock_id>,EX,<x_error>,EY,<y_error>,PAN,<offset>,TILT,<offset>,REF,<dot_x>,<dot_y>,DES,<aim_x>,<aim_y>,RAWID,<track_id>
-```
-
-其中 `id` 是当前帧左上到右下的显示编号；`cx/cy` 是像素中心；
-`cx_norm/cy_norm` 是 0 到 1 的归一化中心坐标。
-
-关键主机回归测试：
-
-```bash
-python scripts/test_closed_loop_aim.py
-python scripts/test_target_lock_persistence.py
-python scripts/test_gimbal_control_dynamics.py
-python scripts/test_aim_relay_safety.py
-```
-
-## 训练复现
-
-大型训练集和 `runs/` 不纳入 Git。数据需按 YOLO 单类别检测格式准备：
-
-```text
-data/<dataset>/
-  images/train  images/val  images/test
-  labels/train  labels/val  labels/test
-  dataset.yaml
-```
-
-训练并导出固定 `640x480` ONNX：
-
-```bash
-python scripts/yolo_train.py \
-  --data data/<dataset>/dataset.yaml \
-  --base-model yolov8n.pt \
-  --epochs 80 --imgsz 640 --export-imgsz 480,640 \
-  --batch 16 --device 0 --workers 0 \
-  --project runs_yolo --name snail_eggs_640x480 \
-  --patience 15 --rect --export-onnx
-```
-
-阈值和召回评估：
-
-```bash
-python scripts/evaluate_thresholds.py \
-  --model runs_yolo/snail_eggs_640x480/weights/best.pt \
-  --data-root data/<dataset> --split test --imgsz 480,640 \
-  --safe-filter --confs 0.10,0.15,0.20,0.25,0.30,0.35,0.40 \
-  --output runs/eval_thresholds.json
-```
-
-硬负样本误检评估：
-
-```bash
-python scripts/evaluate_negative_fps.py \
-  --model runs_yolo/snail_eggs_640x480/weights/best.pt \
-  --negative-dir data/hard_negatives_mixed \
-  --imgsz 480,640 --conf 0.20 --safe-filter \
-  --output runs/eval_negative.json
-```
-
-生成 MaixCam 转换包：
-
-```bash
-python scripts/prepare_maixcam_package.py \
-  --model-name snail_eggs_yolov8n_640x480 \
-  --onnx models/snail_eggs_yolov8n_640x480.onnx \
-  --mud maixcam/snail_eggs_yolov8n_640x480.mud \
-  --input-width 640 --input-height 480 \
-  --calibration-dir data/<dataset>/images/train \
-  --calibration-images 200
-
-VALIDATE_TRANSFORM=0 bash scripts/wsl_convert_maixcam_snail_eggs.sh
-```
-
-转换流程需要 WSL/Linux 和 TPU-MLIR。模型更新后必须重新执行正样本召回、硬负样本、
-多目标、真机光照/距离变化和云台动态测试，不能只看训练集指标。
-
-## 仓库结构
-
-```text
-assets/                         文档图片和结果示例
-docs/                           部署、跟踪设计和测试方法
-maixcam/                        MaixCam 程序源码
-models/                         PC 权重和 ONNX
-release/maixcam_copy_to_device/ 可直接复制到设备的发布镜像
-scripts/                        训练、评估、转换、部署和测试工具
-```
-
-以下本地内容默认不提交：`data/`、`runs/`、`runs_yolo/`、`dist/`、
-`outputs/` 和测试视频。
-
-## 参考资料
-
-- [Sipeed MaixCam](https://wiki.sipeed.com/hardware/zh/maixcam/index.html)
-- [MaixPy 文档](https://wiki.sipeed.com/maixpy/)
-- [MaixPy 自定义 YOLOv8](https://wiki.sipeed.com/maixpy/doc/zh/vision/customize_model_yolov8.html)
-- [MaixCam ONNX 转 MUD](https://wiki.sipeed.com/maixpy/doc/zh/ai_model_converter/maixcam.html)
-- [Ultralytics YOLO](https://docs.ultralytics.com/)
-- [Pink-Eggs Dataset V1](https://datasetninja.com/pink-eggs-dataset-v1)
+YOLO11 与 YOLOv8 在 MaixCAM 的训练和转换流程相近，官方示例支持 `320x224` 输入。JPEG 推流适合调试预览，但不应把网络发送速度当成检测 FPS；本项目因此分别统计采集循环、YOLO 刷新和手机收到的画面帧率。

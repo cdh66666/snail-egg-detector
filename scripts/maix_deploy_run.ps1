@@ -2,6 +2,7 @@ param(
   [string]$HostName = $env:MAIXCAM_HOST,
   [string]$User = "root",
   [string]$RemoteAppDir = "/root/snail_egg",
+  [string]$AppId = "",
   [string]$KeyPath = "$env:USERPROFILE\.ssh\maixcam_ed25519",
   [switch]$SkipModels,
   [switch]$NoRun
@@ -15,8 +16,10 @@ if ([string]::IsNullOrWhiteSpace($HostName)) {
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $MainPy = Join-Path $Root "maixcam\main.py"
+$WebControlPy = Join-Path $Root "maixcam\web_control.py"
 $ModelDir = Join-Path $Root "release\maixcam_copy_to_device\root\models"
-$ModelFiles = @(Get-ChildItem -LiteralPath $ModelDir -Filter "snail_eggs_yolov8n_*" -File -ErrorAction SilentlyContinue)
+$ModelFiles = @(Get-ChildItem -LiteralPath $ModelDir -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -like "snail_eggs_yolo11n_*" -or $_.Name -like "snail_eggs_yolov8n_*" })
 
 if (-not (Test-Path $MainPy)) { throw "Missing $MainPy" }
 if (-not $SkipModels) {
@@ -52,6 +55,25 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "==> Upload main.py"
 scp @ScpArgs $MainPy "${Target}:${RemoteAppDir}/main.py"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (Test-Path $WebControlPy) {
+  scp @ScpArgs $WebControlPy "${Target}:${RemoteAppDir}/web_control.py"
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($AppId)) {
+  $ActiveAppDir = "/maixapp/apps/$AppId"
+  Write-Host "==> Sync active app $ActiveAppDir"
+  ssh @SshArgs $Target "mkdir -p $ActiveAppDir"
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  scp @ScpArgs $MainPy "${Target}:${ActiveAppDir}/main.py"
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if (Test-Path $WebControlPy) {
+    scp @ScpArgs $WebControlPy "${Target}:${ActiveAppDir}/web_control.py"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  }
+  ssh @SshArgs $Target "chmod 644 $RemoteAppDir/main.py $ActiveAppDir/main.py && md5sum $RemoteAppDir/main.py $ActiveAppDir/main.py"
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 if (-not $SkipModels) {
   Write-Host "==> Upload model files"

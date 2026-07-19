@@ -16,7 +16,7 @@ def load_gate():
             names = {target.id for target in node.targets if isinstance(target, ast.Name)}
             if names & {
                 "AIM_RELAY_ON_STABLE_FRAMES",
-                "AIM_RELAY_OFF_MISSING_FRAMES",
+                "AIM_RELAY_OFF_MISSING_S",
                 "AIM_RELAY_NO_TARGET_TEST_FLAG",
             }:
                 selected.append(node)
@@ -30,11 +30,11 @@ def load_gate():
 def main():
     ns = load_gate()
     decide = ns["aim_relay_decision"]
-    assert ns["AIM_RELAY_OFF_MISSING_FRAMES"] == 1
+    assert ns["AIM_RELAY_OFF_MISSING_S"] == 2.0
     assert ns["AIM_RELAY_NO_TARGET_TEST_FLAG"].endswith("test_no_target_safety")
 
     # Startup and unstable whole-view detections cannot enable the light.
-    assert decide(False, 0, 1) is False
+    assert decide(False, 0, 1, 0.5) is None
     assert decide(True, 1, 0) is None
     assert decide(True, 2, 0) is None
     assert decide(True, 3, 0) is True
@@ -43,10 +43,11 @@ def main():
     # any fresh valid egg in the view keeps the light eligible to stay on.
     assert decide(True, 3, 0) is True
 
-    # One missing frame, including a Kalman-only prediction, fails closed.
-    assert decide(False, 0, 1) is False
-    assert decide(False, 0, 50) is False
-    print({"stable_enable_frames": 3, "missing_frames_to_off": 1, "fail_closed": "passed"})
+    # Brief gaps, including Kalman-only predictions, are tolerated; two
+    # seconds without a fresh whole-view detection fails closed.
+    assert decide(False, 0, 1, 1.99) is None
+    assert decide(False, 0, 50, 2.0) is False
+    print({"stable_enable_frames": 3, "missing_seconds_to_off": 2.0, "fail_closed": "passed"})
     return 0
 
 

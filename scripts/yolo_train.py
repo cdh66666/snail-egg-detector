@@ -40,20 +40,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--degrees", type=float, default=0.0, help="Rotation augmentation in degrees.")
     parser.add_argument("--translate", type=float, default=0.1, help="Translate augmentation fraction.")
     parser.add_argument("--scale", type=float, default=0.5, help="Scale augmentation fraction.")
+    parser.add_argument("--shear", type=float, default=0.0, help="Shear augmentation in degrees.")
+    parser.add_argument("--perspective", type=float, default=0.0, help="Perspective augmentation strength.")
+    parser.add_argument("--flipud", type=float, default=0.0, help="Vertical flip probability.")
+    parser.add_argument("--fliplr", type=float, default=0.5, help="Horizontal flip probability.")
+    parser.add_argument("--multi-scale", type=float, default=0.0, help="Random training-size range, for example 0.25.")
     parser.add_argument("--mosaic", type=float, default=1.0, help="Mosaic augmentation probability.")
     parser.add_argument("--mixup", type=float, default=0.0, help="MixUp augmentation probability.")
     parser.add_argument("--close-mosaic", type=int, default=10, help="Disable mosaic for final N epochs.")
+    parser.add_argument("--freeze", type=int, default=0, help="Freeze the first N model layers during fine-tuning.")
+    parser.add_argument("--exist-ok", action="store_true", help="Allow reusing an existing run directory.")
     parser.add_argument("--export-onnx", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    requested_imgsz = args.imgsz
+    # Ultralytics train/val accepts one maximum side length. Supplying [H, W]
+    # is silently collapsed to max(H, W), so make that behavior explicit and
+    # reserve the exact rectangular shape for fixed-size ONNX export.
+    train_imgsz = max(requested_imgsz) if isinstance(requested_imgsz, list) else requested_imgsz
+    export_imgsz = args.export_imgsz or requested_imgsz
     model = YOLO(args.base_model, task="detect")
     train_result = model.train(
         data=str(args.data),
         epochs=args.epochs,
-        imgsz=args.imgsz,
+        imgsz=train_imgsz,
         batch=args.batch,
         workers=args.workers,
         device=args.device,
@@ -71,11 +84,18 @@ def main() -> None:
         degrees=args.degrees,
         translate=args.translate,
         scale=args.scale,
+        shear=args.shear,
+        perspective=args.perspective,
+        flipud=args.flipud,
+        fliplr=args.fliplr,
+        multi_scale=args.multi_scale,
         mosaic=args.mosaic,
         mixup=args.mixup,
         close_mosaic=args.close_mosaic,
+        freeze=args.freeze,
         cache=False,
         verbose=True,
+        exist_ok=args.exist_ok,
     )
 
     best_path = Path(train_result.save_dir) / "weights" / "best.pt"
@@ -83,20 +103,21 @@ def main() -> None:
     test_metrics = best_model.val(
         data=str(args.data),
         split="test",
-        imgsz=args.imgsz,
+        imgsz=train_imgsz,
         batch=args.batch,
         workers=args.workers,
         device=args.device,
         project=args.project,
         name=f"{args.name}_test",
         plots=True,
+        exist_ok=args.exist_ok,
     )
 
     exported = None
     if args.export_onnx:
         exported = best_model.export(
             format="onnx",
-            imgsz=args.export_imgsz or args.imgsz,
+            imgsz=export_imgsz,
             dynamic=False,
             simplify=True,
             opset=17,
@@ -105,6 +126,10 @@ def main() -> None:
     summary = {
         "best_model": str(best_path),
         "train_dir": str(train_result.save_dir),
+        "requested_imgsz": requested_imgsz,
+        "effective_train_imgsz": train_imgsz,
+        "fixed_export_imgsz": export_imgsz if args.export_onnx else None,
+        "rectangular_batches": args.rect,
         "test_map50": float(test_metrics.box.map50),
         "test_map50_95": float(test_metrics.box.map),
         "exported": exported,

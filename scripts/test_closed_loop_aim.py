@@ -10,6 +10,7 @@ MAIN = ROOT / "maixcam" / "main.py"
 NAMES = {
     "FRAME_W",
     "FRAME_H",
+    "FRAME_SCALE",
     "FIXED_AIM_X",
     "FIXED_AIM_Y",
     "AIM_DOT_LAB_THRESHOLDS",
@@ -25,6 +26,7 @@ NAMES = {
     "AIM_DOT_MIN_LOCAL_CONTRAST",
     "AIM_DOT_RGB_STRIDE",
     "AIM_DOT_RGB_REFRESH_FRAMES",
+    "AIM_DOT_RGB_REACQUIRE_FRAMES",
     "AIM_DOT_EXPECTED_RADIUS_PX",
     "AIM_DOT_MAX_JUMP_PX",
     "AIM_DOT_FILTER_ALPHA",
@@ -33,9 +35,6 @@ NAMES = {
     "AIM_DOT_CONTROL_TOLERANCE_PX",
     "AIM_SCAN_SETTLE_FRAMES",
     "AIM_SCAN_DWELL_S",
-    "AIM_SCAN_MARGIN_RATIO",
-    "AIM_SCAN_CONTOUR_GRID",
-    "AIM_SCAN_CONTOUR_REFRESH_FRAMES",
 }
 
 
@@ -59,11 +58,14 @@ def load_namespace():
             "AimWaypointPlanner",
         }:
             selected.append(node)
-    ns = {"print": lambda *_args, **_kwargs: None}
+    ns = {
+        "print": lambda *_args, **_kwargs: None,
+        "USE_FAST_MODEL": False,
+        "FAST_MODEL_IS_YOLO11": False,
+    }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(MAIN), "exec"), ns)
     ns["ACTIVE_AIM_X"] = ns["FIXED_AIM_X"]
     ns["ACTIVE_AIM_Y"] = ns["FIXED_AIM_Y"]
-    ns["cycle_targets_requested"] = lambda: False
     return ns
 
 
@@ -118,14 +120,13 @@ def main():
     point = planner.point(target, None, 0.0, False)
     assert point == (250.0, 160.0)
 
-    # A settled visible dot advances to the next bounded point.
+    # A settled visible dot reaches center, then hands off to manual trim.
     centered = SimpleNamespace(x=250.0, y=160.0, fresh=True)
     for index in range(ns["AIM_SCAN_SETTLE_FRAMES"] + 1):
-        planner.point(target, centered, index * 0.12, True)
-    assert planner.index == 1
-    point = planner.point(target, centered, 1.0, True)
-    assert target.x < point[0] < target.x + target.w
-    assert target.y < point[1] < target.y + target.h
+        planner.point(target, centered, index * 0.12, hold_when_centered=True)
+    assert planner.take_centered_ready()
+    assert planner.point(None, None, 2.0, hold_when_centered=True) is None
+    assert not planner.take_centered_ready()
 
     # Closed-loop image-space simulation: the visible dot is the reference,
     # target detections disappear briefly, and motion must resume without a
@@ -153,7 +154,7 @@ def main():
             "red_dot_detection": "passed",
             "pink_and_large_rejection": "passed",
             "stale_dot_hold": "passed",
-            "bounded_waypoint_scan": "passed",
+            "centered_manual_handoff": "passed",
             "dropout_recovery": "passed",
             "final_closed_loop_error_px": round(final_error, 2),
         }

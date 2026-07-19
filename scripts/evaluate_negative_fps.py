@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safe-filter", action="store_true")
     parser.add_argument("--exclude-yolo-root", type=Path, help="Skip source stems already present in this YOLO dataset.")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--max-examples", type=int, default=30, help="Save this many false-positive examples; 0 saves all.")
     return parser.parse_args()
 
 
@@ -71,7 +72,14 @@ def source_stems_already_in_dataset(root: Path | None) -> set[str]:
 def main() -> None:
     args = parse_args()
     used_stems = source_stems_already_in_dataset(args.exclude_yolo_root)
-    images = [p for p in iter_images(args.negative_dir) if p.stem not in used_stems]
+    source_pattern = re.compile(r"(\d{12})")
+
+    def is_used_source(path: Path) -> bool:
+        if path.stem in used_stems:
+            return True
+        return any(match in used_stems for match in source_pattern.findall(path.stem))
+
+    images = [p for p in iter_images(args.negative_dir) if not is_used_source(p)]
     rng = random.Random(args.seed)
     rng.shuffle(images)
     if args.limit > 0:
@@ -128,7 +136,7 @@ def main() -> None:
         if kept:
             images_with_fp += 1
             fp_count += len(kept)
-            if len(examples) < 30:
+            if args.max_examples == 0 or len(examples) < args.max_examples:
                 examples.append({"image": str(image_path), "detections": kept})
 
     summary = {

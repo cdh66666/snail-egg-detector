@@ -1,8 +1,13 @@
 import atexit
 import os
+import threading
 import time as pytime
 
 from maix import camera, display, image, nn, app, time, pwm, pinmap, gpio
+try:
+    from maix import http
+except Exception:
+    http = None
 try:
     from web_control import WebControl
 except Exception:
@@ -12,12 +17,19 @@ except Exception:
 # Copy this file to MaixVision as main.py after converting the ONNX model to MUD.
 # Put the MUD and model file under /root/models/ on the MaixCam.
 
-MODEL = "/root/models/snail_eggs_yolov8n_640x480.mud"
-CONF_TH = 0.20
+MODEL = "/root/models/snail_eggs_yolo11n_320x224_v26.mud"
+USE_FAST_MODEL = True
+FAST_MODEL_IS_YOLO11 = True
+# Run inference at the maintenance floor, but only expose high-confidence
+# detections for initial selection. A manually selected target may continue at
+# the lower threshold only inside its previous ROI.
+CONF_TH = 0.10
 IOU_TH = 0.35
 MAX_TARGETS = 32
-MIN_MODEL_CONF = 0.20
-STRONG_MODEL_CONF = 0.38
+DISCOVERY_MODEL_CONF = 0.35
+LOCK_MAINTAIN_MODEL_CONF = 0.10
+MIN_MODEL_CONF = LOCK_MAINTAIN_MODEL_CONF
+STRONG_MODEL_CONF = 0.35 if USE_FAST_MODEL else 0.38
 LOW_CONF_MIN_PINK_RATIO = 0.035
 LOW_CONF_MIN_AREA = 18
 
@@ -29,9 +41,9 @@ AIM_RELAY_NO_TARGET_TEST_FLAG = "/root/snail_egg/test_no_target_safety"
 AIM_RELAY_STARTUP_TEST_DONE_FLAG = "/root/snail_egg/aim_relay_startup_test_done"
 AIM_RELAY_ON_STABLE_FRAMES = 3
 # Keep the harmless red aiming light on while any fresh valid egg detection is
-# present anywhere in the camera view. It is not tied to the selected primary
-# target. If the whole view has no fresh valid egg detection, turn it off.
-AIM_RELAY_OFF_MISSING_FRAMES = 1
+# present anywhere in the camera view. Brief detector gaps are tolerated, but
+# two seconds without a fresh valid egg turns it off.
+AIM_RELAY_OFF_MISSING_S = 2.0
 AIM_RELAY_PULSE_S = 0.20
 AIM_RELAY_STARTUP_TEST_ON_S = 1.0
 AIM_RELAY_STARTUP_TEST_CYCLES = 1
@@ -39,13 +51,6 @@ AIM_RELAY_STARTUP_TEST_CYCLES = 1
 # Closed-loop aiming uses the visible low-power red dot as measured feedback.
 # It is runtime opt-in so a missing/misconfigured dot can never move the gimbal.
 CLOSED_LOOP_AIM_FLAG = "/root/snail_egg/enable_closed_loop_aim"
-AIM_SCAN_FLAG = "/root/snail_egg/enable_aim_scan"
-CYCLE_TARGETS_FLAG = "/root/snail_egg/cycle_all_targets"
-COLOR_ONLY_FLAG = "/root/snail_egg/enable_color_only"
-COLOR_ONLY_THRESHOLDS = [[10, 115, 15, 127, -15, 127]]
-COLOR_ONLY_MIN_PIXELS = 12
-COLOR_ONLY_MIN_AREA = 18
-COLOR_ONLY_MIN_PINK_RATIO = 0.04
 AIM_DOT_LAB_THRESHOLDS = [[20, 100, 35, 127, -20, 127]]
 AIM_DOT_MIN_PIXELS = 1
 AIM_DOT_MAX_PIXELS = 420
@@ -62,18 +67,33 @@ AIM_DOT_RGB_MIN_DOMINANCE = 30
 AIM_DOT_RGB_MIN_DOMINANCE_RATIO = 0.17
 AIM_DOT_MIN_LOCAL_CONTRAST = 8
 AIM_DOT_RGB_STRIDE = 7
-AIM_DOT_RGB_REFRESH_FRAMES = 3
+AIM_DOT_RGB_REFRESH_FRAMES = 1
+AIM_DOT_RGB_REACQUIRE_FRAMES = 3
+# The red spot is rigidly attached to the camera. Search more often while it
+# is visible and less often while lost; this keeps dot search from starving
+# YOLO while retaining prompt reacquisition.
+AIM_DOT_LOOP_EVERY_N_FRAMES = 10
+AIM_DOT_TRACK_LOOP_EVERY_N_FRAMES = 2
 AIM_DOT_EXPECTED_RADIUS_PX = 70
 AIM_DOT_MAX_JUMP_PX = 65
 AIM_DOT_FILTER_ALPHA = 0.55
 AIM_DOT_STALE_FRAMES = 8
+AIM_DOT_FIXED_FALLBACK_AFTER_MISSES = 6
 AIM_DOT_LOG_EVERY_N_FRAMES = 10
 AIM_DOT_CONTROL_TOLERANCE_PX = 9
 AIM_SCAN_SETTLE_FRAMES = 2
 AIM_SCAN_DWELL_S = 0.12
-AIM_SCAN_MARGIN_RATIO = 0.44
-AIM_SCAN_CONTOUR_GRID = 9
-AIM_SCAN_CONTOUR_REFRESH_FRAMES = 5
+SELECTED_LOSS_CONFIRM_DETECTIONS = 8
+SELECTED_GOAL_FILTER_ALPHA = 0.30
+SELECTED_LOCK_CONFIRM_DETECTIONS = 4
+SELECTED_LOCK_TIMEOUT_DETECTIONS = 8
+SELECTED_LOCK_MAX_CENTER_SHIFT_BOXES = 0.45
+SELECTED_LOCK_MAX_SIZE_RATIO = 1.65
+# Measured on the installed camera/gimbal pair with +/-5 degree moves.
+# The nominal lens FOV over-commanded the servos and left the target short.
+# These equivalent FOV values are used as calibrated pixels-per-degree.
+CAMERA_H_FOV_DEG = 55.7
+CAMERA_V_FOV_DEG = 36.5
 
 # Basic gimbal control. On the current wiring A18/PWM6 is pan and
 # A19/PWM7 is tilt. Every command is clamped to the axis-specific limits
@@ -91,7 +111,7 @@ GIMBAL_DISABLE_FLAG = "/root/snail_egg/disable_gimbal"
 # outdoor scenes. This opt-in flag lowers only the model score floor for the
 # desktop tracking rig; removing it restores the production thresholds above.
 SCREEN_TEST_FLAG = "/root/snail_egg/screen_tracking_test"
-SCREEN_TEST_CONF_TH = 0.08
+SCREEN_TEST_CONF_TH = 0.05
 GIMBAL_FREQ = 50
 GIMBAL_CENTER_DEG = 90
 GIMBAL_PAN_MIN_DEG = 60
@@ -101,22 +121,29 @@ GIMBAL_TILT_MAX_DEG = 120
 GIMBAL_CENTER_SETTLE_S = 0.35
 GIMBAL_PAN_PWM_ID = 6
 GIMBAL_TILT_PWM_ID = 7
-# Control loop is slower than the detector on purpose. The detector/display
-# can stay near 19 FPS while the hobby servos receive smooth 10 Hz updates.
-GIMBAL_CONTROL_HZ = 20.0
-GIMBAL_DEADZONE_X = 0.018
-GIMBAL_DEADZONE_Y = 0.022
-GIMBAL_MAX_STEP_DEG = 1.5
-GIMBAL_MAX_RATE_DEG_S = 15.0
-GIMBAL_MAX_ACCEL_DEG_S2 = 30.0
-GIMBAL_ERROR_FILTER_TAU_S = 0.08
-# In the velocity controller KP maps normalized image error to deg/s.
-GIMBAL_PAN_KP = 52.0
-GIMBAL_PAN_KI = 0.0
-GIMBAL_PAN_KD = 2.5
-GIMBAL_TILT_KP = 44.0
-GIMBAL_TILT_KI = 0.0
-GIMBAL_TILT_KD = 2.0
+# Slow non-PID tracking profile. Image error is smoothed and converted directly
+# to a tiny bounded angle step. Reversals must brake through zero first.
+GIMBAL_CONTROL_HZ = 30.0
+GIMBAL_DEADZONE_X = 0.015
+GIMBAL_DEADZONE_Y = 0.018
+GIMBAL_SLOW_MAX_STEP_DEG = 0.35
+GIMBAL_SLOW_STEP_CHANGE_DEG = 0.060
+GIMBAL_SLOW_FULL_SPEED_ERROR = 0.08
+GIMBAL_SLOW_ERROR_FILTER_TAU_S = 0.04
+# The vision controller may run slower, but physical PWM commands are
+# interpolated independently at 50 Hz with bounded speed, acceleration and
+# jerk. This removes the visible 12 Hz staircase without adding PID overshoot.
+GIMBAL_TRAJECTORY_HZ = 50.0
+GIMBAL_TRAJECTORY_MAX_SPEED_DEG_S = 3.0
+GIMBAL_TRAJECTORY_MAX_ACCEL_DEG_S2 = 8.0
+GIMBAL_TRAJECTORY_MAX_JERK_DEG_S3 = 40.0
+GIMBAL_TRAJECTORY_POSITION_EPS_DEG = 0.008
+GIMBAL_TRAJECTORY_SPEED_EPS_DEG_S = 0.04
+# Avoid restarting a rest-to-rest quintic segment on every tiny 30 Hz vision
+# update. Frequent replans look fine on a static move but lag badly on a curve.
+GIMBAL_TARGET_REPLAN_EPS_DEG = 0.20
+GIMBAL_RECENTER_NO_TARGET_S = 2.0
+GIMBAL_RECENTER_RATE_DEG_S = 3.0
 GIMBAL_PAN_SIGN = -1.0
 GIMBAL_TILT_SIGN = -1.0
 GIMBAL_MIN_STABLE = 3
@@ -129,39 +156,53 @@ AIM_LOG_EVERY_N_FRAMES = 5
 # 2 = final: only draw pink-passed targets with IDs.
 # 3 = auto tune: color debug + save frames + print every raw/candidate stat.
 RUN_MODE = 2
+SHOW_OVERLAY_TEXT = False
 
-# Runtime speed profiles. The packaged release uses "full_frame": one 640x480
-# inference per camera frame, no stale memory boxes. Tile profiles are kept only
-# for experiments with smaller custom models.
+# Runtime speed profiles use one inference per current camera frame. No stale
+# round-robin tiles are used for actuator aiming.
 SPEED_PROFILE = "full_frame"
 
-# The current deployed model input is 640x480, so the detector sees the whole
-# camera image in one pass. That avoids stale round-robin boxes for laser aiming.
-FRAME_W = 640
-FRAME_H = 480
-# GC4653 stock lens: H-FOV 81 degrees, V-FOV 51 degrees. With the laser
+# Use the compact rectangular YOLO11 INT8 model exclusively on MaixCAM.
+FRAME_W = 320 if USE_FAST_MODEL else 640
+FRAME_H = 224 if FAST_MODEL_IS_YOLO11 else (256 if USE_FAST_MODEL else 480)
+FRAME_SCALE = FRAME_W / 640.0
+# The installed camera/gimbal pair is calibrated above. With the laser
 # emitter 10 mm right and 60 mm below the camera, parallel-axis parallax at
 # 1.0 m is approximately (+3.7, +30.2) pixels. The rounded point below is the
-# fixed 1 m aim reference; production control does not need red-dot detection.
+# fixed aim reference. A raw device capture measured the visible red spot at
+# approximately (154, 121) in the 320x224 control frame.
 LASER_WORK_DISTANCE_MM = 1000
 LASER_OFFSET_RIGHT_MM = 10
 LASER_OFFSET_DOWN_MM = 60
-FIXED_AIM_X = 324
-FIXED_AIM_Y = 270
+FIXED_AIM_X = int(round(308 * FRAME_SCALE))
+FIXED_AIM_Y = int(round(259 * FRAME_H / 480.0))
 # The desktop monitor used for gimbal tuning is about 0.35 m away. A captured
 # frame measured the visible aiming dot at y=326 there. Keep this calibration
 # separate so the field profile remains correct at the required 1.0 m range.
-SCREEN_TEST_AIM_X = 329
-SCREEN_TEST_AIM_Y = 326
+SCREEN_TEST_AIM_X = FIXED_AIM_X
+SCREEN_TEST_AIM_Y = FIXED_AIM_Y
 SCREEN_TEST_DISTANCE_MM = 350
 # A visible aiming dot can itself produce a small low-confidence YOLO box.
 # Reject only marker-sized boxes very close to the calibrated aim point.
-AIM_MARKER_REJECT_RADIUS_PX = 32
-AIM_MARKER_REJECT_MAX_W = 52
-AIM_MARKER_REJECT_MAX_H = 56
-# A 640x480 RGB888 frame is large on MaixCam. The SDK default is three
-# buffers; one buffer is enough here and avoids the VI memory allocation crash.
-CAMERA_BUFF_NUM = 1
+AIM_MARKER_REJECT_RADIUS_PX = max(16, int(round(32 * FRAME_SCALE)))
+AIM_MARKER_REJECT_MAX_W = max(26, int(round(52 * FRAME_SCALE)))
+AIM_MARKER_REJECT_MAX_H = max(28, int(round(56 * FRAME_H / 480.0)))
+if USE_FAST_MODEL:
+    AIM_DOT_MAX_PIXELS = 120
+    AIM_DOT_MAX_SIDE = 18
+    AIM_DOT_RGB_STRIDE = 4
+    AIM_DOT_RGB_REFRESH_FRAMES = 3
+    AIM_DOT_EXPECTED_RADIUS_PX = 35
+    AIM_DOT_MAX_JUMP_PX = 22
+    AIM_DOT_CONTROL_TOLERANCE_PX = 5
+# Keep two capture buffers. Three buffers plus YOLO dual buffering and the
+# physical display can exhaust the MaixCAM media pool during Display() init;
+# two still prevents the camera read from blocking behind inference.
+CAMERA_BUFF_NUM = 2
+CAMERA_TARGET_FPS = 60
+WEB_STREAM_PORT = 8001
+WEB_STREAM_MAX_CLIENTS = 4
+WEB_STREAM_EVERY_N_FRAMES = 1
 USE_TILED_INFERENCE = False
 TILE_OVERLAP = 160
 MERGE_IOU = 0.45
@@ -172,10 +213,10 @@ MEMORY_TTL_FRAMES = 36
 # Bring-up defaults: show what the model sees first. Keep laser disconnected.
 # After field tuning, raise CONF_TH, turn ENABLE_COLOR_GATE back on, and require
 # stable frames before sending targets to any actuator.
-MIN_BOX_AREA = 18
+MIN_BOX_AREA = 8 if USE_FAST_MODEL else 18
 # Reject dot-like detections that are too small to be an actionable egg mass.
 # A thin mass is still accepted when either side exceeds this limit.
-MAX_TINY_BOX_SIDE = 11
+MAX_TINY_BOX_SIDE = 6 if USE_FAST_MODEL else 11
 MAX_BOX_AREA_RATIO = 0.32
 MAX_BOX_SIDE_RATIO = 0.86
 MIN_ASPECT = 0.18
@@ -187,29 +228,40 @@ MAX_RED_BAD_RATIO = 0.55
 RED_BAD_DOMINANCE = 2.4
 COLOR_GRID = 6
 MAX_COLOR_CHECKS = 36
+STRONG_COLOR_CHECKS = 4
+LOW_CONF_COLOR_CHECKS = 16
 REQUIRE_STABLE_FRAMES = 2
 # Keep a short prediction window when the detector misses a frame. At about
 # 19 FPS this is roughly 0.3 seconds, long enough to bridge transient misses.
-TRACK_MAX_MISSES = 24
-TRACK_PREDICT_MAX_MISSES = 12
-LOCK_REACQUIRE_RADIUS_PX = 75
+TRACK_MAX_MISSES = 60
+# At the current 18-22 Hz loop and every-other-frame YOLO cadence, forty
+# prediction frames bridge about two seconds of motion-induced detector loss.
+# Prediction velocity decays on every miss so stale boxes settle instead of
+# drifting across the view.
+TRACK_PREDICT_MAX_MISSES = 40
+LOCK_REACQUIRE_RADIUS_PX = 38 if USE_FAST_MODEL else 75
 LOCK_REACQUIRE_MAX_COST = 60.0
 # The deployed 640x480 pipeline runs at about 5 FPS. Release a target after
 # roughly five seconds of failed reacquisition so another visible egg mass can
 # take over, while still bridging ordinary one- or two-frame detector misses.
 LOCK_RELEASE_MISSING_FRAMES = 25
+# Switch to a fresh visible candidate after a short unmatched-lock window.
+LOCK_SWITCH_MISSING_FRAMES = 6
 TRACK_MATCH_DISTANCE_SCALE = 1.35
-TRACK_MATCH_MIN_DISTANCE_PX = 90.0
+TRACK_MATCH_MIN_DISTANCE_PX = 45.0 if USE_FAST_MODEL else 90.0
+TRACK_ASSOC_MAX_COST = 1.45
+TRACK_LOCKED_LOW_ASSOC_MAX_COST = 0.92
+TRACK_ASSOC_MAX_SIZE_RATIO = 1.9
 TRACK_KF_PROCESS_NOISE = 2.0
 TRACK_KF_MEASUREMENT_NOISE = 16.0
-TRACK_MAX_VELOCITY_PX = 54.0
-GIMBAL_PREDICT_MAX_MISSES = 4
+TRACK_MAX_VELOCITY_PX = 27.0 if USE_FAST_MODEL else 54.0
+GIMBAL_PREDICT_MAX_MISSES = 12
 GIMBAL_COAST_MAX_MISSES = 2
 # 0 means automatically lock the first stable track; set a positive ID to
 # lock a specific track later when the gimbal controller is connected.
 LOCK_TARGET_ID = 0
 PRIMARY_TARGET_POLICY = "robust_center"
-PRIMARY_COLUMN_TOLERANCE_PX = 40
+PRIMARY_COLUMN_TOLERANCE_PX = 20 if USE_FAST_MODEL else 40
 WARMUP_FRAMES = 6
 
 if SPEED_PROFILE == "full_frame":
@@ -232,12 +284,21 @@ elif SPEED_PROFILE == "fast":
 else:
     print("WARN,UNKNOWN_SPEED_PROFILE,%s" % SPEED_PROFILE)
 
-# For laser aiming, False keeps boxes aligned with the current frame. Set True only
-# if you prefer higher FPS and can tolerate one-frame image delay.
-DUAL_BUFF = False
+# The updated MaixPy runtime supports asynchronous YOLO11 inference. Two camera
+# buffers plus NPU dual buffering overlap capture, inference and control.
+DUAL_BUFF = True
+# YOLO inference is the expensive stage. The tracker/control/display loop runs
+# on every camera frame; YOLO refreshes the tracks periodically. A value of 1
+# restores detector-on-every-frame behavior for accuracy comparisons.
+# Detection accuracy and stable association take priority. Run YOLO on every
+# frame by default; real device PROF data decides whether a stride is needed.
+DETECT_EVERY_N_FRAMES = 1
 
-PRINT_EVERY_N_FRAMES = 30
+# Per-target serial logging is useful during a lab trace but blocks the
+# MaixVision UART in normal operation. Structured STAT/PROF telemetry remains.
+PRINT_EVERY_N_FRAMES = 0
 STAT_EVERY_N_FRAMES = 30
+PROFILE_EVERY_N_FRAMES = 120
 DEBUG_DIR = "/root/snail_egg/debug"
 DEBUG_CAPTURE_FLAG = "/root/snail_egg/capture_frames"
 DEBUG_CAPTURE_ONCE_FLAG = "/root/snail_egg/capture_once"
@@ -251,11 +312,19 @@ DEBUG_MAX_SAVES = 6
 MANUAL_CAPTURE_EVERY_N_FRAMES = 60
 MANUAL_CAPTURE_MAX_SAVES = 4
 WEB_CONTROL_PORT = 8000
+WEB_CONTROL_POLL_EVERY_N_FRAMES = 1
+WEB_CONTROL_DISABLE_FLAG = "/root/snail_egg/disable_web_control"
+RUNTIME_FLAG_POLL_EVERY_N_FRAMES = 15
 # Default to visual output for MaixVision/device use. The VSCode SSH helper
 # creates /root/snail_egg/headless before running so automated tests do not
 # block on display.Display().
 ENABLE_DISPLAY = True
 HEADLESS_FLAG = "/root/snail_egg/headless"
+# Text is drawn on every output frame. Skipping text redraws makes the labels
+# visibly blink because each camera frame starts from a clean image buffer.
+OVERLAY_TEXT_EVERY_N_FRAMES = 1
+_overlay_text_enabled = True
+_web_overlay_enabled = False
 _tracks = []
 _next_track_id = 1
 _locked_track_id = 0
@@ -263,9 +332,13 @@ _locked_last_center = None
 _locked_last_size = None
 _locked_missing_frames = 0
 _primary_center = None
+_manual_lock_active = False
+_track_last_pan_offset = None
+_track_last_tilt_offset = None
+_pending_detection_pan_offset = None
+_pending_detection_tilt_offset = None
 _last_aim_dot = None
 _previous_aim_dot = None
-_completed_track_ids = set()
 
 
 class AimRelay:
@@ -410,11 +483,125 @@ def servo_duty_from_angle(angle):
     return 2.5 + (float(angle) / 180.0) * 10.0
 
 
+def quintic_trajectory_duration(distance, initial_velocity=0.0, initial_acceleration=0.0):
+    """Choose a rest-to-rest duration that respects speed and acceleration."""
+    distance = abs(float(distance))
+    if distance <= GIMBAL_TRAJECTORY_POSITION_EPS_DEG:
+        return 0.0
+    speed_time = 1.875 * distance / GIMBAL_TRAJECTORY_MAX_SPEED_DEG_S
+    acceleration_time = pow(
+        5.8 * distance / GIMBAL_TRAJECTORY_MAX_ACCEL_DEG_S2,
+        0.5,
+    )
+    jerk_time = pow(
+        60.0 * distance / GIMBAL_TRAJECTORY_MAX_JERK_DEG_S3,
+        1.0 / 3.0,
+    )
+    state_time = max(
+        2.0 * abs(initial_velocity) / GIMBAL_TRAJECTORY_MAX_ACCEL_DEG_S2,
+        pow(2.0 * abs(initial_acceleration) / GIMBAL_TRAJECTORY_MAX_JERK_DEG_S3, 0.5),
+    )
+    return max(0.45, speed_time, acceleration_time, jerk_time, state_time)
+
+
+def quintic_trajectory_coefficients(position, velocity, acceleration, target, duration):
+    """Build a quintic segment ending with zero velocity and acceleration."""
+    duration = max(0.001, float(duration))
+    delta = float(target) - float(position)
+    t2 = duration * duration
+    t3 = t2 * duration
+    t4 = t3 * duration
+    t5 = t4 * duration
+    a0 = float(position)
+    a1 = float(velocity)
+    a2 = 0.5 * float(acceleration)
+    a3 = (20.0 * delta - 12.0 * velocity * duration - 3.0 * acceleration * t2) / (2.0 * t3)
+    a4 = (-30.0 * delta + 16.0 * velocity * duration + 3.0 * acceleration * t2) / (2.0 * t4)
+    a5 = (12.0 * delta - 6.0 * velocity * duration - acceleration * t2) / (2.0 * t5)
+    return (a0, a1, a2, a3, a4, a5)
+
+
+def quintic_trajectory_sample(coefficients, elapsed, duration, target):
+    if elapsed >= duration:
+        return float(target), 0.0, 0.0
+    t = max(0.0, float(elapsed))
+    a0, a1, a2, a3, a4, a5 = coefficients
+    t2 = t * t
+    t3 = t2 * t
+    t4 = t3 * t
+    t5 = t4 * t
+    position = a0 + a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5
+    velocity = a1 + 2.0 * a2 * t + 3.0 * a3 * t2 + 4.0 * a4 * t3 + 5.0 * a5 * t4
+    acceleration = 2.0 * a2 + 6.0 * a3 * t + 12.0 * a4 * t2 + 20.0 * a5 * t3
+    return position, velocity, acceleration
+
+
 def safe_sleep(seconds):
     try:
         pytime.sleep(seconds)
     except Exception:
         pass
+
+
+class LatestJpegStreamer:
+    """Publish only the newest JPEG so a slow client cannot backlog vision."""
+
+    def __init__(self, streamer):
+        self.streamer = streamer
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._latest = None
+        self._sequence = 0
+        self._stop = False
+        self.fps = 0.0
+        self.write_ms = 0.0
+        self._window_start = pytime.time()
+        self._window_frames = 0
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+
+    def submit(self, jpeg):
+        with self._lock:
+            self._latest = jpeg
+            self._sequence += 1
+        self._ready.set()
+
+    def _writer_loop(self):
+        clock = getattr(pytime, "monotonic", pytime.time)
+        sent_sequence = -1
+        while not self._stop:
+            self._ready.wait(0.2)
+            self._ready.clear()
+            with self._lock:
+                jpeg = self._latest
+                sequence = self._sequence
+            if jpeg is None or sequence == sent_sequence:
+                continue
+            started = clock()
+            try:
+                self.streamer.write(jpeg)
+                sent_sequence = sequence
+                self.write_ms = (clock() - started) * 1000.0
+                self._window_frames += 1
+                elapsed = pytime.time() - self._window_start
+                if elapsed >= 1.0:
+                    self.fps = self._window_frames / max(0.001, elapsed)
+                    self._window_frames = 0
+                    self._window_start = pytime.time()
+            except Exception as e:
+                print("WEB_STREAM_WRITE_ERROR,%s" % e)
+
+    def close(self):
+        self._stop = True
+        self._ready.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self.streamer.stop()
+        except Exception:
+            pass
 
 
 def file_exists(path):
@@ -438,25 +625,13 @@ def closed_loop_aim_requested():
     return file_exists(CLOSED_LOOP_AIM_FLAG)
 
 
-def aim_scan_requested():
-    return closed_loop_aim_requested() and file_exists(AIM_SCAN_FLAG)
-
-
-def aim_relay_decision(fresh_target, detected_frames, missing_frames):
+def aim_relay_decision(fresh_target, detected_frames, missing_frames, missing_seconds=0.0):
     """Return True/False for a relay transition, or None to keep its state."""
-    if not fresh_target or missing_frames >= AIM_RELAY_OFF_MISSING_FRAMES:
+    if missing_seconds >= AIM_RELAY_OFF_MISSING_S:
         return False
     if detected_frames >= AIM_RELAY_ON_STABLE_FRAMES:
         return True
     return None
-
-
-def cycle_targets_requested():
-    return aim_scan_requested() and file_exists(CYCLE_TARGETS_FLAG)
-
-
-def color_only_requested():
-    return file_exists(COLOR_ONLY_FLAG)
 
 
 def gimbal_pwm_requested():
@@ -494,28 +669,130 @@ class Gimbal:
         center_duty = servo_duty_from_angle(GIMBAL_CENTER_DEG)
         self.pan = pwm.PWM(GIMBAL_PAN_PWM_ID, freq=GIMBAL_FREQ, duty=center_duty, enable=True)
         self.tilt = pwm.PWM(GIMBAL_TILT_PWM_ID, freq=GIMBAL_FREQ, duty=center_duty, enable=True)
+        self._lock = threading.Lock()
+        self._pending = (0.0, 0.0)
+        self._applied = (0.0, 0.0)
+        self._velocity = (0.0, 0.0)
+        self._acceleration = (0.0, 0.0)
+        self._trajectory_target = (0.0, 0.0)
+        self._trajectory_start = 0.0
+        self._trajectory_duration = 0.0
+        self._trajectory_coefficients = None
+        self.motion_phase = "hold"
+        self._stop = False
         safe_sleep(GIMBAL_CENTER_SETTLE_S)
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
 
-    def set_offsets(self, pan_offset, tilt_offset, source="CMD"):
-        self.pan_offset = clamp_pan_offset(pan_offset)
-        self.tilt_offset = clamp_tilt_offset(tilt_offset)
-        pan_angle = max(GIMBAL_PAN_MIN_DEG, min(GIMBAL_PAN_MAX_DEG, GIMBAL_CENTER_DEG + self.pan_offset))
-        tilt_angle = max(GIMBAL_TILT_MIN_DEG, min(GIMBAL_TILT_MAX_DEG, GIMBAL_CENTER_DEG + self.tilt_offset))
+    def _apply_offsets(self, pan_offset, tilt_offset):
+        pan_angle = max(GIMBAL_PAN_MIN_DEG, min(GIMBAL_PAN_MAX_DEG, GIMBAL_CENTER_DEG + pan_offset))
+        tilt_angle = max(GIMBAL_TILT_MIN_DEG, min(GIMBAL_TILT_MAX_DEG, GIMBAL_CENTER_DEG + tilt_offset))
         self.pan.duty(servo_duty_from_angle(pan_angle))
         self.tilt.duty(servo_duty_from_angle(tilt_angle))
+        self._applied = (pan_offset, tilt_offset)
+        self.pan_offset = pan_offset
+        self.tilt_offset = tilt_offset
+
+    def _writer_loop(self):
+        clock = getattr(pytime, "monotonic", pytime.time)
+        while not self._stop:
+            tick_start = clock()
+            with self._lock:
+                pending = self._pending
+            target_changed = max(
+                abs(pending[0] - self._trajectory_target[0]),
+                abs(pending[1] - self._trajectory_target[1]),
+            ) >= GIMBAL_TARGET_REPLAN_EPS_DEG
+            if self._trajectory_coefficients is None:
+                target_changed = max(
+                    abs(pending[0] - self._applied[0]),
+                    abs(pending[1] - self._applied[1]),
+                ) > GIMBAL_TRAJECTORY_POSITION_EPS_DEG
+            if target_changed:
+                pan_duration = quintic_trajectory_duration(
+                    pending[0] - self._applied[0], self._velocity[0], self._acceleration[0]
+                )
+                tilt_duration = quintic_trajectory_duration(
+                    pending[1] - self._applied[1], self._velocity[1], self._acceleration[1]
+                )
+                self._trajectory_duration = max(pan_duration, tilt_duration)
+                self._trajectory_start = tick_start
+                self._trajectory_target = pending
+                self.motion_phase = "sync"
+                if self._trajectory_duration > 0.0:
+                    self._trajectory_coefficients = (
+                        quintic_trajectory_coefficients(
+                            self._applied[0], self._velocity[0], self._acceleration[0],
+                            pending[0], self._trajectory_duration,
+                        ),
+                        quintic_trajectory_coefficients(
+                            self._applied[1], self._velocity[1], self._acceleration[1],
+                            pending[1], self._trajectory_duration,
+                        ),
+                    )
+                else:
+                    self._trajectory_coefficients = None
+            if self._trajectory_coefficients is not None:
+                try:
+                    elapsed = tick_start - self._trajectory_start
+                    next_pan, pan_velocity, pan_acceleration = quintic_trajectory_sample(
+                        self._trajectory_coefficients[0], elapsed,
+                        self._trajectory_duration, self._trajectory_target[0],
+                    )
+                    next_tilt, tilt_velocity, tilt_acceleration = quintic_trajectory_sample(
+                        self._trajectory_coefficients[1], elapsed,
+                        self._trajectory_duration, self._trajectory_target[1],
+                    )
+                    self._velocity = (pan_velocity, tilt_velocity)
+                    self._acceleration = (pan_acceleration, tilt_acceleration)
+                    self._apply_offsets(next_pan, next_tilt)
+                    if elapsed >= self._trajectory_duration:
+                        self._trajectory_coefficients = None
+                        self._velocity = (0.0, 0.0)
+                        self._acceleration = (0.0, 0.0)
+                        self.motion_phase = "hold"
+                except Exception as e:
+                    print("GIMBAL_PWM_ERROR,%s" % e)
+            else:
+                self._velocity = (0.0, 0.0)
+                self._acceleration = (0.0, 0.0)
+            tick_elapsed = clock() - tick_start
+            safe_sleep(max(0.001, 1.0 / GIMBAL_TRAJECTORY_HZ - tick_elapsed))
+
+    def set_offsets(self, pan_offset, tilt_offset, source="CMD"):
+        target_pan = clamp_pan_offset(pan_offset)
+        target_tilt = clamp_tilt_offset(tilt_offset)
+        pan_angle = max(GIMBAL_PAN_MIN_DEG, min(GIMBAL_PAN_MAX_DEG, GIMBAL_CENTER_DEG + target_pan))
+        tilt_angle = max(GIMBAL_TILT_MIN_DEG, min(GIMBAL_TILT_MAX_DEG, GIMBAL_CENTER_DEG + target_tilt))
+        with self._lock:
+            self._pending = (target_pan, target_tilt)
         self.command_count += 1
-        if source != "TRACK" or self.command_count % GIMBAL_LOG_EVERY_N_FRAMES == 0:
+        if source not in ("TRACK", "RECENTER") or self.command_count % GIMBAL_LOG_EVERY_N_FRAMES == 0:
             print(
                 "GIMBAL,%s,PAN_OFFSET,%d,TILT_OFFSET,%d,PAN_ANGLE,%d,TILT_ANGLE,%d"
-                % (source, self.pan_offset, self.tilt_offset, pan_angle, tilt_angle)
+                % (source, target_pan, target_tilt, pan_angle, tilt_angle)
             )
 
+    def hold(self):
+        """Freeze the active trajectory at the latest applied PWM position."""
+        with self._lock:
+            self._pending = self._applied
+            self._trajectory_target = self._applied
+            self._trajectory_coefficients = None
+            self._trajectory_duration = 0.0
+            self._velocity = (0.0, 0.0)
+            self._acceleration = (0.0, 0.0)
+            self.motion_phase = "hold"
+
     def close(self):
+        # Shutdown must never start an unsolicited sweep. Freeze at the latest
+        # applied position, stop the worker, then disable both PWM outputs.
+        self.hold()
+        self._stop = True
         try:
-            self.set_offsets(0, 0, "STOP_CENTER")
-            safe_sleep(GIMBAL_CENTER_SETTLE_S)
-        except Exception as e:
-            print("GIMBAL_STOP_CENTER_ERROR,%s" % e)
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
         try:
             self.pan.disable()
         except Exception as e:
@@ -541,67 +818,60 @@ class DryRunGimbal:
             % (source, self.pan_offset, self.tilt_offset)
         )
 
+    def hold(self):
+        return None
+
     def close(self):
         print("GIMBAL,DRY_RUN,CLOSE")
 
 
 class GimbalAxisController:
-    """Acceleration-limited image-error to angular-velocity controller.
+    """Slow, bounded image-error follower with no PID state."""
 
-    The output is an angle increment, not a raw PWM duty.  This makes the
-    configured absolute mechanical limits and the per-update slew limit easy
-    to enforce before touching the hardware.
-    """
-
-    def __init__(self, kp, ki, kd, sign):
-        self.kp = float(kp)
-        self.ki = float(ki)
-        self.kd = float(kd)
+    def __init__(self, sign):
         self.sign = float(sign)
-        self.integral = 0.0
-        self.previous_error = 0.0
-        self.has_previous = False
         self.filtered_error = 0.0
-        self.velocity = 0.0
+        self.command_step = 0.0
+        self.initialized = False
 
     def reset(self):
-        self.integral = 0.0
-        self.previous_error = 0.0
-        self.has_previous = False
         self.filtered_error = 0.0
-        self.velocity = 0.0
+        self.command_step = 0.0
+        self.initialized = False
+
+    def hold(self):
+        self.filtered_error = 0.0
+        self.command_step = 0.0
+        self.initialized = False
 
     def step(self, error, dt):
         if dt <= 0.0:
             dt = 1.0 / GIMBAL_CONTROL_HZ
-        alpha = 1.0 - pow(2.718281828, -dt / max(0.01, GIMBAL_ERROR_FILTER_TAU_S))
-        if not self.has_previous:
+        alpha = 1.0 - pow(2.718281828, -dt / max(0.01, GIMBAL_SLOW_ERROR_FILTER_TAU_S))
+        if not self.initialized:
             self.filtered_error = error
+            self.initialized = True
         else:
             self.filtered_error += alpha * (error - self.filtered_error)
-        self.integral += self.filtered_error * dt
-        # Integral is currently zero by default, but this clamp keeps future
-        # field tuning from building a large wind-up near a hard stop.
-        self.integral = max(-0.5, min(0.5, self.integral))
-        derivative = 0.0
-        if self.has_previous:
-            derivative = (self.filtered_error - self.previous_error) / dt
-        self.previous_error = self.filtered_error
-        self.has_previous = True
-        desired_rate = self.sign * (
-            self.kp * self.filtered_error + self.ki * self.integral + self.kd * derivative
-        )
-        desired_rate = max(-GIMBAL_MAX_RATE_DEG_S, min(GIMBAL_MAX_RATE_DEG_S, desired_rate))
-        if error == 0.0:
-            desired_rate = 0.0
-        max_rate_change = GIMBAL_MAX_ACCEL_DEG_S2 * dt
-        rate_error = desired_rate - self.velocity
-        rate_error = max(-max_rate_change, min(max_rate_change, rate_error))
-        self.velocity += rate_error
-        if desired_rate == 0.0 and abs(self.velocity) < max_rate_change:
-            self.velocity = 0.0
-        output = self.velocity * dt
-        return max(-GIMBAL_MAX_STEP_DEG, min(GIMBAL_MAX_STEP_DEG, output))
+
+        magnitude = abs(self.filtered_error)
+        if error == 0.0 or magnitude < 0.001:
+            desired_step = 0.0
+        else:
+            speed_ratio = min(1.0, magnitude / max(0.01, GIMBAL_SLOW_FULL_SPEED_ERROR))
+            desired_step = self.sign * (1.0 if self.filtered_error > 0.0 else -1.0)
+            desired_step *= GIMBAL_SLOW_MAX_STEP_DEG * speed_ratio
+
+        # Never reverse in one update. First reduce the old command to zero,
+        # then start moving in the other direction on a later update.
+        max_change = GIMBAL_SLOW_STEP_CHANGE_DEG
+        if self.command_step * desired_step < 0.0:
+            desired_step = 0.0
+        delta = max(-max_change, min(max_change, desired_step - self.command_step))
+        self.command_step += delta
+        if desired_step == 0.0 and abs(self.command_step) <= max_change:
+            self.command_step = 0.0
+        return self.command_step
 
 
 class GimbalTracker:
@@ -609,24 +879,56 @@ class GimbalTracker:
 
     def __init__(self, gimbal):
         self.gimbal = gimbal
-        self.pan = GimbalAxisController(GIMBAL_PAN_KP, GIMBAL_PAN_KI, GIMBAL_PAN_KD, GIMBAL_PAN_SIGN)
-        self.tilt = GimbalAxisController(GIMBAL_TILT_KP, GIMBAL_TILT_KI, GIMBAL_TILT_KD, GIMBAL_TILT_SIGN)
+        self.pan = GimbalAxisController(GIMBAL_PAN_SIGN)
+        self.tilt = GimbalAxisController(GIMBAL_TILT_SIGN)
         self.pan_offset = 0.0
         self.tilt_offset = 0.0
         self.last_update = 0.0
         self.hold_frames = 0
+        self.closed_loop = closed_loop_aim_requested()
 
     def reset(self):
         self.pan.reset()
         self.tilt.reset()
         self.hold_frames = 0
 
+    def sync_to_offsets(self, pan_offset, tilt_offset):
+        """Adopt the current physical command before auto control resumes."""
+        self.pan_offset = clamp_pan_offset(pan_offset)
+        self.tilt_offset = clamp_tilt_offset(tilt_offset)
+        self.reset()
+        self.last_update = 0.0
+
     def hold(self):
-        # Stop adding motion while preserving the filtered error history. This
-        # avoids a derivative kick when a briefly hidden target returns.
-        self.pan.velocity = 0.0
-        self.tilt.velocity = 0.0
+        self.pan.hold()
+        self.tilt.hold()
+        freeze = getattr(self.gimbal, "hold", None)
+        if freeze is not None:
+            freeze()
         self.hold_frames += 1
+
+    @staticmethod
+    def _approach_zero(value, amount):
+        if value > amount:
+            return value - amount
+        if value < -amount:
+            return value + amount
+        return 0.0
+
+    def recenter(self, now):
+        """Return toward the optical center after a sustained empty view."""
+        interval = 1.0 / GIMBAL_CONTROL_HZ
+        if self.last_update > 0.0 and now - self.last_update < interval:
+            return "HOLD,RATE"
+        dt = interval if self.last_update <= 0.0 else max(0.001, now - self.last_update)
+        self.last_update = now
+        step = GIMBAL_RECENTER_RATE_DEG_S * dt
+        self.pan.reset()
+        self.tilt.reset()
+        self.pan_offset = self._approach_zero(self.pan_offset, step)
+        self.tilt_offset = self._approach_zero(self.tilt_offset, step)
+        self.gimbal.set_offsets(self.pan_offset, self.tilt_offset, "RECENTER")
+        return "RECENTER,PAN,%.2f,TILT,%.2f" % (self.pan_offset, self.tilt_offset)
 
     @staticmethod
     def soften_deadzone(error, deadzone):
@@ -637,7 +939,7 @@ class GimbalTracker:
         scaled = (magnitude - deadzone) / max(0.001, 1.0 - deadzone)
         return scaled if error > 0.0 else -scaled
 
-    def update(self, target, frame_w, frame_h, now, aim_dot=None, waypoint=None):
+    def update(self, target, frame_w, frame_h, now, aim_dot=None, waypoint=None, use_closed_loop=None):
         if target is None:
             self.hold()
             return "HOLD,NO_FRESH_TARGET"
@@ -660,7 +962,11 @@ class GimbalTracker:
             self.hold()
             return "HOLD,QUALITY"
 
-        closed_loop = closed_loop_aim_requested()
+        # A manually selected target may use the calibrated camera-to-aim point
+        # when the visible red dot is temporarily not measurable. The actual
+        # dot object remains untouched, so telemetry never claims false
+        # closed-loop feedback.
+        closed_loop = self.closed_loop if use_closed_loop is None else bool(use_closed_loop)
         if closed_loop and (aim_dot is None or not getattr(aim_dot, "fresh", False)):
             self.hold()
             return "HOLD,DOT_MISSING"
@@ -707,10 +1013,10 @@ def init_gimbal_tracker(gimbal):
     if gimbal is None or not gimbal_tracking_requested():
         print("GIMBAL_TRACK_SKIP,DISABLED")
         return None
-    print("GIMBAL_TRACK_OK,HZ,%.1f,DEADZONE,%.3f,MAX_STEP,%.1f,AIM,%d,%d,DIST_MM,%d" % (
+    print("GIMBAL_TRACK_OK,MODE,SLOW_SLEW,HZ,%.1f,DEADZONE,%.3f,MAX_STEP,%.2f,AIM,%d,%d,DIST_MM,%d" % (
         GIMBAL_CONTROL_HZ,
         GIMBAL_DEADZONE_X,
-        GIMBAL_MAX_STEP_DEG,
+        GIMBAL_SLOW_MAX_STEP_DEG,
         ACTIVE_AIM_X,
         ACTIVE_AIM_Y,
         ACTIVE_AIM_DISTANCE_MM,
@@ -751,6 +1057,8 @@ class DetectedBox:
 
 
 def draw_cross(img, cx, cy, color):
+    if not (ENABLE_DISPLAY or _web_overlay_enabled):
+        return
     try:
         img.draw_cross(cx, cy, color, size=7, thickness=2)
     except Exception:
@@ -758,8 +1066,84 @@ def draw_cross(img, cx, cy, color):
         img.draw_line(cx, cy - 7, cx, cy + 7, color, 2)
 
 
+def draw_text(img, x, y, text, color):
+    if SHOW_OVERLAY_TEXT and (ENABLE_DISPLAY or _web_overlay_enabled) and _overlay_text_enabled:
+        img.draw_string(x, y, text, color)
+
+
+def draw_rect(img, x, y, w, h, color, thickness=1):
+    if ENABLE_DISPLAY or _web_overlay_enabled:
+        img.draw_rect(x, y, w, h, color=color, thickness=thickness)
+
+
 def obj_center(obj):
     return int(obj.x + obj.w // 2), int(obj.y + obj.h // 2)
+
+
+class SelectedLockGate:
+    """Require repeatable same-target observations before closed-loop motion."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self, obj=None):
+        self.attempts = 0
+        self.consistent = 0
+        self.confirmed = False
+        self.failed = False
+        self.reference = None
+        if obj is not None:
+            self.reference = self._measurement(obj)
+            self.consistent = 1
+
+    @staticmethod
+    def _measurement(obj):
+        cx, cy = obj_center(obj)
+        return float(cx), float(cy), float(obj.w), float(obj.h)
+
+    def observe(self, obj):
+        if self.confirmed or self.failed:
+            return self.state()
+        self.attempts += 1
+        fresh = obj is not None and not getattr(obj, "predicted", False)
+        if fresh and self.reference is not None:
+            cx, cy, width, height = self._measurement(obj)
+            old_cx, old_cy, old_width, old_height = self.reference
+            center_shift = ((cx - old_cx) ** 2 + (cy - old_cy) ** 2) ** 0.5
+            scale = max(4.0, (old_width * old_width + old_height * old_height) ** 0.5)
+            width_ratio = width / max(1.0, old_width)
+            height_ratio = height / max(1.0, old_height)
+            max_ratio = SELECTED_LOCK_MAX_SIZE_RATIO
+            repeatable = (
+                center_shift <= scale * SELECTED_LOCK_MAX_CENTER_SHIFT_BOXES
+                and 1.0 / max_ratio <= width_ratio <= max_ratio
+                and 1.0 / max_ratio <= height_ratio <= max_ratio
+            )
+            if repeatable:
+                self.consistent += 1
+                alpha = 0.35
+                self.reference = (
+                    old_cx + alpha * (cx - old_cx),
+                    old_cy + alpha * (cy - old_cy),
+                    old_width + alpha * (width - old_width),
+                    old_height + alpha * (height - old_height),
+                )
+            else:
+                self.consistent = 0
+        else:
+            self.consistent = 0
+        if self.consistent >= SELECTED_LOCK_CONFIRM_DETECTIONS:
+            self.confirmed = True
+        elif self.attempts >= SELECTED_LOCK_TIMEOUT_DETECTIONS:
+            self.failed = True
+        return self.state()
+
+    def state(self):
+        if self.confirmed:
+            return "stable"
+        if self.failed:
+            return "approach_hold"
+        return "confirming"
 
 
 def box_iou(a, b):
@@ -953,16 +1337,15 @@ class AimDotDetector:
             roi_y = max(0, int(center_y - radius))
             roi_w = min(FRAME_W - roi_x, int(radius * 2))
             roi_h = min(FRAME_H - roi_y, int(radius * 2))
-            if not self.rgb_locked:
-                blobs = img.find_blobs(
-                    AIM_DOT_LAB_THRESHOLDS,
-                    roi=[roi_x, roi_y, roi_w, roi_h],
-                    x_stride=1,
-                    y_stride=1,
-                    area_threshold=AIM_DOT_MIN_PIXELS,
-                    pixels_threshold=AIM_DOT_MIN_PIXELS,
-                    merge=False,
-                )
+            blobs = img.find_blobs(
+                AIM_DOT_LAB_THRESHOLDS,
+                roi=[roi_x, roi_y, roi_w, roi_h],
+                x_stride=2,
+                y_stride=2,
+                area_threshold=AIM_DOT_MIN_PIXELS,
+                pixels_threshold=AIM_DOT_MIN_PIXELS,
+                merge=False,
+            )
         except Exception as e:
             print("AIM_DOT_ERROR,%s" % e)
             blobs = []
@@ -1000,20 +1383,25 @@ class AimDotDetector:
             score = red_score + compactness * 30.0 - distance * 0.25
             candidates.append((score, cx, cy))
 
-        # The real spot has a white core and locally dominant red halo. Always
-        # let a sparse fixed-axis RGB peak override LAB fragments, which can be
-        # confused by pink egg granules after the spot reaches the target.
-        rgb_peak, fallback_debug = self._rgb_peak_candidate(
-            img,
-            ACTIVE_AIM_X,
-            ACTIVE_AIM_Y,
-            AIM_DOT_EXPECTED_RADIUS_PX,
+        # LAB blob extraction runs in native code and is the normal tracking
+        # path. The Python RGB search is deliberately reserved for initial or
+        # occasional reacquisition; running hundreds of get_pixel calls on
+        # every frame costs more time than YOLO itself on MaixCAM.
+        fallback_debug = None
+        rgb_reacquire = not candidates and (
+            not self.rgb_locked
+            or self.debug_frames % AIM_DOT_RGB_REACQUIRE_FRAMES == 0
         )
-        if rgb_peak is not None:
-            self.rgb_locked = True
-            candidates = [rgb_peak]
-        elif self.rgb_locked:
-            candidates = []
+        if rgb_reacquire:
+            rgb_peak, fallback_debug = self._rgb_peak_candidate(
+                img,
+                ACTIVE_AIM_X,
+                ACTIVE_AIM_Y,
+                AIM_DOT_EXPECTED_RADIUS_PX,
+            )
+            if rgb_peak is not None:
+                self.rgb_locked = True
+                candidates = [rgb_peak]
 
         if self.debug_frames % AIM_DOT_LOG_EVERY_N_FRAMES == 0 and fallback_debug is not None:
             score, red_value, dominance, ratio_value, px, py = fallback_debug
@@ -1024,6 +1412,7 @@ class AimDotDetector:
 
         if candidates:
             score, cx, cy = max(candidates, key=lambda item: item[0])
+            self.rgb_locked = True
             if self.x is None or self.misses > AIM_DOT_STALE_FRAMES:
                 self.x, self.y = cx, cy
             else:
@@ -1041,125 +1430,37 @@ class AimDotDetector:
 
 
 class AimWaypointPlanner:
-    """Generate a YOLO-gated, color-refined path inside the locked egg mass."""
-
-    PATTERN = (
-        (0.0, 0.0),
-        (0.0, -1.0),
-        (0.707, -0.707),
-        (1.0, 0.0),
-        (0.707, 0.707),
-        (0.0, 1.0),
-        (-0.707, 0.707),
-        (-1.0, 0.0),
-        (-0.707, -0.707),
-    )
+    """Center a selected target, then signal the manual-adjust handoff."""
 
     def __init__(self):
         self.track_id = 0
-        self.index = 0
         self.settled_frames = 0
         self.settled_since = 0.0
-        self.frame_counter = 0
-        self.pattern = self.PATTERN
-        self.completed_track_id = 0
+        self.centered_ready = False
 
     def reset(self):
         self.track_id = 0
-        self.index = 0
         self.settled_frames = 0
         self.settled_since = 0.0
-        self.frame_counter = 0
-        self.pattern = self.PATTERN
-        self.completed_track_id = 0
+        self.centered_ready = False
 
-    def _refine_pattern(self, target, img):
-        """Snap the inset ellipse to pink samples inside a YOLO-confirmed box."""
-        if img is None or getattr(target, "predicted", False):
-            return self.pattern
-        cx = target.x + target.w * 0.5
-        cy = target.y + target.h * 0.5
-        half_w = max(2.0, target.w * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
-        half_h = max(2.0, target.h * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
-        inset_x = max(1.0, target.w * 0.12)
-        inset_y = max(1.0, target.h * 0.12)
-        x0 = max(0, int(target.x + inset_x))
-        y0 = max(0, int(target.y + inset_y))
-        x1 = min(FRAME_W - 1, int(target.x + target.w - inset_x))
-        y1 = min(FRAME_H - 1, int(target.y + target.h - inset_y))
-        step_x = max(1, (x1 - x0) // max(1, AIM_SCAN_CONTOUR_GRID - 1))
-        step_y = max(1, (y1 - y0) // max(1, AIM_SCAN_CONTOUR_GRID - 1))
-        samples = []
-        try:
-            yy = y0
-            while yy <= y1:
-                xx = x0
-                while xx <= x1:
-                    r, g, b = pixel_to_rgb(img.get_pixel(xx, yy))
-                    if pink_pixel(r, g, b) and not red_bad_pixel(r, g, b):
-                        samples.append((float(xx), float(yy)))
-                    xx += step_x
-                yy += step_y
-        except Exception:
-            return self.PATTERN
-        if len(samples) < 3:
-            return self.PATTERN
+    def take_centered_ready(self):
+        ready = self.centered_ready
+        self.centered_ready = False
+        return ready
 
-        refined = []
-        used = set()
-        for nx, ny in self.PATTERN:
-            nominal_x = cx + nx * half_w
-            nominal_y = cy + ny * half_h
-            ranked = sorted(
-                enumerate(samples),
-                key=lambda item: (item[1][0] - nominal_x) ** 2 + (item[1][1] - nominal_y) ** 2,
-            )
-            chosen_index, chosen = ranked[0]
-            for candidate_index, candidate in ranked:
-                if candidate_index not in used:
-                    chosen_index, chosen = candidate_index, candidate
-                    break
-            used.add(chosen_index)
-            refined.append(
-                (
-                    max(-1.0, min(1.0, (chosen[0] - cx) / half_w)),
-                    max(-1.0, min(1.0, (chosen[1] - cy) / half_h)),
-                )
-            )
-        return tuple(refined)
-
-    def take_completed_track(self):
-        track_id = self.completed_track_id
-        self.completed_track_id = 0
-        return track_id
-
-    def point(self, target, aim_dot, now, scan_enabled, img=None):
+    def point(self, target, aim_dot, now, hold_when_centered=False):
         if target is None:
             self.settled_frames = 0
             return None
         track_id = getattr(target, "track_id", 0)
         if track_id != self.track_id:
             self.track_id = track_id
-            self.index = 0
             self.settled_frames = 0
             self.settled_since = now
-            self.frame_counter = 0
-            self.pattern = self.PATTERN
-        if not scan_enabled:
-            self.index = 0
-
-        self.frame_counter += 1
-        if scan_enabled and (
-            self.frame_counter == 1 or self.frame_counter % AIM_SCAN_CONTOUR_REFRESH_FRAMES == 0
-        ):
-            self.pattern = self._refine_pattern(target, img)
-
-        nx, ny = self.pattern[self.index]
-        half_w = max(2.0, target.w * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
-        half_h = max(2.0, target.h * 0.5 * (1.0 - AIM_SCAN_MARGIN_RATIO))
-        point = (target.x + target.w * 0.5 + nx * half_w, target.y + target.h * 0.5 + ny * half_h)
-
-        if scan_enabled and aim_dot is not None and getattr(aim_dot, "fresh", False):
+            self.centered_ready = False
+        point = (target.x + target.w * 0.5, target.y + target.h * 0.5)
+        if hold_when_centered and aim_dot is not None and getattr(aim_dot, "fresh", False):
             dx = aim_dot.x - point[0]
             dy = aim_dot.y - point[1]
             if (dx * dx + dy * dy) ** 0.5 <= AIM_DOT_CONTROL_TOLERANCE_PX:
@@ -1170,9 +1471,7 @@ class AimWaypointPlanner:
                     self.settled_frames >= AIM_SCAN_SETTLE_FRAMES
                     and now - self.settled_since >= AIM_SCAN_DWELL_S
                 ):
-                    self.index = (self.index + 1) % len(self.pattern)
-                    if self.index == 0 and cycle_targets_requested():
-                        self.completed_track_id = track_id
+                    self.centered_ready = True
                     self.settled_frames = 0
                     self.settled_since = now
             else:
@@ -1181,14 +1480,15 @@ class AimWaypointPlanner:
         return point
 
 
-def color_gate(img, x, y, w, h):
+def color_gate(img, x, y, w, h, max_checks=MAX_COLOR_CHECKS):
     if not ENABLE_COLOR_GATE or RUN_MODE == 0:
         return True, 1.0, 0.0
     total = 0
     pink = 0
     red_bad = 0
-    step_x = max(1, w // COLOR_GRID)
-    step_y = max(1, h // COLOR_GRID)
+    grid = 2 if max_checks <= 4 else 4
+    step_x = max(1, w // grid)
+    step_y = max(1, h // grid)
     start_x = x + max(0, w // 10)
     start_y = y + max(0, h // 10)
     end_x = x + w - max(0, w // 10)
@@ -1204,10 +1504,10 @@ def color_gate(img, x, y, w, h):
                 if red_bad_pixel(r, g, b):
                     red_bad += 1
                 total += 1
-                if total >= MAX_COLOR_CHECKS:
+                if total >= max_checks:
                     break
                 xx += step_x
-            if total >= MAX_COLOR_CHECKS:
+            if total >= max_checks:
                 break
             yy += step_y
     except Exception:
@@ -1278,7 +1578,17 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
                 print("PIX,%d,%d,%d,%d,%s,%d,%d,%d" % (frame_id, idx, sx, sy, str(px), r0, g0, b0))
             except Exception as e:
                 print("PIX_ERROR,%d,%d,%s" % (frame_id, idx, e))
-        ok, pink_ratio, red_ratio = color_gate(img, x, y, w, h)
+        # Keep weak measurements only when they already agree with the locked
+        # trajectory prediction. This is a track gate, not a low-threshold ROI.
+        score_ok = obj.score >= ACTIVE_MIN_MODEL_CONF
+        if score_ok and not SCREEN_TEST_MODE and obj.score < DISCOVERY_MODEL_CONF:
+            locked_track = next((track for track in _tracks if track["id"] == _locked_track_id), None)
+            score_ok = locked_track is not None and track_match_cost(obj, locked_track) is not None
+        if not score_ok:
+            rows.append((idx, obj, True, False, 0.0, 0.0))
+            continue
+        color_checks = STRONG_COLOR_CHECKS if obj.score >= STRONG_MODEL_CONF else LOW_CONF_COLOR_CHECKS
+        ok, pink_ratio, red_ratio = color_gate(img, x, y, w, h, color_checks)
         rows.append((idx, obj, True, ok, pink_ratio, red_ratio))
         if pink_ratio > best_pink_ratio:
             best_pink_ratio = pink_ratio
@@ -1286,7 +1596,6 @@ def filter_candidates(img, objs, frame_w, frame_h, frame_id):
             best_red_ratio = red_ratio
         area = w * h
         red_reject = red_ratio > MAX_RED_BAD_RATIO and red_ratio > pink_ratio * RED_BAD_DOMINANCE
-        score_ok = obj.score >= ACTIVE_MIN_MODEL_CONF
         if SCREEN_TEST_MODE:
             # Monitor gamma and viewing angle can remove most measured pink
             # even though the trained detector still recognizes the egg mass.
@@ -1319,6 +1628,10 @@ class ScalarKalman:
         self.p00 = self.p00 + 2.0 * old_p01 + self.p11 + TRACK_KF_PROCESS_NOISE
         self.p01 = old_p01 + self.p11
         self.p11 += TRACK_KF_PROCESS_NOISE * 0.25
+
+    def shift(self, delta):
+        # Known camera motion changes image position, not target velocity.
+        self.pos += float(delta)
 
     def update(self, measurement):
         measurement = float(measurement)
@@ -1398,24 +1711,111 @@ def new_track(obj):
     return track
 
 
+def current_gimbal_offsets():
+    controller = globals().get("gimbal")
+    if controller is None:
+        return 0.0, 0.0
+    return (
+        float(getattr(controller, "pan_offset", 0.0)),
+        float(getattr(controller, "tilt_offset", 0.0)),
+    )
+
+
+def gimbal_image_shift(from_pan, from_tilt, to_pan, to_tilt):
+    pixels_per_pan_deg = FRAME_W / CAMERA_H_FOV_DEG
+    pixels_per_tilt_deg = FRAME_H / CAMERA_V_FOV_DEG
+    dx = -(float(to_pan) - float(from_pan)) * pixels_per_pan_deg / GIMBAL_PAN_SIGN
+    dy = -(float(to_tilt) - float(from_tilt)) * pixels_per_tilt_deg / GIMBAL_TILT_SIGN
+    return dx, dy
+
+
+def shift_measurements_to_current_frame(objs, dx, dy):
+    if abs(dx) < 0.01 and abs(dy) < 0.01:
+        return objs
+    shifted = []
+    for obj in objs:
+        shifted.append(
+            DetectedBox(
+                int(round(obj.x + dx)),
+                int(round(obj.y + dy)),
+                int(obj.w),
+                int(obj.h),
+                float(obj.score),
+            )
+        )
+    return shifted
+
+
 def track_match_cost(obj, track):
     predicted_box = track_box(track)
     measured_box = (int(obj.x), int(obj.y), int(obj.w), int(obj.h))
-    predicted_cx, predicted_cy = obj_center(DetectedBox(*predicted_box, 0.0))
+    predicted_cx = predicted_box[0] + predicted_box[2] * 0.5
+    predicted_cy = predicted_box[1] + predicted_box[3] * 0.5
     measured_cx, measured_cy = obj_center(obj)
     dx = measured_cx - predicted_cx
     dy = measured_cy - predicted_cy
     distance = (dx * dx + dy * dy) ** 0.5
     scale = max(TRACK_MATCH_MIN_DISTANCE_PX, max(predicted_box[2], predicted_box[3]) * TRACK_MATCH_DISTANCE_SCALE)
     overlap = box_iou(measured_box, predicted_box)
-    if overlap < 0.02 and distance > scale:
+    width_ratio = max(
+        measured_box[2] / max(2.0, predicted_box[2]),
+        predicted_box[2] / max(2.0, measured_box[2]),
+    )
+    height_ratio = max(
+        measured_box[3] / max(2.0, predicted_box[3]),
+        predicted_box[3] / max(2.0, measured_box[3]),
+    )
+    predicted_aspect = predicted_box[2] / max(2.0, predicted_box[3])
+    measured_aspect = measured_box[2] / max(2.0, measured_box[3])
+    aspect_ratio = max(
+        measured_aspect / max(0.05, predicted_aspect),
+        predicted_aspect / max(0.05, measured_aspect),
+    )
+    if max(width_ratio, height_ratio, aspect_ratio) > TRACK_ASSOC_MAX_SIZE_RATIO:
         return None
-    return distance / scale + (1.0 - overlap) * 0.65
+    sigma_x = max(3.0, (track["cx"].p00 + TRACK_KF_MEASUREMENT_NOISE) ** 0.5)
+    sigma_y = max(3.0, (track["cy"].p00 + TRACK_KF_MEASUREMENT_NOISE) ** 0.5)
+    normalized_innovation = ((dx / sigma_x) ** 2 + (dy / sigma_y) ** 2) ** 0.5
+    if overlap < 0.02 and (distance > scale or normalized_innovation > 3.5):
+        return None
+    size_cost = (width_ratio - 1.0) + (height_ratio - 1.0)
+    shape_cost = aspect_ratio - 1.0
+    confidence_penalty = max(0.0, DISCOVERY_MODEL_CONF - obj.score) / max(0.01, DISCOVERY_MODEL_CONF)
+    cost = (
+        min(2.0, normalized_innovation / 3.0) * 0.42
+        + (1.0 - overlap) * 0.30
+        + min(2.0, size_cost) * 0.16
+        + min(1.0, shape_cost) * 0.07
+        + confidence_penalty * 0.05
+    )
+    low_measurement = obj.score < DISCOVERY_MODEL_CONF
+    if low_measurement:
+        if not _manual_lock_active or track["id"] != _locked_track_id:
+            return None
+        if cost > TRACK_LOCKED_LOW_ASSOC_MAX_COST:
+            return None
+    elif cost > TRACK_ASSOC_MAX_COST:
+        return None
+    return cost
 
 
 def update_tracks(objs):
-    global _tracks
+    global _tracks, _track_last_pan_offset, _track_last_tilt_offset
+    current_pan, current_tilt = current_gimbal_offsets()
+    if _track_last_pan_offset is None:
+        _track_last_pan_offset = current_pan
+        _track_last_tilt_offset = current_tilt
+    camera_dx, camera_dy = gimbal_image_shift(
+        _track_last_pan_offset,
+        _track_last_tilt_offset,
+        current_pan,
+        current_tilt,
+    )
+    _track_last_pan_offset = current_pan
+    _track_last_tilt_offset = current_tilt
     for track in _tracks:
+        track["cx"].shift(camera_dx)
+        track["cy"].shift(camera_dy)
         track["cx"].predict()
         track["cy"].predict()
         track["w"].predict()
@@ -1455,12 +1855,17 @@ def update_tracks(objs):
             continue
         track["misses"] += 1
         track["age"] += 1
+        track["cx"].vel *= 0.82
+        track["cy"].vel *= 0.82
+        track["w"].vel *= 0.75
+        track["h"].vel *= 0.75
         if track["misses"] <= TRACK_MAX_MISSES:
             track["obj"] = track_object(track, True)
             next_tracks.append(track)
 
+    birth_threshold = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else DISCOVERY_MODEL_CONF
     for det_idx, obj in enumerate(objs):
-        if det_idx not in used_detections:
+        if det_idx not in used_detections and obj.score >= birth_threshold:
             next_tracks.append(new_track(obj))
 
     _tracks = next_tracks
@@ -1474,28 +1879,53 @@ def update_tracks(objs):
     return deduped
 
 
-def mark_target_completed(track_id):
-    global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center
+def clear_target_lock():
+    global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center, _manual_lock_active
+    _locked_track_id = 0
+    _locked_last_center = None
+    _locked_last_size = None
+    _locked_missing_frames = 0
+    _primary_center = None
+    _manual_lock_active = False
+
+
+def lock_target(obj):
+    global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center, _manual_lock_active
+    track_id = int(getattr(obj, "track_id", 0))
     if track_id <= 0:
-        return
-    _completed_track_ids.add(track_id)
-    if _locked_track_id == track_id:
-        _locked_track_id = 0
-        _locked_last_center = None
-        _locked_last_size = None
-        _locked_missing_frames = 0
-        _primary_center = None
-    print("TARGET,COMPLETE,%d,TOTAL,%d" % (track_id, len(_completed_track_ids)))
+        return 0
+    _locked_track_id = track_id
+    _primary_center = obj_center(obj)
+    _locked_last_center = _primary_center
+    _locked_last_size = (obj.w, obj.h)
+    _locked_missing_frames = 0
+    _manual_lock_active = True
+    obj.aim_lock_id = 1
+    print("LOCK,WEB_SELECT,%d,%d,%d" % (track_id, _primary_center[0], _primary_center[1]))
+    return track_id
 
 
-def select_primary_target(objs):
+def target_at_point(objs, point_x, point_y):
+    hits = []
+    for obj in objs:
+        if getattr(obj, "predicted", False):
+            continue
+        margin = max(3.0, min(obj.w, obj.h) * 0.08)
+        if (
+            obj.x - margin <= point_x <= obj.x + obj.w + margin
+            and obj.y - margin <= point_y <= obj.y + obj.h + margin
+        ):
+            cx, cy = obj_center(obj)
+            distance = (cx - point_x) ** 2 + (cy - point_y) ** 2
+            hits.append((obj.w * obj.h, distance, obj))
+    return min(hits, key=lambda item: (item[0], item[1]))[2] if hits else None
+
+
+def select_primary_target(objs, manual_lock=False):
     global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center
-    if not cycle_targets_requested() and _completed_track_ids:
-        _completed_track_ids.clear()
     if PRIMARY_TARGET_POLICY in ("leftmost", "robust_center"):
-        fresh = [obj for obj in objs if not getattr(obj, "predicted", False)]
-        if cycle_targets_requested():
-            fresh = [obj for obj in fresh if getattr(obj, "track_id", 0) not in _completed_track_ids]
+        raw_fresh = [obj for obj in objs if not getattr(obj, "predicted", False)]
+        fresh = raw_fresh
         locked_fresh = [obj for obj in fresh if getattr(obj, "track_id", 0) == _locked_track_id]
         locked_predicted = [
             obj
@@ -1517,6 +1947,19 @@ def select_primary_target(objs):
             return None
         if _locked_track_id > 0:
             _locked_missing_frames += 1
+            if manual_lock:
+                # A phone-selected target is safety-critical: a nearby fresh
+                # detection is not evidence that it is the same object. Keep
+                # the original track prediction when available and otherwise
+                # stop the gimbal until that exact track returns. Never switch
+                # to another egg just because the selected one is occluded.
+                if locked_predicted and getattr(locked_predicted[0], "misses", 99) <= GIMBAL_PREDICT_MAX_MISSES:
+                    locked_predicted[0].aim_lock_id = 1
+                    _primary_center = obj_center(locked_predicted[0])
+                    _locked_last_center = _primary_center
+                    _locked_last_size = (locked_predicted[0].w, locked_predicted[0].h)
+                    return locked_predicted[0]
+                return None
             if _locked_last_center is not None and fresh:
                 lx, ly = _locked_last_center
                 lw, lh = _locked_last_size if _locked_last_size is not None else (1.0, 1.0)
@@ -1556,10 +1999,21 @@ def select_primary_target(objs):
             if locked_predicted and getattr(locked_predicted[0], "misses", 99) <= GIMBAL_PREDICT_MAX_MISSES:
                 locked_predicted[0].aim_lock_id = 1
                 return locked_predicted[0]
-            if _locked_missing_frames <= LOCK_RELEASE_MISSING_FRAMES:
+            switch_missing_frames = globals().get("LOCK_SWITCH_MISSING_FRAMES", 6)
+            if fresh and _locked_missing_frames >= switch_missing_frames:
+                # The old lock is no longer supported by a fresh detection;
+                # release it so the current candidates can be selected.
+                _locked_track_id = 0
+                _locked_last_center = None
+                _locked_last_size = None
+                _locked_missing_frames = 0
+            if _locked_track_id > 0 and _locked_missing_frames <= LOCK_RELEASE_MISSING_FRAMES:
                 return None
-            print("LOCK,RELEASE,%d,MISSES,%d" % (_locked_track_id, _locked_missing_frames))
-            _locked_track_id = 0
+            if _locked_track_id > 0:
+                print("LOCK,RELEASE,%d,MISSES,%d" % (_locked_track_id, _locked_missing_frames))
+                _locked_track_id = 0
+        if manual_lock:
+            return None
         if PRIMARY_TARGET_POLICY == "leftmost":
             min_x = min(obj_center(obj)[0] for obj in fresh)
             left_column = [obj for obj in fresh if obj_center(obj)[0] <= min_x + PRIMARY_COLUMN_TOLERANCE_PX]
@@ -1687,44 +2141,6 @@ def crop_tile(img, x, y, w, h):
             return None
 
 
-def detect_color_only_frame(img):
-    """Broad pink-candidate detector used only by the comparison mode."""
-    try:
-        blobs = img.find_blobs(
-            COLOR_ONLY_THRESHOLDS,
-            x_stride=2,
-            y_stride=2,
-            area_threshold=COLOR_ONLY_MIN_AREA,
-            pixels_threshold=COLOR_ONLY_MIN_PIXELS,
-            merge=True,
-            margin=2,
-        )
-    except Exception as e:
-        print("COLOR_ONLY_ERROR,%s" % e)
-        return 0, [], 0.0, 0.0, []
-    candidates = []
-    rows = []
-    best_pink = 0.0
-    best_red = 0.0
-    for idx, blob in enumerate(blobs):
-        x, y, w, h = [int(blob[i]) for i in range(4)]
-        pixels = int(blob[4])
-        obj = DetectedBox(x, y, w, h, 0.60 + min(0.39, pixels / 1000.0))
-        geometry_ok = pass_geometry(obj, FRAME_W, FRAME_H)
-        if not geometry_ok or is_aim_marker_box(obj):
-            rows.append((idx, obj, geometry_ok, False, 0.0, 0.0))
-            continue
-        color_ok, pink_ratio, red_ratio = color_gate(img, x, y, w, h)
-        color_ok = color_ok and pink_ratio >= COLOR_ONLY_MIN_PINK_RATIO
-        best_pink = max(best_pink, pink_ratio)
-        best_red = max(best_red, red_ratio)
-        rows.append((idx, obj, geometry_ok, color_ok, pink_ratio, red_ratio))
-        if color_ok:
-            candidates.append(obj)
-    candidates = merge_overlaps(candidates)
-    return len(blobs), candidates, best_pink, best_red, rows
-
-
 def remember_detections(new_objs):
     global _memory
     next_memory = []
@@ -1754,9 +2170,6 @@ def remember_detections(new_objs):
 
 def detect_frame(detector, img, frame_id):
     global _tile_scan_index, _last_tile_info
-    if color_only_requested():
-        _last_tile_info = "COLOR_ONLY"
-        return detect_color_only_frame(img)
     frame_w = FRAME_W
     frame_h = FRAME_H
     tile_w = detector.input_width()
@@ -1811,12 +2224,22 @@ aim_relay = init_aim_relay()
 aim_dot_detector = AimDotDetector()
 aim_waypoint_planner = AimWaypointPlanner()
 web_control = None
-if WebControl is not None:
+if WebControl is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
     try:
         web_control = WebControl(port=WEB_CONTROL_PORT)
         web_control.start()
     except Exception as e:
         print("WEB_CONTROL_ERROR,%s" % e)
+jpeg_streamer = None
+if http is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
+    try:
+        native_streamer = http.JpegStreamer("0.0.0.0", WEB_STREAM_PORT, WEB_STREAM_MAX_CLIENTS)
+        native_streamer.start()
+        jpeg_streamer = LatestJpegStreamer(native_streamer)
+        print("WEB_STREAM,LISTEN,0.0.0.0,%d" % WEB_STREAM_PORT)
+    except Exception as e:
+        jpeg_streamer = None
+        print("WEB_STREAM_ERROR,%s" % e)
 if aim_relay:
     atexit.register(aim_relay.close)
 print(
@@ -1846,13 +2269,15 @@ try:
         ENABLE_DISPLAY = False
 except Exception:
     pass
-detector = nn.YOLOv8(model=MODEL, dual_buff=DUAL_BUFF)
+detector_class = nn.YOLO11 if "yolo11" in MODEL.lower() else nn.YOLOv8
+detector = detector_class(model=MODEL, dual_buff=DUAL_BUFF)
 print("INIT,DETECTOR_OK")
 print("INIT,TILES,%d" % len(tile_origins(FRAME_W, FRAME_H, detector.input_width(), detector.input_height())))
 cam = camera.Camera(
     FRAME_W,
     FRAME_H,
     detector.input_format(),
+    fps=CAMERA_TARGET_FPS,
     buff_num=CAMERA_BUFF_NUM,
 )
 print("INIT,CAMERA_OK")
@@ -1863,19 +2288,72 @@ else:
     disp = None
     print("INIT,DISPLAY_SKIP")
 frame_id = 0
+last_yolo_frame = -DETECT_EVERY_N_FRAMES
+last_raw_count = 0
+last_candidate_count = 0
+last_pink_ratio = 0.0
+last_red_ratio = 0.0
+last_candidate_rows = []
 debug_saved = 0
 manual_capture_saved = 0
 overlay_stream_saved = 0
 aim_detect_frames = 0
-aim_missing_frames = AIM_RELAY_OFF_MISSING_FRAMES
+aim_missing_frames = 0
+last_fresh_egg_time = 0.0
+web_mode = "select"
+web_pan = 0.0
+web_tilt = 0.0
+web_aim_override = None
+web_estop = False
+last_control_mode = None
+selected_loss_detections = 0
+selected_lock_gate = SelectedLockGate()
+selected_lock_state = "none"
+selected_goal_valid = False
+selected_goal_pan = 0.0
+selected_goal_tilt = 0.0
+selected_loss_active = False
+selected_last_box = None
+selected_last_box_pan = 0.0
+selected_last_box_tilt = 0.0
+profile_count = 0
+profile_detect_count = 0
+profile_read_s = 0.0
+profile_dot_s = 0.0
+profile_detect_s = 0.0
+profile_control_draw_s = 0.0
+profile_encode_s = 0.0
+profile_display_s = 0.0
+profile_stream_s = 0.0
+stream_fps = 0.0
+detect_window_start = pytime.time()
+detect_window_frames = 0
+detect_fps = 0.0
 print("INIT,LOOP_START")
+profile_clock = getattr(pytime, "monotonic", pytime.time)
+closed_loop_enabled_runtime = closed_loop_aim_requested()
+no_target_test_runtime = file_exists(AIM_RELAY_NO_TARGET_TEST_FLAG)
+capture_once_runtime = file_exists(DEBUG_CAPTURE_ONCE_FLAG)
+capture_frames_runtime = file_exists(DEBUG_CAPTURE_FLAG)
+overlay_stream_runtime = file_exists(DEBUG_OVERLAY_STREAM_FLAG)
 
 while not app.need_exit():
+    profile_loop_start = profile_clock()
+    _overlay_text_enabled = (frame_id % OVERLAY_TEXT_EVERY_N_FRAMES) == 0
+    web_snapshot_requested = False
+    _web_overlay_enabled = ENABLE_DISPLAY
+    if frame_id % RUNTIME_FLAG_POLL_EVERY_N_FRAMES == 0:
+        no_target_test_runtime = file_exists(AIM_RELAY_NO_TARGET_TEST_FLAG)
+        capture_once_runtime = file_exists(DEBUG_CAPTURE_ONCE_FLAG)
+        capture_frames_runtime = file_exists(DEBUG_CAPTURE_FLAG)
+        overlay_stream_runtime = file_exists(DEBUG_OVERLAY_STREAM_FLAG)
+    run_detection = frame_id - last_yolo_frame >= DETECT_EVERY_N_FRAMES
     if RUN_MODE == 3 and frame_id < 3:
         print("TRACE,%d,READ_BEGIN" % frame_id)
     img = cam.read()
+    profile_read_done = profile_clock()
     dot_enabled = bool(
-        closed_loop_aim_requested()
+        closed_loop_enabled_runtime
         and aim_relay is not None
         # Do not look for feedback while the two button pulses are still
         # changing the physical light state; pink image detail can otherwise
@@ -1883,7 +2361,29 @@ while not app.need_exit():
         and aim_relay.logical_on
         and aim_relay.phase == "IDLE"
     )
-    aim_dot = aim_dot_detector.detect(img, dot_enabled)
+    dot_loop_period = AIM_DOT_TRACK_LOOP_EVERY_N_FRAMES if (
+        _previous_aim_dot is not None and getattr(_previous_aim_dot, "fresh", False)
+    ) else AIM_DOT_LOOP_EVERY_N_FRAMES
+    if dot_enabled and _previous_aim_dot is not None and frame_id % dot_loop_period != 0:
+        aim_dot = AimDot(
+            _previous_aim_dot.x,
+            _previous_aim_dot.y,
+            _previous_aim_dot.score,
+            _previous_aim_dot.fresh,
+            _previous_aim_dot.misses,
+        )
+    else:
+        aim_dot = aim_dot_detector.detect(img, dot_enabled)
+    # A fixed calibration point is useful as a visual hint, but it is not
+    # measured feedback. Never label it fresh or let closed-loop control treat
+    # it as a visible red dot.
+    if (
+        dot_enabled
+        and aim_dot is None
+        and aim_dot_detector.misses >= AIM_DOT_FIXED_FALLBACK_AFTER_MISSES
+    ):
+        aim_dot = AimDot(ACTIVE_AIM_X, ACTIVE_AIM_Y, 0.0, False, aim_dot_detector.misses)
+    profile_dot_done = profile_clock()
     _last_aim_dot = aim_dot
     # YOLO dual buffering returns the previous frame's detections. Pair them
     # with the previous red-dot measurement so closed-loop error stays aligned.
@@ -1911,18 +2411,54 @@ while not app.need_exit():
         except Exception as e:
             print("TRACE,%d,SAVE_ERROR,%s" % (frame_id, e))
         print("TRACE,%d,DETECT_BEGIN" % frame_id)
-    raw_count, candidates, best_pink_ratio, best_red_ratio, candidate_rows = detect_frame(detector, img, frame_id)
-    if file_exists(DEBUG_CAPTURE_ONCE_FLAG):
+    if run_detection:
+        raw_count, candidates, best_pink_ratio, best_red_ratio, candidate_rows = detect_frame(detector, img, frame_id)
+        capture_pan, capture_tilt = current_gimbal_offsets()
+        if DUAL_BUFF:
+            if _pending_detection_pan_offset is not None:
+                measurement_dx, measurement_dy = gimbal_image_shift(
+                    _pending_detection_pan_offset,
+                    _pending_detection_tilt_offset,
+                    capture_pan,
+                    capture_tilt,
+                )
+                candidates = shift_measurements_to_current_frame(candidates, measurement_dx, measurement_dy)
+            _pending_detection_pan_offset = capture_pan
+            _pending_detection_tilt_offset = capture_tilt
+        detect_window_frames += 1
+        detect_elapsed = pytime.time() - detect_window_start
+        if detect_elapsed >= 1.0:
+            detect_fps = detect_window_frames / max(0.001, detect_elapsed)
+            detect_window_frames = 0
+            detect_window_start = pytime.time()
+        last_yolo_frame = frame_id
+        last_raw_count = raw_count
+        last_candidate_count = len(candidates)
+        last_pink_ratio = best_pink_ratio
+        last_red_ratio = best_red_ratio
+        last_candidate_rows = candidate_rows
+    else:
+        # Empty detections advance the Kalman/velocity tracks without claiming
+        # that a fresh YOLO target exists. Relay decisions are updated only on
+        # YOLO refresh frames, so a valid target does not flicker between them.
+        raw_count = 0
+        candidates = []
+        best_pink_ratio = last_pink_ratio
+        best_red_ratio = last_red_ratio
+        candidate_rows = []
+    profile_detect_done = profile_clock()
+    if capture_once_runtime:
         try:
             capture_path = "%s/once_%06d.jpg" % (DEBUG_DIR, frame_id)
             img.save(capture_path)
             os.remove(DEBUG_CAPTURE_ONCE_FLAG)
+            capture_once_runtime = False
             print("MANUAL_CAPTURE_ONCE,%s" % capture_path)
         except Exception as e:
             print("MANUAL_CAPTURE_ONCE_ERROR,%s" % e)
     if (
         manual_capture_saved < MANUAL_CAPTURE_MAX_SAVES
-        and file_exists(DEBUG_CAPTURE_FLAG)
+        and capture_frames_runtime
         and frame_id % MANUAL_CAPTURE_EVERY_N_FRAMES == 0
     ):
         try:
@@ -1936,59 +2472,248 @@ while not app.need_exit():
         print("TRACE,%d,DETECT_OK,%d" % (frame_id, raw_count))
     stable = update_tracks(candidates)
     targets = [] if frame_id < WARMUP_FRAMES else sort_targets(stable, FRAME_H)
-    if file_exists(AIM_RELAY_NO_TARGET_TEST_FLAG):
+    if no_target_test_runtime:
         targets = []
-    primary_obj = select_primary_target([item[0] for item in targets])
+    if web_control is not None and frame_id % WEB_CONTROL_POLL_EVERY_N_FRAMES == 0:
+        web_mode, web_pan, web_tilt, web_aim_override, web_estop = web_control.get_control()
+    elif web_control is None:
+        web_mode, web_pan, web_tilt, web_aim_override, web_estop = "auto", 0.0, 0.0, None, False
+    target_objects = [item[0] for item in targets]
+    selection_request = web_control.consume_selection_request() if web_control is not None else None
+    selection_changed = False
+    if selection_request is not None:
+        action, select_x, select_y = selection_request
+        aim_waypoint_planner.reset()
+        if action == "clear":
+            clear_target_lock()
+            selected_lock_gate.reset()
+            selected_lock_state = "none"
+            selected_goal_valid = False
+            selected_loss_active = False
+            selected_last_box = None
+            selection_changed = True
+        else:
+            selected_obj = target_at_point(target_objects, select_x * FRAME_W, select_y * FRAME_H)
+            if selected_obj is not None:
+                selected_track_id = lock_target(selected_obj)
+                # Freeze the clicked target's identity and initial box. From
+                # this point on, YOLO detections cannot replace the target or
+                # make its lock box disappear during a camera move.
+                current_pan_offset = float(getattr(gimbal, "pan_offset", 0.0)) if gimbal is not None else 0.0
+                current_tilt_offset = float(getattr(gimbal, "tilt_offset", 0.0)) if gimbal is not None else 0.0
+                desired_x = selected_obj.x + selected_obj.w * 0.5
+                desired_y = selected_obj.y + selected_obj.h * 0.5
+                pixels_per_pan_deg = FRAME_W / CAMERA_H_FOV_DEG
+                pixels_per_tilt_deg = FRAME_H / CAMERA_V_FOV_DEG
+                reference_x = ACTIVE_AIM_X
+                reference_y = ACTIVE_AIM_Y
+                selected_goal_pan = clamp_pan_offset(
+                    current_pan_offset
+                    + GIMBAL_PAN_SIGN * (desired_x - reference_x) / pixels_per_pan_deg
+                )
+                selected_goal_tilt = clamp_tilt_offset(
+                    current_tilt_offset
+                    + GIMBAL_TILT_SIGN * (desired_y - reference_y) / pixels_per_tilt_deg
+                )
+                selected_goal_valid = True
+                selected_last_box = (
+                    int(selected_obj.x), int(selected_obj.y),
+                    int(selected_obj.w), int(selected_obj.h),
+                )
+                selected_last_box_pan = current_pan_offset
+                selected_last_box_tilt = current_tilt_offset
+                selected_loss_active = False
+                selected_loss_detections = 0
+                selected_lock_gate.reset(selected_obj)
+                selected_lock_state = selected_lock_gate.state()
+                if web_control is not None:
+                    web_control.confirm_selection(selected_track_id)
+                # Do not move on the single click. The next detector frames
+                # decide whether this is a trustworthy lock or only a target
+                # estimate for conservative manual hand-off.
+                web_mode = "selected"
+                selection_changed = True
+            else:
+                clear_target_lock()
+                web_control.reject_selection()
+                web_mode = "select"
+                selection_changed = True
+    if web_mode == "selected":
+        primary_obj = select_primary_target(target_objects, manual_lock=True)
+    elif web_mode == "auto":
+        primary_obj = select_primary_target(target_objects)
+    else:
+        primary_obj = None
     primary_id = getattr(primary_obj, "aim_lock_id", getattr(primary_obj, "track_id", 0)) if primary_obj else 0
     fresh_aim_present = bool(primary_obj is not None and not getattr(primary_obj, "predicted", False))
+    if web_mode == "selected" and run_detection:
+        if fresh_aim_present:
+            selected_loss_detections = 0
+        else:
+            selected_loss_detections += 1
+        if not selected_lock_gate.confirmed and not selected_lock_gate.failed:
+            selected_lock_state = selected_lock_gate.observe(primary_obj if fresh_aim_present else None)
+            if selected_lock_gate.confirmed and web_control is not None:
+                web_control.mark_stable_tracking(selected_track_id)
+        elif selected_lock_gate.confirmed:
+            selected_lock_state = "stable"
+        else:
+            selected_lock_state = "approach_hold"
+    elif web_mode != "selected":
+        selected_loss_detections = 0
     fresh_egg_present = bool(candidates)
-    if web_control is not None:
-        web_mode, web_pan, web_tilt, web_aim_override, web_estop = web_control.get_control()
-    else:
-        web_mode, web_pan, web_tilt, web_aim_override, web_estop = "auto", 0.0, 0.0, None, False
-    if fresh_egg_present:
-        aim_detect_frames += 1
-        aim_missing_frames = 0
-    else:
-        aim_detect_frames = 0
-        aim_missing_frames += 1
+    if run_detection:
+        if fresh_egg_present:
+            aim_detect_frames += 1
+            aim_missing_frames = 0
+            last_fresh_egg_time = pytime.time()
+        else:
+            aim_detect_frames = 0
+            aim_missing_frames += 1
     if aim_relay:
         if web_estop or web_aim_override is False:
             relay_decision = False
-        else:
+        elif run_detection:
             # A web "ON" request never bypasses the whole-view egg safety gate.
-            relay_decision = aim_relay_decision(fresh_egg_present, aim_detect_frames, aim_missing_frames)
+            missing_seconds = pytime.time() - last_fresh_egg_time if last_fresh_egg_time else 999.0
+            relay_decision = aim_relay_decision(
+                fresh_egg_present, aim_detect_frames, aim_missing_frames, missing_seconds
+            )
+        else:
+            relay_decision = None
         if relay_decision is not None:
             aim_relay.request(relay_decision)
         aim_relay.update(pytime.time())
-    aim_waypoint = aim_waypoint_planner.point(
-        primary_obj,
-        control_aim_dot,
-        pytime.time(),
-        bool(aim_relay is not None and aim_relay.logical_on and aim_scan_requested()),
-        img=img,
+    selected_dot_fresh = bool(
+        web_mode == "selected"
+        and control_aim_dot is not None
+        and getattr(control_aim_dot, "fresh", False)
     )
-    completed_track_id = aim_waypoint_planner.take_completed_track()
-    if completed_track_id > 0:
-        mark_target_completed(completed_track_id)
+    selected_open_loop = bool(web_mode == "selected" and not selected_dot_fresh)
+    # In selected mode only, use the calibrated fixed point as an explicit
+    # fallback when the dot is lost. This does not alter the real dot
+    # measurement reported to the web UI.
+    planner_aim_dot = control_aim_dot
+    if selected_open_loop:
+        planner_aim_dot = AimDot(ACTIVE_AIM_X, ACTIVE_AIM_Y, 0.0, True, 0)
+    current_pan_offset = float(getattr(gimbal, "pan_offset", 0.0)) if gimbal is not None else 0.0
+    current_tilt_offset = float(getattr(gimbal, "tilt_offset", 0.0)) if gimbal is not None else 0.0
+    if web_mode == "selected" and selected_lock_gate.confirmed and fresh_aim_present and primary_obj is not None:
+        desired_x = primary_obj.x + primary_obj.w * 0.5
+        desired_y = primary_obj.y + primary_obj.h * 0.5
+        reference_x = planner_aim_dot.x if planner_aim_dot is not None else ACTIVE_AIM_X
+        reference_y = planner_aim_dot.y if planner_aim_dot is not None else ACTIVE_AIM_Y
+        pixels_per_pan_deg = FRAME_W / CAMERA_H_FOV_DEG
+        pixels_per_tilt_deg = FRAME_H / CAMERA_V_FOV_DEG
+        raw_goal_pan = current_pan_offset + GIMBAL_PAN_SIGN * (desired_x - reference_x) / pixels_per_pan_deg
+        raw_goal_tilt = current_tilt_offset + GIMBAL_TILT_SIGN * (desired_y - reference_y) / pixels_per_tilt_deg
+        raw_goal_pan = clamp_pan_offset(raw_goal_pan)
+        raw_goal_tilt = clamp_tilt_offset(raw_goal_tilt)
+        if not selected_goal_valid or selection_changed:
+            selected_goal_pan = raw_goal_pan
+            selected_goal_tilt = raw_goal_tilt
+            selected_goal_valid = True
+        else:
+            alpha = SELECTED_GOAL_FILTER_ALPHA
+            selected_goal_pan += alpha * (raw_goal_pan - selected_goal_pan)
+            selected_goal_tilt += alpha * (raw_goal_tilt - selected_goal_tilt)
+        selected_last_box = (int(primary_obj.x), int(primary_obj.y), int(primary_obj.w), int(primary_obj.h))
+        selected_last_box_pan = current_pan_offset
+        selected_last_box_tilt = current_tilt_offset
+    if (
+        web_mode == "selected"
+        and not selected_lock_gate.confirmed
+        and selected_lock_gate.failed
+    ):
+        # Never chase a target from one unstable observation. Finish only the
+        # original click-derived angle, then hand control to the operator.
+        aim_waypoint_planner.reset()
+        if web_control is not None:
+            web_control.begin_conservative_finish(
+                current_pan_offset,
+                current_tilt_offset,
+                selected_goal_pan if selected_goal_valid else current_pan_offset,
+                selected_goal_tilt if selected_goal_valid else current_tilt_offset,
+                selected_track_id,
+            )
+        web_mode = "manual"
+        web_pan = selected_goal_pan if selected_goal_valid else current_pan_offset
+        web_tilt = selected_goal_tilt if selected_goal_valid else current_tilt_offset
+        primary_obj = None
+        primary_id = 0
+        selected_loss_active = True
+        selected_loss_detections = 0
+        selected_lock_state = "approach_hold"
+    if web_mode == "selected" and selected_lock_gate.confirmed and selected_loss_detections >= SELECTED_LOSS_CONFIRM_DETECTIONS:
+        # Once a selected target is confirmed lost, finish the last reliable
+        # angular plan slowly, then hold. Do not resume from later detections.
+        aim_waypoint_planner.reset()
+        if web_control is not None:
+            web_control.begin_lost_finish(
+                current_pan_offset,
+                current_tilt_offset,
+                selected_goal_pan if selected_goal_valid else current_pan_offset,
+                selected_goal_tilt if selected_goal_valid else current_tilt_offset,
+                selected_track_id,
+            )
+        web_mode = "manual"
+        web_pan = selected_goal_pan if selected_goal_valid else current_pan_offset
+        web_tilt = selected_goal_tilt if selected_goal_valid else current_tilt_offset
+        primary_obj = None
+        primary_id = 0
+        selected_loss_active = True
+        selected_loss_detections = 0
+    control_target = primary_obj if (web_mode != "selected" or selected_lock_gate.confirmed) else None
+    aim_waypoint = aim_waypoint_planner.point(
+        control_target,
+        planner_aim_dot,
+        pytime.time(),
+        hold_when_centered=(web_mode == "selected"),
+    )
+    if web_mode == "selected" and selected_lock_gate.confirmed and aim_waypoint_planner.take_centered_ready():
+        current_pan_offset = float(getattr(gimbal, "pan_offset", 0.0)) if gimbal is not None else 0.0
+        current_tilt_offset = float(getattr(gimbal, "tilt_offset", 0.0)) if gimbal is not None else 0.0
+        if web_control is not None:
+            web_control.begin_manual_adjust(current_pan_offset, current_tilt_offset, primary_id)
+        web_mode = "manual"
+        web_pan = current_pan_offset
+        web_tilt = current_tilt_offset
+        aim_waypoint = None
     control_status = "OFF"
     if gimbal_tracker is not None:
         if web_estop or web_mode == "hold":
             gimbal_tracker.hold()
             control_status = "WEB,HOLD"
         elif web_mode == "manual":
+            # Send only the destination. Gimbal's independent 50 Hz
+            # jerk-limited trajectory produces the physical motion.
             gimbal.set_offsets(web_pan, web_tilt, "WEB")
             control_status = "WEB,MANUAL,PAN,%.1f,TILT,%.1f" % (web_pan, web_tilt)
+        elif web_mode in ("auto", "selected"):
+            if web_mode in ("auto", "selected"):
+                if last_control_mode != web_mode or selection_changed:
+                    gimbal_tracker.sync_to_offsets(
+                        float(getattr(gimbal, "pan_offset", 0.0)),
+                        float(getattr(gimbal, "tilt_offset", 0.0)),
+                    )
+                now = pytime.time()
+                no_target_seconds = now - last_fresh_egg_time if last_fresh_egg_time else 999.0
+                if web_mode == "auto" and primary_obj is None and no_target_seconds >= GIMBAL_RECENTER_NO_TARGET_S:
+                    control_status = gimbal_tracker.recenter(now)
+                else:
+                    control_status = gimbal_tracker.update(
+                        primary_obj,
+                        FRAME_W,
+                        FRAME_H,
+                        now,
+                        aim_dot=control_aim_dot,
+                        waypoint=aim_waypoint,
+                        use_closed_loop=(selected_dot_fresh if web_mode == "selected" else None),
+                    )
         else:
-            if web_mode == "auto":
-                control_status = gimbal_tracker.update(
-                    primary_obj,
-                    FRAME_W,
-                    FRAME_H,
-                    pytime.time(),
-                    aim_dot=control_aim_dot,
-                    waypoint=aim_waypoint,
-                )
+            gimbal_tracker.hold()
+            control_status = "WEB,SELECT_WAIT"
+        last_control_mode = web_mode
         if (
             (control_status.startswith("TRACK,") or control_status.startswith("PREDICT,"))
             and frame_id % AIM_LOG_EVERY_N_FRAMES == 0
@@ -2008,28 +2733,36 @@ while not app.need_exit():
             print("SAVE_RAW_ERROR,%d,%s" % (frame_id, e))
 
     fps_now = time.fps()
-    if web_control is not None:
-        if web_control.consume_frame_request():
-            try:
-                img.save(web_control.snapshot_path)
-            except Exception as e:
-                print("WEB_SNAPSHOT_ERROR,%s" % e)
-            web_control.publish_frame()
+    if web_control is not None and frame_id % WEB_CONTROL_POLL_EVERY_N_FRAMES == 0:
         web_control.update_status({
             "fps": round(float(fps_now), 2),
-            "raw": raw_count,
-            "candidates": len(candidates),
+            "loop_fps": round(float(fps_now), 2),
+            "detect_hz": round(float(detect_fps), 2),
+            "stream_fps": round(float(stream_fps), 2),
+            "stream_port": WEB_STREAM_PORT if jpeg_streamer is not None else 0,
+            "raw": last_raw_count,
+            "candidates": last_candidate_count,
             "eggs": len(targets),
             "primary": primary_id,
             "relay": aim_relay.label() if aim_relay else "disabled",
             "dot": "fresh" if aim_dot is not None and aim_dot.fresh else "lost",
+            "aim_mode": "fixed" if selected_open_loop else "closed_loop",
+            "selected_lock_state": selected_lock_state,
+            "control": control_status,
+            "gimbal_pan": round(float(getattr(gimbal, "pan_offset", 0.0)), 2) if gimbal is not None else 0.0,
+            "gimbal_tilt": round(float(getattr(gimbal, "tilt_offset", 0.0)), 2) if gimbal is not None else 0.0,
+            "gimbal_phase": str(getattr(gimbal, "motion_phase", "hold")) if gimbal is not None else "off",
             "web_url": "http://<maixcam-ip>:%d/?token=%s" % (WEB_CONTROL_PORT, web_control.token),
         })
-    img.draw_string(2, 2, "FPS %.1f" % fps_now, image.COLOR_GREEN)
+    if web_control is not None:
+        web_snapshot_requested = web_control.consume_frame_request()
+        _web_overlay_enabled = ENABLE_DISPLAY or web_snapshot_requested
+    draw_text(img, 2, 2, "FPS %.1f YOLO/%d" % (fps_now, DETECT_EVERY_N_FRAMES), image.COLOR_GREEN)
     status_label = "WARM" if frame_id < WARMUP_FRAMES else "EGGS"
-    img.draw_string(2, 18, "M%d RAW %d CAND %d %s %d LOCK %d" % (RUN_MODE, raw_count, len(candidates), status_label, len(targets), primary_id),
-                    image.COLOR_GREEN if targets else image.COLOR_RED)
-    img.draw_string(
+    draw_text(img, 2, 18, "M%d RAW %d CAND %d %s %d LOCK %d" % (RUN_MODE, last_raw_count, last_candidate_count, status_label, len(targets), primary_id),
+              image.COLOR_GREEN if targets else image.COLOR_RED)
+    draw_text(
+        img,
         2,
         34,
         "PINK %.2f RED %.2f T %s" % (best_pink_ratio, best_red_ratio, _last_tile_info),
@@ -2045,19 +2778,19 @@ while not app.need_exit():
         gimbal_label = "GIMBAL TRACK %d" % primary_id
     if aim_dot is not None:
         dot_label = "DOT" if aim_dot.fresh else "DOT HOLD"
-    elif closed_loop_aim_requested():
+    elif closed_loop_enabled_runtime:
         dot_label = "DOT LOST"
     else:
         dot_label = "OPEN LOOP"
     aim_label = "%s %s" % (aim_relay.label() if aim_relay else "AIM DISABLED", dot_label)
-    img.draw_string(2, 50, "%s %s" % (gimbal_label, aim_label), image.COLOR_BLUE if gimbal_tracker else image.COLOR_RED)
+    draw_text(img, 2, 50, "%s %s" % (gimbal_label, aim_label), image.COLOR_BLUE if gimbal_tracker else image.COLOR_RED)
     if web_control is not None:
-        img.draw_string(2, 66, "WEB :8000 token %s" % web_control.token, image.COLOR_BLUE)
+        draw_text(img, 2, 66, "WEB :8000 token %s" % web_control.token, image.COLOR_BLUE)
 
     if aim_dot is not None:
         dot_x, dot_y = int(aim_dot.x), int(aim_dot.y)
         draw_cross(img, dot_x, dot_y, image.COLOR_RED if aim_dot.fresh else image.COLOR_YELLOW)
-        img.draw_rect(dot_x - 5, dot_y - 5, 10, 10, color=image.COLOR_RED, thickness=1)
+        draw_rect(img, dot_x - 5, dot_y - 5, 10, 10, image.COLOR_RED, 1)
     if aim_waypoint is not None:
         waypoint_x, waypoint_y = int(aim_waypoint[0]), int(aim_waypoint[1])
         draw_cross(img, waypoint_x, waypoint_y, image.COLOR_BLUE)
@@ -2066,14 +2799,14 @@ while not app.need_exit():
         raw_targets = sort_targets([row[1] for row in candidate_rows], FRAME_H)
         for idx, item in enumerate(raw_targets):
             obj, cx, cy = item
-            img.draw_rect(int(obj.x), int(obj.y), int(obj.w), int(obj.h), color=image.COLOR_YELLOW, thickness=1)
+            draw_rect(img, int(obj.x), int(obj.y), int(obj.w), int(obj.h), image.COLOR_YELLOW, 1)
             draw_cross(img, cx, cy, image.COLOR_YELLOW)
 
     elif RUN_MODE == 1 or RUN_MODE == 3:
         raw_targets = sort_targets([row[1] for row in candidate_rows], FRAME_H)
         for idx, item in enumerate(raw_targets):
             obj, cx, cy = item
-            img.draw_rect(int(obj.x), int(obj.y), int(obj.w), int(obj.h), color=image.COLOR_YELLOW, thickness=1)
+            draw_rect(img, int(obj.x), int(obj.y), int(obj.w), int(obj.h), image.COLOR_YELLOW, 1)
 
     for idx, item in enumerate(targets):
         obj, cx, cy = item
@@ -2085,13 +2818,15 @@ while not app.need_exit():
         w = int(obj.w)
         h = int(obj.h)
         box_color = image.COLOR_YELLOW if predicted else image.COLOR_GREEN
-        box_thickness = 3 if is_primary else 2
-        img.draw_rect(x, y, w, h, color=box_color, thickness=box_thickness)
-        draw_cross(img, cx, cy, image.COLOR_RED if not is_primary else image.COLOR_BLUE)
+        box_thickness = 3 if is_primary and web_mode == "selected" else 2
+        draw_rect(img, x, y, w, h, box_color, box_thickness)
+        if is_primary:
+            draw_cross(img, cx, cy, image.COLOR_BLUE)
         label_y = y - 14 if y >= 14 else y
-        img.draw_string(x, label_y, str(target_id), box_color)
+        display_id = "S%d" % target_id if is_primary and web_mode == "selected" else str(target_id)
+        draw_text(img, x, label_y, display_id, box_color)
 
-        if frame_id % PRINT_EVERY_N_FRAMES == 0:
+        if PRINT_EVERY_N_FRAMES > 0 and frame_id % PRINT_EVERY_N_FRAMES == 0:
             print(
                 "EGG,%d,%d,%d,%d,%d,%d,%d,%.3f,%.4f,%.4f"
                 % (
@@ -2108,12 +2843,72 @@ while not app.need_exit():
                 )
             )
 
+    if selected_loss_active and selected_last_box is not None and gimbal is not None:
+        # Keep the last reliable selected box visible while the slow final
+        # angular plan completes. This is a display-only prediction; it never
+        # feeds a new detection back into the controller.
+        last_x, last_y, last_w, last_h = selected_last_box
+        ghost_cx = last_x + last_w * 0.5 + (
+            float(getattr(gimbal, "pan_offset", 0.0)) - selected_last_box_pan
+        ) * (FRAME_W / CAMERA_H_FOV_DEG)
+        ghost_cy = last_y + last_h * 0.5 + (
+            float(getattr(gimbal, "tilt_offset", 0.0)) - selected_last_box_tilt
+        ) * (FRAME_H / CAMERA_V_FOV_DEG)
+        ghost_x = int(ghost_cx - last_w * 0.5)
+        ghost_y = int(ghost_cy - last_h * 0.5)
+        draw_rect(img, ghost_x, ghost_y, last_w, last_h, image.COLOR_YELLOW, 3)
+        draw_cross(img, int(ghost_cx), int(ghost_cy), image.COLOR_YELLOW)
+
     if frame_id % STAT_EVERY_N_FRAMES == 0:
-        stat_line = "STAT,%d,FPS,%.1f,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
-            frame_id, fps_now, raw_count, len(candidates), len(targets), _last_tile_info
+        stat_line = "STAT,%d,LOOP_FPS,%.1f,DETECT_HZ,%.1f,STREAM_FPS,%.1f,YOLO_FRAME,%d,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
+            frame_id, fps_now, detect_fps, stream_fps, last_yolo_frame,
+            last_raw_count, last_candidate_count, len(targets), _last_tile_info
         )
         print(stat_line)
         write_telemetry(stat_line)
+        if primary_obj is None:
+            track_line = "TRACK,%d,DETECT,%d,RAW,%d,CAND,%d,EGGS,%d,PRIMARY,0,RAWID,0,PCX,-1,PCY,-1,PRED,0,MISSES,-1,FRESH,%d" % (
+                frame_id,
+                int(run_detection),
+                last_raw_count,
+                last_candidate_count,
+                len(targets),
+                int(fresh_egg_present),
+            )
+        else:
+            primary_cx, primary_cy = obj_center(primary_obj)
+            track_line = "TRACK,%d,DETECT,%d,RAW,%d,CAND,%d,EGGS,%d,PRIMARY,%d,RAWID,%d,PCX,%d,PCY,%d,PRED,%d,MISSES,%d,FRESH,%d" % (
+                frame_id,
+                int(run_detection),
+                last_raw_count,
+                last_candidate_count,
+                len(targets),
+                primary_id,
+                int(getattr(primary_obj, "track_id", 0)),
+                primary_cx,
+                primary_cy,
+                int(getattr(primary_obj, "predicted", False)),
+                int(getattr(primary_obj, "misses", 0)),
+                int(fresh_egg_present),
+            )
+        print(track_line)
+        write_telemetry(track_line)
+        if control_aim_dot is None or primary_obj is None:
+            aim_line = "AIMSTAT,%d,VALID,0,EX,0.000,EY,0.000,DOT,0,PRIMARY,%d" % (frame_id, primary_id)
+        else:
+            aim_x = aim_waypoint[0] if aim_waypoint is not None else primary_obj.x + primary_obj.w * 0.5
+            aim_y = aim_waypoint[1] if aim_waypoint is not None else primary_obj.y + primary_obj.h * 0.5
+            aim_ex = (aim_x - control_aim_dot.x) / max(1.0, FRAME_W * 0.5)
+            aim_ey = (aim_y - control_aim_dot.y) / max(1.0, FRAME_H * 0.5)
+            aim_line = "AIMSTAT,%d,VALID,1,EX,%.4f,EY,%.4f,DOT,%d,PRIMARY,%d" % (
+                frame_id,
+                aim_ex,
+                aim_ey,
+                int(getattr(control_aim_dot, "fresh", False)),
+                primary_id,
+            )
+        print(aim_line)
+        write_telemetry(aim_line)
 
     if RUN_MODE == 3 and frame_id % PRINT_EVERY_N_FRAMES == 0:
         print(
@@ -2150,7 +2945,7 @@ while not app.need_exit():
 
     if (
         overlay_stream_saved < DEBUG_OVERLAY_STREAM_MAX_SAVES
-        and file_exists(DEBUG_OVERLAY_STREAM_FLAG)
+        and overlay_stream_runtime
         and frame_id % DEBUG_OVERLAY_STREAM_EVERY_N_FRAMES == 0
     ):
         try:
@@ -2159,12 +2954,76 @@ while not app.need_exit():
             overlay_stream_saved += 1
             if overlay_stream_saved >= DEBUG_OVERLAY_STREAM_MAX_SAVES:
                 os.remove(DEBUG_OVERLAY_STREAM_FLAG)
+                overlay_stream_runtime = False
             print("DEMO_OVERLAY,%s" % overlay_path)
         except Exception as e:
             print("DEMO_OVERLAY_ERROR,%s" % e)
 
+    # Save web snapshots after drawing detections, so remote recordings show
+    # the same annotated frame that is visible on the MaixCAM display.
+    profile_pre_display = profile_clock()
+    if web_control is not None and web_snapshot_requested:
+        try:
+            img.save(web_control.snapshot_path)
+        except Exception as e:
+            print("WEB_SNAPSHOT_ERROR,%s" % e)
+        web_control.publish_frame()
+
+    profile_stream_start = profile_clock()
+    if jpeg_streamer is not None and frame_id % WEB_STREAM_EVERY_N_FRAMES == 0:
+        try:
+            stream_jpeg = img.to_jpeg()
+            profile_encode_done = profile_clock()
+            jpeg_streamer.submit(stream_jpeg)
+            stream_fps = jpeg_streamer.fps
+        except Exception as e:
+            print("WEB_STREAM_WRITE_ERROR,%s" % e)
+            profile_encode_done = profile_clock()
+    else:
+        profile_encode_done = profile_clock()
+    profile_stream_done = profile_clock()
+
     if disp:
         disp.show(img)
+    profile_display_done = profile_clock()
+    profile_count += 1
+    profile_read_s += profile_read_done - profile_loop_start
+    profile_dot_s += profile_dot_done - profile_read_done
+    if run_detection:
+        profile_detect_count += 1
+        profile_detect_s += profile_detect_done - profile_dot_done
+    profile_control_draw_s += profile_pre_display - profile_detect_done
+    profile_encode_s += profile_encode_done - profile_stream_start
+    profile_stream_s += profile_stream_done - profile_stream_start
+    profile_display_s += profile_display_done - profile_stream_done
+    if profile_count >= PROFILE_EVERY_N_FRAMES:
+        prof_line = (
+            "PROF,%d,FRAMES,%d,DETECTS,%d,READ_MS,%.2f,DOT_MS,%.2f,"
+            "DETECT_MS,%.2f,CONTROL_DRAW_MS,%.2f,ENCODE_MS,%.2f,ENQUEUE_MS,%.2f,DISPLAY_MS,%.2f"
+            % (
+                frame_id,
+                profile_count,
+                profile_detect_count,
+                1000.0 * profile_read_s / max(1, profile_count),
+                1000.0 * profile_dot_s / max(1, profile_count),
+                1000.0 * profile_detect_s / max(1, profile_detect_count),
+                1000.0 * profile_control_draw_s / max(1, profile_count),
+                1000.0 * profile_encode_s / max(1, profile_count),
+                1000.0 * (profile_stream_s - profile_encode_s) / max(1, profile_count),
+                1000.0 * profile_display_s / max(1, profile_count),
+            )
+        )
+        print(prof_line)
+        write_telemetry(prof_line)
+        profile_count = 0
+        profile_detect_count = 0
+        profile_read_s = 0.0
+        profile_dot_s = 0.0
+        profile_detect_s = 0.0
+        profile_control_draw_s = 0.0
+        profile_encode_s = 0.0
+        profile_stream_s = 0.0
+        profile_display_s = 0.0
     frame_id += 1
 
 if gimbal:
@@ -2173,4 +3032,6 @@ if aim_relay:
     aim_relay.close()
 if web_control is not None:
     web_control.stop()
+if jpeg_streamer is not None:
+    jpeg_streamer.close()
 print("YOLO SNAIL EGG DETECTOR STOP")

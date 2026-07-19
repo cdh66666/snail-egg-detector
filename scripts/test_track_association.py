@@ -1,0 +1,90 @@
+"""Host regression checks for track-specific weak detections and gimbal compensation."""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+from types import SimpleNamespace
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MAIN = ROOT / "maixcam" / "main.py"
+
+
+def load_namespace():
+    tree = ast.parse(MAIN.read_text(encoding="utf-8"))
+    wanted = {
+        "ScalarKalman",
+        "obj_center",
+        "box_iou",
+        "track_box",
+        "track_match_cost",
+        "gimbal_image_shift",
+    }
+    selected = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted]
+    ns = {
+        "TRACK_MAX_VELOCITY_PX": 27.0,
+        "TRACK_KF_PROCESS_NOISE": 2.0,
+        "TRACK_KF_MEASUREMENT_NOISE": 16.0,
+        "TRACK_MATCH_MIN_DISTANCE_PX": 45.0,
+        "TRACK_MATCH_DISTANCE_SCALE": 1.35,
+        "TRACK_ASSOC_MAX_SIZE_RATIO": 1.9,
+        "TRACK_ASSOC_MAX_COST": 1.45,
+        "TRACK_LOCKED_LOW_ASSOC_MAX_COST": 0.92,
+        "DISCOVERY_MODEL_CONF": 0.35,
+        "_manual_lock_active": True,
+        "_locked_track_id": 7,
+        "FRAME_W": 320,
+        "FRAME_H": 224,
+        "CAMERA_H_FOV_DEG": 55.7,
+        "CAMERA_V_FOV_DEG": 36.5,
+        "GIMBAL_PAN_SIGN": -1.0,
+        "GIMBAL_TILT_SIGN": -1.0,
+    }
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(MAIN), "exec"), ns)
+    return ns
+
+
+def make_track(ns, track_id=7, cx=120, cy=90, w=30, h=40):
+    return {
+        "id": track_id,
+        "cx": ns["ScalarKalman"](cx),
+        "cy": ns["ScalarKalman"](cy),
+        "w": ns["ScalarKalman"](w),
+        "h": ns["ScalarKalman"](h),
+    }
+
+
+def detection(cx, cy, w=30, h=40, score=0.15):
+    return SimpleNamespace(x=cx - w / 2, y=cy - h / 2, w=w, h=h, score=score)
+
+
+def main():
+    ns = load_namespace()
+    cost = ns["track_match_cost"]
+    selected = make_track(ns)
+
+    # A weak observation can update the selected trajectory.
+    assert cost(detection(123, 92), selected) is not None
+    # The same weak observation cannot update or create an unrelated track.
+    assert cost(detection(123, 92), make_track(ns, track_id=8)) is None
+    # Proximity alone is insufficient when shape changes too much.
+    assert cost(detection(122, 91, w=8, h=70), selected) is None
+    # A distant weak observation is rejected even for the selected ID.
+    assert cost(detection(250, 180), selected) is None
+
+    shift = ns["gimbal_image_shift"]
+    pixels_per_pan = ns["FRAME_W"] / ns["CAMERA_H_FOV_DEG"]
+    # With the calibrated negative pan sign, a -5 degree servo move shifts the
+    # same world target left by about five degrees worth of image pixels.
+    dx, dy = shift(0.0, 0.0, -5.0, 0.0)
+    assert abs(dx + 5.0 * pixels_per_pan) < 1e-6
+    assert abs(dy) < 1e-6
+
+    source = MAIN.read_text(encoding="utf-8")
+    assert "obj.score >= birth_threshold" in source
+    print({"weak_selected_update": "passed", "weak_track_birth_blocked": "passed", "gimbal_compensation": "passed"})
+
+
+if __name__ == "__main__":
+    main()

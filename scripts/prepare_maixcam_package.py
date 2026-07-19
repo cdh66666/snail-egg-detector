@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--mud", type=Path, default=ROOT / "maixcam" / "snail_eggs_yolov8n_640x480.mud")
     parser.add_argument("--input-width", type=int, default=640)
     parser.add_argument("--input-height", type=int, default=480)
+    parser.add_argument("--output-names", default="/model.22/dfl/conv/Conv_output_0,/model.22/Sigmoid_output_0")
     parser.add_argument(
         "--calibration-dir",
         type=Path,
@@ -50,6 +51,7 @@ def main() -> None:
                 f"export NET_NAME={args.model_name}",
                 f"export INPUT_W={args.input_width}",
                 f"export INPUT_H={args.input_height}",
+                f"export YOLO_OUTPUT_NAMES={args.output_names}",
                 "",
             ]
         ),

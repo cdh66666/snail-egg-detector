@@ -16,6 +16,7 @@ MAIN_PY = ROOT / "maixcam" / "main.py"
 WEB_CONTROL_PY = ROOT / "maixcam" / "web_control.py"
 PREVIEW_PY = ROOT / "maixcam" / "preview.py"
 MODEL_DIR = ROOT / "release" / "maixcam_copy_to_device" / "root" / "models"
+REMOTE_HEADLESS_FLAG = "/root/snail_egg/headless"
 
 
 def model_files():
@@ -118,7 +119,7 @@ def probe(args):
         run_checked(
             ssh,
             "echo connected; hostname; python -V; "
-            "ls -lh /root/models/snail_eggs_yolov8n_* 2>/dev/null || true",
+            "ls -lh /root/models/snail_eggs_yolo11n_* /root/models/snail_eggs_yolov8n_* 2>/dev/null || true",
         )
     finally:
         ssh.close()
@@ -135,11 +136,22 @@ def deploy(args, ssh=None):
             upload_file(sftp, MAIN_PY, f"{args.remote_dir}/main.py")
             if WEB_CONTROL_PY.exists():
                 upload_file(sftp, WEB_CONTROL_PY, f"{args.remote_dir}/web_control.py")
+            app_id = getattr(args, "app_id", None)
+            app_dir = f"/maixapp/apps/{app_id}" if app_id else None
+            if app_dir and app_dir != args.remote_dir:
+                upload_file(sftp, MAIN_PY, f"{app_dir}/main.py")
+                if WEB_CONTROL_PY.exists():
+                    upload_file(sftp, WEB_CONTROL_PY, f"{app_dir}/web_control.py")
             if not args.skip_models:
                 for model in model_files():
                     upload_file(sftp, model, f"/root/models/{model.name}")
         finally:
             sftp.close()
+        verify_paths = [f"{args.remote_dir}/main.py"]
+        if app_dir and app_dir != args.remote_dir:
+            verify_paths.append(f"{app_dir}/main.py")
+        quoted_paths = " ".join(shlex.quote(path) for path in verify_paths)
+        run_checked(ssh, f"chmod 644 {quoted_paths} && md5sum {quoted_paths}", timeout=10)
     finally:
         if close:
             ssh.close()
@@ -197,10 +209,14 @@ def download_debug(args):
 def kill_existing(ssh):
     channel = ssh.get_transport().open_session(timeout=5)
     channel.exec_command(
-        "sh -lc 'killall python3 2>/dev/null || true; "
-        "killall python 2>/dev/null || true; sleep 1' >/dev/null 2>&1 &"
+        "sh -lc 'for name in python3 python; do "
+        "killall -INT $name 2>/dev/null || true; done; sleep 1; "
+        "for name in python3 python; do "
+        "killall -TERM $name 2>/dev/null || true; done; sleep 1; "
+        "for name in python3 python; do "
+        "killall -KILL $name 2>/dev/null || true; done' >/dev/null 2>&1 &"
     )
-    time.sleep(1.2)
+    time.sleep(2.3)
     channel.close()
 
 
@@ -222,7 +238,15 @@ def stream_run(ssh, remote_dir, run_seconds):
             if run_seconds > 0 and time.time() - start >= run_seconds:
                 print("\n==> Stop remote app after timed run")
                 channel.send("\x03")
-                time.sleep(1.0)
+                stop_deadline = time.time() + 4.0
+                while time.time() < stop_deadline:
+                    if channel.recv_ready():
+                        print(channel.recv(4096).decode(errors="replace"), end="")
+                    if channel.recv_stderr_ready():
+                        print(channel.recv_stderr(4096).decode(errors="replace"), end="", file=sys.stderr)
+                    if channel.exit_status_ready():
+                        return channel.recv_exit_status()
+                    time.sleep(0.1)
                 return 0
             select.select([channel], [], [], 0.1)
     finally:
@@ -234,10 +258,20 @@ def run_app(args):
     try:
         if args.kill_existing:
             kill_existing(ssh)
-        run_checked(ssh, f"mkdir -p {shlex.quote(args.remote_dir)} && touch {shlex.quote(args.remote_dir)}/headless", timeout=5, quiet=True)
+        headless_cmd = (
+            f"rm -f {REMOTE_HEADLESS_FLAG} {shlex.quote(args.remote_dir)}/headless"
+            if args.display
+            else f"touch {REMOTE_HEADLESS_FLAG}"
+        )
+        run_checked(ssh, f"mkdir -p {shlex.quote(args.remote_dir)} && {headless_cmd}", timeout=5, quiet=True)
         code = stream_run(ssh, args.remote_dir, args.run_seconds)
         raise SystemExit(code)
     finally:
+        if args.run_seconds > 0:
+            try:
+                kill_existing(ssh)
+            except Exception:
+                pass
         ssh.close()
 
 
@@ -247,10 +281,20 @@ def deploy_run(args):
         if args.kill_existing:
             kill_existing(ssh)
         deploy(args, ssh=ssh)
-        run_checked(ssh, f"mkdir -p {shlex.quote(args.remote_dir)} && touch {shlex.quote(args.remote_dir)}/headless", timeout=5, quiet=True)
+        headless_cmd = (
+            f"rm -f {REMOTE_HEADLESS_FLAG} {shlex.quote(args.remote_dir)}/headless"
+            if args.display
+            else f"touch {REMOTE_HEADLESS_FLAG}"
+        )
+        run_checked(ssh, f"mkdir -p {shlex.quote(args.remote_dir)} && {headless_cmd}", timeout=5, quiet=True)
         code = stream_run(ssh, args.remote_dir, args.run_seconds)
         raise SystemExit(code)
     finally:
+        if args.run_seconds > 0:
+            try:
+                kill_existing(ssh)
+            except Exception:
+                pass
         ssh.close()
 
 
@@ -318,15 +362,19 @@ def main():
 
     p_deploy = sub.add_parser("deploy")
     p_deploy.add_argument("--skip-models", action="store_true")
+    p_deploy.add_argument("--app-id", help="also update /maixapp/apps/<app-id>")
 
     p_run = sub.add_parser("run")
     p_run.add_argument("--run-seconds", type=float, default=0)
+    p_run.add_argument("--display", action="store_true", help="keep the MaixCAM display enabled")
     p_run.add_argument("--no-kill", dest="kill_existing", action="store_false")
     p_run.set_defaults(kill_existing=True)
 
     p_deploy_run = sub.add_parser("deploy-run")
     p_deploy_run.add_argument("--skip-models", action="store_true")
+    p_deploy_run.add_argument("--app-id", help="also update /maixapp/apps/<app-id>")
     p_deploy_run.add_argument("--run-seconds", type=float, default=0)
+    p_deploy_run.add_argument("--display", action="store_true", help="keep the MaixCAM display enabled")
     p_deploy_run.add_argument("--no-kill", dest="kill_existing", action="store_false")
     p_deploy_run.set_defaults(kill_existing=True)
 

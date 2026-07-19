@@ -13,7 +13,7 @@ input_h="${INPUT_H:-480}"
 
 # YOLOv8 detection output nodes for the exported Ultralytics YOLOv8n graph.
 # If your ONNX graph differs, inspect it with Netron and update these names.
-output_names="/model.22/dfl/conv/Conv_output_0,/model.22/Sigmoid_output_0"
+output_names="${YOLO_OUTPUT_NAMES:-/model.22/dfl/conv/Conv_output_0,/model.22/Sigmoid_output_0}"
 
 TPUC_ROOT="${TPUC_ROOT:-$(python -c 'import importlib.util, pathlib; spec=importlib.util.find_spec("tpu_mlir"); print(pathlib.Path(spec.origin).resolve().parent)')}"
 export TPUC_ROOT
