@@ -134,6 +134,7 @@ GIMBAL_SLOW_MAX_STEP_DEG = 0.65
 GIMBAL_SLOW_STEP_CHANGE_DEG = 0.060
 GIMBAL_SLOW_FULL_SPEED_ERROR = 0.08
 GIMBAL_SLOW_ERROR_FILTER_TAU_S = 0.04
+GIMBAL_TARGET_CENTER_ALPHA = 0.35
 # The vision controller may run slower, but physical PWM commands are advanced
 # in small straight-line steps at 50 Hz. There is no acceleration planner: each
 # tick applies the same bounded step on both axes toward the latest target.
@@ -1509,12 +1510,14 @@ class AimWaypointPlanner:
         self.settled_frames = 0
         self.settled_since = 0.0
         self.centered_ready = False
+        self.filtered_point = None
 
     def reset(self):
         self.track_id = 0
         self.settled_frames = 0
         self.settled_since = 0.0
         self.centered_ready = False
+        self.filtered_point = None
 
     def take_centered_ready(self):
         ready = self.centered_ready
@@ -1531,7 +1534,16 @@ class AimWaypointPlanner:
             self.settled_frames = 0
             self.settled_since = now
             self.centered_ready = False
-        point = (target.x + target.w * 0.5, target.y + target.h * 0.5)
+        raw_point = (target.x + target.w * 0.5, target.y + target.h * 0.5)
+        if self.filtered_point is None or identity != self.track_id:
+            self.filtered_point = raw_point
+        else:
+            alpha = GIMBAL_TARGET_CENTER_ALPHA
+            self.filtered_point = (
+                self.filtered_point[0] + alpha * (raw_point[0] - self.filtered_point[0]),
+                self.filtered_point[1] + alpha * (raw_point[1] - self.filtered_point[1]),
+            )
+        point = self.filtered_point
         if hold_when_centered and aim_dot is not None and getattr(aim_dot, "fresh", False):
             # Handoff is based on the target center, not the box edge. Scale
             # the radius with the detected object but keep a small absolute
