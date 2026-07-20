@@ -130,15 +130,17 @@ GIMBAL_SLOW_MAX_STEP_DEG = 0.35
 GIMBAL_SLOW_STEP_CHANGE_DEG = 0.060
 GIMBAL_SLOW_FULL_SPEED_ERROR = 0.08
 GIMBAL_SLOW_ERROR_FILTER_TAU_S = 0.04
-# The vision controller may run slower, but physical PWM commands are
-# interpolated independently at 50 Hz with bounded speed, acceleration and
-# jerk. This removes the visible 12 Hz staircase without adding PID overshoot.
+# The vision controller may run slower, but physical PWM commands are advanced
+# in small straight-line steps at 50 Hz. There is no acceleration planner: each
+# tick applies the same bounded step on both axes toward the latest target.
 GIMBAL_TRAJECTORY_HZ = 50.0
+GIMBAL_LINEAR_SPEED_DEG_S = 6.0
+# Kept for the offline trajectory-analysis scripts; the real-device writer
+# below no longer calls the quintic planner.
 GIMBAL_TRAJECTORY_MAX_SPEED_DEG_S = 3.0
 GIMBAL_TRAJECTORY_MAX_ACCEL_DEG_S2 = 8.0
 GIMBAL_TRAJECTORY_MAX_JERK_DEG_S3 = 40.0
 GIMBAL_TRAJECTORY_POSITION_EPS_DEG = 0.008
-GIMBAL_TRAJECTORY_SPEED_EPS_DEG_S = 0.04
 # Open-loop servos do not report shaft angle. Keep PWM command and estimated
 # physical angle separate so image-motion compensation does not pretend that a
 # newly written duty cycle has already moved the camera. These conservative
@@ -159,6 +161,8 @@ GIMBAL_MIN_STABLE = 3
 GIMBAL_MIN_SCORE = 0.28
 GIMBAL_LOG_EVERY_N_FRAMES = 10
 AIM_LOG_EVERY_N_FRAMES = 5
+GIMBAL_MAX_TARGET_JUMP_PX = 72.0
+GIMBAL_MAX_TARGET_AREA_RATIO = 2.4
 
 # 0 = raw YOLO debug: draw every model detection, no color filtering.
 # 1 = color debug: raw boxes are yellow, pink-passed boxes are green.
@@ -743,63 +747,25 @@ class Gimbal:
             tick_start = clock()
             with self._lock:
                 pending = self._pending
-            target_changed = max(
-                abs(pending[0] - self._trajectory_target[0]),
-                abs(pending[1] - self._trajectory_target[1]),
-            ) >= GIMBAL_TARGET_REPLAN_EPS_DEG
-            if self._trajectory_coefficients is None:
-                target_changed = max(
-                    abs(pending[0] - self._applied[0]),
-                    abs(pending[1] - self._applied[1]),
-                ) > GIMBAL_TRAJECTORY_POSITION_EPS_DEG
-            if target_changed:
-                pan_duration = quintic_trajectory_duration(
-                    pending[0] - self._applied[0], self._velocity[0], self._acceleration[0]
-                )
-                tilt_duration = quintic_trajectory_duration(
-                    pending[1] - self._applied[1], self._velocity[1], self._acceleration[1]
-                )
-                self._trajectory_duration = max(pan_duration, tilt_duration)
-                self._trajectory_start = tick_start
-                self._trajectory_target = pending
-                self.motion_phase = "sync"
-                if self._trajectory_duration > 0.0:
-                    self._trajectory_coefficients = (
-                        quintic_trajectory_coefficients(
-                            self._applied[0], self._velocity[0], self._acceleration[0],
-                            pending[0], self._trajectory_duration,
-                        ),
-                        quintic_trajectory_coefficients(
-                            self._applied[1], self._velocity[1], self._acceleration[1],
-                            pending[1], self._trajectory_duration,
-                        ),
-                    )
-                else:
-                    self._trajectory_coefficients = None
-            if self._trajectory_coefficients is not None:
+            max_step = GIMBAL_LINEAR_SPEED_DEG_S / GIMBAL_TRAJECTORY_HZ
+            pan_error = pending[0] - self._applied[0]
+            tilt_error = pending[1] - self._applied[1]
+            distance = (pan_error * pan_error + tilt_error * tilt_error) ** 0.5
+            ratio = 1.0 if distance <= max_step else max_step / max(0.0001, distance)
+            pan_delta = pan_error * ratio
+            tilt_delta = tilt_error * ratio
+            next_pan = self._applied[0] + pan_delta
+            next_tilt = self._applied[1] + tilt_delta
+            self._velocity = (pan_delta * GIMBAL_TRAJECTORY_HZ, tilt_delta * GIMBAL_TRAJECTORY_HZ)
+            self._acceleration = (0.0, 0.0)
+            if abs(pan_delta) > GIMBAL_TRAJECTORY_POSITION_EPS_DEG or abs(tilt_delta) > GIMBAL_TRAJECTORY_POSITION_EPS_DEG:
+                self.motion_phase = "slew"
                 try:
-                    elapsed = tick_start - self._trajectory_start
-                    next_pan, pan_velocity, pan_acceleration = quintic_trajectory_sample(
-                        self._trajectory_coefficients[0], elapsed,
-                        self._trajectory_duration, self._trajectory_target[0],
-                    )
-                    next_tilt, tilt_velocity, tilt_acceleration = quintic_trajectory_sample(
-                        self._trajectory_coefficients[1], elapsed,
-                        self._trajectory_duration, self._trajectory_target[1],
-                    )
-                    self._velocity = (pan_velocity, tilt_velocity)
-                    self._acceleration = (pan_acceleration, tilt_acceleration)
                     self._apply_offsets(next_pan, next_tilt)
-                    if elapsed >= self._trajectory_duration:
-                        self._trajectory_coefficients = None
-                        self._velocity = (0.0, 0.0)
-                        self._acceleration = (0.0, 0.0)
-                        self.motion_phase = "hold"
                 except Exception as e:
                     print("GIMBAL_PWM_ERROR,%s" % e)
             else:
-                self._velocity = (0.0, 0.0)
-                self._acceleration = (0.0, 0.0)
+                self.motion_phase = "hold"
             self._update_estimated_offsets(clock())
             tick_elapsed = clock() - tick_start
             safe_sleep(max(0.001, 1.0 / GIMBAL_TRAJECTORY_HZ - tick_elapsed))
@@ -893,32 +859,16 @@ class GimbalAxisController:
         self.initialized = False
 
     def step(self, error, dt):
-        if dt <= 0.0:
-            dt = 1.0 / GIMBAL_CONTROL_HZ
-        alpha = 1.0 - pow(2.718281828, -dt / max(0.01, GIMBAL_SLOW_ERROR_FILTER_TAU_S))
-        if not self.initialized:
-            self.filtered_error = error
-            self.initialized = True
-        else:
-            self.filtered_error += alpha * (error - self.filtered_error)
-
-        magnitude = abs(self.filtered_error)
+        self.filtered_error = error
+        self.initialized = True
+        magnitude = abs(error)
         if error == 0.0 or magnitude < 0.001:
             desired_step = 0.0
         else:
             speed_ratio = min(1.0, magnitude / max(0.01, GIMBAL_SLOW_FULL_SPEED_ERROR))
-            desired_step = self.sign * (1.0 if self.filtered_error > 0.0 else -1.0)
+            desired_step = self.sign * (1.0 if error > 0.0 else -1.0)
             desired_step *= GIMBAL_SLOW_MAX_STEP_DEG * speed_ratio
-
-        # Never reverse in one update. First reduce the old command to zero,
-        # then start moving in the other direction on a later update.
-        max_change = GIMBAL_SLOW_STEP_CHANGE_DEG
-        if self.command_step * desired_step < 0.0:
-            desired_step = 0.0
-        delta = max(-max_change, min(max_change, desired_step - self.command_step))
-        self.command_step += delta
-        if desired_step == 0.0 and abs(self.command_step) <= max_change:
-            self.command_step = 0.0
+        self.command_step = desired_step
         return self.command_step
 
 
@@ -934,11 +884,17 @@ class GimbalTracker:
         self.last_update = 0.0
         self.hold_frames = 0
         self.closed_loop = closed_loop_aim_requested()
+        self.last_target_center = None
+        self.last_target_area = None
+        self.locked_track_id = 0
 
     def reset(self):
         self.pan.reset()
         self.tilt.reset()
         self.hold_frames = 0
+        self.last_target_center = None
+        self.last_target_area = None
+        self.locked_track_id = 0
 
     def sync_to_offsets(self, pan_offset, tilt_offset):
         """Adopt the current physical command before auto control resumes."""
@@ -992,14 +948,11 @@ class GimbalTracker:
             self.hold()
             return "HOLD,NO_FRESH_TARGET"
         predicted = getattr(target, "predicted", False)
-        if predicted and getattr(target, "misses", GIMBAL_PREDICT_MAX_MISSES + 1) > GIMBAL_PREDICT_MAX_MISSES:
-            self.reset()
-            return "HOLD,PREDICTION_EXPIRED"
-        if predicted and getattr(target, "misses", GIMBAL_COAST_MAX_MISSES + 1) > GIMBAL_COAST_MAX_MISSES:
-            # Coast through at most two detector frames. Longer extrapolation
-            # holds position until a fresh YOLO observation returns.
+        if predicted:
+            # Do not move on a predicted box. A missing target must stop the
+            # gimbal instead of allowing a stale estimate to carry it onward.
             self.hold()
-            return "HOLD,PREDICT_LIMIT,%d" % target.track_id
+            return "HOLD,TARGET_LOST"
         if getattr(target, "track_id", 0) <= 0:
             self.hold()
             return "HOLD,NO_TRACK_ID"
@@ -1009,6 +962,28 @@ class GimbalTracker:
         if not predicted and (getattr(target, "misses", 1) != 0 or getattr(target, "score", 0.0) < ACTIVE_GIMBAL_MIN_SCORE):
             self.hold()
             return "HOLD,QUALITY"
+
+        center = obj_center(target)
+        area = max(1.0, float(target.w) * float(target.h))
+        track_id = int(getattr(target, "track_id", 0))
+        if self.locked_track_id and track_id != self.locked_track_id:
+            self.hold()
+            self.last_target_center = None
+            self.last_target_area = None
+            self.locked_track_id = 0
+            return "HOLD,TARGET_CHANGED"
+        if self.last_target_center is not None:
+            jump = ((center[0] - self.last_target_center[0]) ** 2 + (center[1] - self.last_target_center[1]) ** 2) ** 0.5
+            area_ratio = max(area, self.last_target_area) / max(1.0, min(area, self.last_target_area))
+            if jump > GIMBAL_MAX_TARGET_JUMP_PX or area_ratio > GIMBAL_MAX_TARGET_AREA_RATIO:
+                self.hold()
+                self.last_target_center = None
+                self.last_target_area = None
+                self.locked_track_id = 0
+                return "HOLD,TARGET_JUMP"
+        self.locked_track_id = track_id
+        self.last_target_center = center
+        self.last_target_area = area
 
         # A manually selected target may use the calibrated camera-to-aim point
         # when the visible red dot is temporarily not measurable. The actual
@@ -1026,8 +1001,7 @@ class GimbalTracker:
         self.last_update = now
 
         if waypoint is None:
-            desired_x = target.x + target.w * 0.5
-            desired_y = target.y + target.h * 0.5
+            desired_x, desired_y = center
         else:
             desired_x, desired_y = waypoint
         reference_x = aim_dot.x if closed_loop else ACTIVE_AIM_X
@@ -2806,40 +2780,28 @@ while not app.need_exit():
         and not selected_lock_gate.confirmed
         and selected_lock_gate.failed
     ):
-        # Never chase a target from one unstable observation. Finish only the
-        # original click-derived angle, then hand control to the operator.
+        # Never chase a target from one unstable observation. Stop exactly at
+        # the current applied position and hand control to the operator.
         aim_waypoint_planner.reset()
         if web_control is not None:
-            web_control.begin_conservative_finish(
-                current_pan_offset,
-                current_tilt_offset,
-                selected_goal_pan if selected_goal_valid else current_pan_offset,
-                selected_goal_tilt if selected_goal_valid else current_tilt_offset,
-                selected_track_id,
-            )
+            web_control.begin_lost_hold(current_pan_offset, current_tilt_offset, selected_track_id)
         web_mode = "manual"
-        web_pan = selected_goal_pan if selected_goal_valid else current_pan_offset
-        web_tilt = selected_goal_tilt if selected_goal_valid else current_tilt_offset
+        web_pan = current_pan_offset
+        web_tilt = current_tilt_offset
         primary_obj = None
         primary_id = 0
         selected_loss_active = True
         selected_loss_detections = 0
         selected_lock_state = "approach_hold"
     if web_mode == "selected" and selected_lock_gate.confirmed and selected_loss_detections >= SELECTED_LOSS_CONFIRM_DETECTIONS:
-        # Once a selected target is confirmed lost, finish the last reliable
-        # angular plan slowly, then hold. Do not resume from later detections.
+        # Once a selected target is confirmed lost, stop immediately. Do not
+        # finish an old angular plan and do not resume from later detections.
         aim_waypoint_planner.reset()
         if web_control is not None:
-            web_control.begin_lost_finish(
-                current_pan_offset,
-                current_tilt_offset,
-                selected_goal_pan if selected_goal_valid else current_pan_offset,
-                selected_goal_tilt if selected_goal_valid else current_tilt_offset,
-                selected_track_id,
-            )
+            web_control.begin_lost_hold(current_pan_offset, current_tilt_offset, selected_track_id)
         web_mode = "manual"
-        web_pan = selected_goal_pan if selected_goal_valid else current_pan_offset
-        web_tilt = selected_goal_tilt if selected_goal_valid else current_tilt_offset
+        web_pan = current_pan_offset
+        web_tilt = current_tilt_offset
         primary_obj = None
         primary_id = 0
         selected_loss_active = True
@@ -3001,7 +2963,7 @@ while not app.need_exit():
         y = int(obj.y)
         w = int(obj.w)
         h = int(obj.h)
-        box_color = image.COLOR_YELLOW if predicted else image.COLOR_GREEN
+        box_color = image.COLOR_GREEN
         box_thickness = 3 if is_primary and web_mode == "selected" else 2
         draw_rect(img, x, y, w, h, box_color, box_thickness)
         if is_primary:
@@ -3040,8 +3002,8 @@ while not app.need_exit():
         ) * (FRAME_H / CAMERA_V_FOV_DEG)
         ghost_x = int(ghost_cx - last_w * 0.5)
         ghost_y = int(ghost_cy - last_h * 0.5)
-        draw_rect(img, ghost_x, ghost_y, last_w, last_h, image.COLOR_YELLOW, 3)
-        draw_cross(img, int(ghost_cx), int(ghost_cy), image.COLOR_YELLOW)
+        draw_rect(img, ghost_x, ghost_y, last_w, last_h, image.COLOR_GREEN, 3)
+        draw_cross(img, int(ghost_cx), int(ghost_cy), image.COLOR_GREEN)
 
     if frame_id % STAT_EVERY_N_FRAMES == 0:
         stat_line = "STAT,%d,LOOP_FPS,%.1f,DETECT_HZ,%.1f,STREAM_FPS,%.1f,TRACK_DT,%.2f,YOLO_FRAME,%d,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
