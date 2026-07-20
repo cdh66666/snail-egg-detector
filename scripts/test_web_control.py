@@ -42,7 +42,9 @@ def main() -> None:
         status, _, body = get(base + "/api/status?token=maixcam")
         assert status == 200
         payload = json.loads(body)
-        assert payload["mode"] == "select"
+        assert payload["mode"] == "hold"
+        assert payload["estop"] is True
+        assert payload["aim_override"] is False
         assert payload["pan_limits"] == [-30.0, 30.0]
         assert payload["tilt_limits"] == [-10.0, 30.0]
         assert payload["closed_loop_override"] is None
@@ -57,6 +59,9 @@ def main() -> None:
         status, _, _ = get(base + "/api/action?cmd=pan_left&token=maixcam")
         assert status == 400
 
+        status, _, _ = get(base + "/api/action?cmd=nudge_left&token=maixcam")
+        assert status == 400
+        get(base + "/api/action?cmd=clear_estop&token=maixcam")
         web.update_status({"gimbal_pan": 12.0, "gimbal_tilt": -4.0, "eggs": 3})
         status, _, _ = get(base + "/api/action?cmd=nudge_left&token=maixcam")
         assert status == 200
