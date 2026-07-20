@@ -75,10 +75,22 @@ shot.addEventListener('click',selectTarget);
 document.querySelectorAll('[data-nudge]').forEach(button=>{let armed=false;button.addEventListener('pointerdown',event=>{event.preventDefault();event.stopPropagation();armed=true;button.setPointerCapture(event.pointerId)});button.addEventListener('pointerup',event=>{event.preventDefault();event.stopPropagation();if(!armed)return;armed=false;nudge(button.dataset.nudge)});button.addEventListener('pointercancel',()=>{armed=false});button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation()})});
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>button.dataset.command==='fullscreen'?toggleFullscreen():cmd(button.dataset.command)));
 async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();online.className='dot online';fps.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggs.textContent=status.eggs??'--';primary.textContent=status.selected_track_id||status.primary||'--';relay.textContent=status.relay??'--';selection.textContent=status.selection_message||'点击画面中的绿色目标框开始跟踪';const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackMode.textContent='红点闭环：'+mode;feedbackMode.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';}catch(_error){online.className='dot';}}
-let liveTimer=0;
-function nextLiveFrame(delay=0){clearTimeout(liveTimer);liveTimer=setTimeout(()=>{shot.src='/live.jpg?token='+encodeURIComponent(token)+'&ts='+Date.now();},delay);}
-shot.addEventListener('load',()=>nextLiveFrame(45));
-shot.addEventListener('error',()=>nextLiveFrame(350));setInterval(refreshStatus,650);refreshStatus();nextLiveFrame();
+let liveTimer=0,liveObjectUrl='';
+function nextLiveFrame(delay=0){
+  clearTimeout(liveTimer);
+  liveTimer=setTimeout(async()=>{
+    try{
+      const response=await fetch('/live.jpg?token='+encodeURIComponent(token)+'&ts='+Date.now(),{cache:'no-store'});
+      if(!response.ok)throw new Error('HTTP '+response.status);
+      const blob=await response.blob();
+      const nextUrl=URL.createObjectURL(blob),oldUrl=liveObjectUrl;
+      shot.onload=()=>{if(oldUrl)URL.revokeObjectURL(oldUrl);nextLiveFrame(45);};
+      shot.onerror=()=>{URL.revokeObjectURL(nextUrl);nextLiveFrame(350);};
+      liveObjectUrl=nextUrl;shot.src=nextUrl;
+    }catch(_error){nextLiveFrame(350);}
+  },delay);
+}
+setInterval(refreshStatus,650);refreshStatus();nextLiveFrame();
 </script></body></html>"""
 
 
