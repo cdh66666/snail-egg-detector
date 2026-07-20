@@ -3080,22 +3080,6 @@ while not app.need_exit():
                 )
             )
 
-    if selected_loss_active and selected_last_box is not None and gimbal is not None:
-        # Keep the last reliable selected box visible while the slow final
-        # angular plan completes. This is a display-only prediction; it never
-        # feeds a new detection back into the controller.
-        last_x, last_y, last_w, last_h = selected_last_box
-        ghost_cx = last_x + last_w * 0.5 + (
-            float(getattr(gimbal, "pan_offset", 0.0)) - selected_last_box_pan
-        ) * (FRAME_W / CAMERA_H_FOV_DEG)
-        ghost_cy = last_y + last_h * 0.5 + (
-            float(getattr(gimbal, "tilt_offset", 0.0)) - selected_last_box_tilt
-        ) * (FRAME_H / CAMERA_V_FOV_DEG)
-        ghost_x = int(ghost_cx - last_w * 0.5)
-        ghost_y = int(ghost_cy - last_h * 0.5)
-        draw_rect(img, ghost_x, ghost_y, last_w, last_h, image.COLOR_GREEN, 3)
-        draw_cross(img, int(ghost_cx), int(ghost_cy), image.COLOR_GREEN)
-
     if frame_id % STAT_EVERY_N_FRAMES == 0:
         stat_line = "STAT,%d,LOOP_FPS,%.1f,DETECT_HZ,%.1f,STREAM_FPS,%.1f,TRACK_DT,%.2f,YOLO_FRAME,%d,RAW,%d,CAND,%d,EGGS,%d,TILE,%s" % (
             frame_id, fps_now, detect_fps, stream_fps, track_dt_frames, last_yolo_frame,
