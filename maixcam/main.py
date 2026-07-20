@@ -264,6 +264,12 @@ TRACK_MAX_MISSES = 60
 TRACK_PREDICT_MAX_MISSES = 40
 LOCK_REACQUIRE_RADIUS_PX = 38 if USE_FAST_MODEL else 75
 LOCK_REACQUIRE_MAX_COST = 60.0
+# A selected lock may only consume a measurement that is a tight continuation
+# of its predicted box. If this gate fails, holding is safer than switching to
+# a nearby small egg mass.
+LOCKED_ASSOC_MIN_IOU = 0.05
+LOCKED_ASSOC_MAX_CENTER_RATIO = 0.90
+LOCKED_ASSOC_MAX_SIZE_RATIO = 1.55
 # The deployed 640x480 pipeline runs at about 5 FPS. Release a target after
 # roughly five seconds of failed reacquisition so another visible egg mass can
 # take over, while still bridging ordinary one- or two-frame detector misses.
@@ -1862,6 +1868,23 @@ def track_match_cost(obj, track):
     )
     if max(width_ratio, height_ratio, aspect_ratio) > TRACK_ASSOC_MAX_SIZE_RATIO:
         return None
+    if (
+        _manual_lock_active
+        and track["id"] == _locked_track_id
+        and obj.score >= DISCOVERY_MODEL_CONF
+    ):
+        max_center_distance = max(
+            4.0,
+            max(predicted_box[2], predicted_box[3]) * LOCKED_ASSOC_MAX_CENTER_RATIO,
+        )
+        if (
+            overlap < LOCKED_ASSOC_MIN_IOU
+            or distance > max_center_distance
+            or width_ratio > LOCKED_ASSOC_MAX_SIZE_RATIO
+            or height_ratio > LOCKED_ASSOC_MAX_SIZE_RATIO
+            or aspect_ratio > LOCKED_ASSOC_MAX_SIZE_RATIO
+        ):
+            return None
     sigma_x = max(3.0, (track["cx"].p00 + TRACK_KF_MEASUREMENT_NOISE) ** 0.5)
     sigma_y = max(3.0, (track["cy"].p00 + TRACK_KF_MEASUREMENT_NOISE) ** 0.5)
     normalized_innovation = ((dx / sigma_x) ** 2 + (dy / sigma_y) ** 2) ** 0.5

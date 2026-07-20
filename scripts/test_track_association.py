@@ -35,6 +35,9 @@ def load_namespace():
         "TRACK_ASSOC_MAX_SIZE_RATIO": 1.9,
         "TRACK_ASSOC_MAX_COST": 1.45,
         "TRACK_LOCKED_LOW_ASSOC_MAX_COST": 0.92,
+        "LOCKED_ASSOC_MIN_IOU": 0.05,
+        "LOCKED_ASSOC_MAX_CENTER_RATIO": 0.90,
+        "LOCKED_ASSOC_MAX_SIZE_RATIO": 1.55,
         "DISCOVERY_MODEL_CONF": 0.35,
         "_manual_lock_active": True,
         "_locked_track_id": 7,
@@ -76,6 +79,11 @@ def main():
     assert cost(detection(122, 91, w=8, h=70), selected) is None
     # A distant weak observation is rejected even for the selected ID.
     assert cost(detection(250, 180), selected) is None
+
+    # A nearby same-size small target must not steal a phone-selected ID.
+    small_selected = make_track(ns, track_id=7, cx=120, cy=90, w=16, h=16)
+    assert cost(detection(123, 91, w=16, h=16, score=0.42), small_selected) is not None
+    assert cost(detection(136, 90, w=16, h=16, score=0.42), small_selected) is None
 
     shift = ns["gimbal_image_shift"]
     pixels_per_pan = ns["FRAME_W"] / ns["CAMERA_H_FOV_DEG"]
