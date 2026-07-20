@@ -76,6 +76,7 @@ document.querySelectorAll('[data-nudge]').forEach(button=>{let armed=false;butto
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>button.dataset.command==='fullscreen'?toggleFullscreen():cmd(button.dataset.command)));
 async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();online.className='dot online';fps.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggs.textContent=status.eggs??'--';primary.textContent=status.selected_track_id||status.primary||'--';relay.textContent=status.relay??'--';selection.textContent=status.selection_message||'点击画面中的绿色目标框开始跟踪';const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackMode.textContent='红点闭环：'+mode;feedbackMode.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';}catch(_error){online.className='dot';}}
 let liveTimer=0,liveObjectUrl='';
+function startStream(){shot.src='/stream?token='+encodeURIComponent(token)+'&ts='+Date.now();}
 function nextLiveFrame(delay=0){
   clearTimeout(liveTimer);
   liveTimer=setTimeout(async()=>{
@@ -90,7 +91,8 @@ function nextLiveFrame(delay=0){
     }catch(_error){nextLiveFrame(350);}
   },delay);
 }
-setInterval(refreshStatus,650);refreshStatus();nextLiveFrame();
+shot.addEventListener('error',()=>nextLiveFrame(350));
+setInterval(refreshStatus,650);refreshStatus();startStream();
 </script></body></html>"""
 
 
@@ -120,6 +122,7 @@ class WebControl:
         self.snapshot_ready = threading.Event()
         self.latest_jpeg = None
         self.latest_jpeg_sequence = 0
+        self.latest_jpeg_ready = threading.Condition(self.lock)
         self._stopped = False
         control = self
 
@@ -150,7 +153,9 @@ class WebControl:
                 if not self.authorized(query):
                     self.send_json({"ok": False, "error": "bad token"}, 403)
                     return
-                if parsed.path == "/api/status":
+                if parsed.path == "/stream":
+                    control.stream_frame(self)
+                elif parsed.path == "/api/status":
                     self.send_json(control.get_status())
                 elif parsed.path == "/api/action":
                     command = query.get("cmd", [""])[0]
@@ -368,10 +373,31 @@ class WebControl:
         self.snapshot_ready.set()
 
     def publish_jpeg(self, jpeg):
-        with self.lock:
+        with self.latest_jpeg_ready:
             self.latest_jpeg = jpeg
             self.latest_jpeg_sequence += 1
+            self.latest_jpeg_ready.notify_all()
 
     def get_latest_jpeg(self):
         with self.lock:
             return self.latest_jpeg
+
+    def stream_frame(self, request):
+        request.send_response(200)
+        request.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        request.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        request.send_header("Pragma", "no-cache")
+        request.send_header("Connection", "close")
+        request.end_headers()
+        sent = -1
+        while True:
+            with self.latest_jpeg_ready:
+                if self.latest_jpeg_sequence == sent:
+                    self.latest_jpeg_ready.wait(0.5)
+                jpeg = self.latest_jpeg
+                sequence = self.latest_jpeg_sequence
+            if jpeg is None or sequence == sent:
+                continue
+            request.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(jpeg)).encode("ascii") + b"\r\n\r\n" + jpeg + b"\r\n")
+            request.wfile.flush()
+            sent = sequence
