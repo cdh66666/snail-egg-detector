@@ -61,9 +61,9 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 </main>
 <script>
 const token=new URLSearchParams(location.search).get('token')||'maixcam';
-const streamPort=8001,selection=document.querySelector('#selection'),viewer=document.querySelector('#viewer'),shot=document.querySelector('#shot');
+const selection=document.querySelector('#selection'),viewer=document.querySelector('#viewer'),shot=document.querySelector('#shot');
 async function api(path){const join=path.includes('?')?'&':'?';const response=await fetch(path+join+'token='+encodeURIComponent(token),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);return response;}
-async function cmd(command){await api('/api/action?cmd='+encodeURIComponent(command));await refreshStatus();}
+async function cmd(command){try{await api('/api/action?cmd='+encodeURIComponent(command));await refreshStatus();}catch(error){selection.textContent='控制请求失败：'+error.message;}}
 let nudgeBusy=false;
 async function nudge(command){if(nudgeBusy)return;nudgeBusy=true;try{await cmd(command);}finally{setTimeout(()=>{nudgeBusy=false},120);}}
 function fullscreenActive(){return !!(document.fullscreenElement||document.webkitFullscreenElement||viewer.classList.contains('viewer-fullscreen'));}
@@ -75,8 +75,10 @@ shot.addEventListener('click',selectTarget);
 document.querySelectorAll('[data-nudge]').forEach(button=>{let armed=false;button.addEventListener('pointerdown',event=>{event.preventDefault();event.stopPropagation();armed=true;button.setPointerCapture(event.pointerId)});button.addEventListener('pointerup',event=>{event.preventDefault();event.stopPropagation();if(!armed)return;armed=false;nudge(button.dataset.nudge)});button.addEventListener('pointercancel',()=>{armed=false});button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation()})});
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>button.dataset.command==='fullscreen'?toggleFullscreen():cmd(button.dataset.command)));
 async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();online.className='dot online';fps.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggs.textContent=status.eggs??'--';primary.textContent=status.selected_track_id||status.primary||'--';relay.textContent=status.relay??'--';selection.textContent=status.selection_message||'点击画面中的绿色目标框开始跟踪';const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackMode.textContent='红点闭环：'+mode;feedbackMode.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';}catch(_error){online.className='dot';}}
-function startStream(){shot.src='http://'+location.hostname+':'+streamPort+'/stream?ts='+Date.now();}
-shot.addEventListener('error',()=>setTimeout(startStream,600));setInterval(refreshStatus,650);refreshStatus();startStream();
+let liveTimer=0;
+function nextLiveFrame(delay=0){clearTimeout(liveTimer);liveTimer=setTimeout(()=>{shot.src='/live.jpg?token='+encodeURIComponent(token)+'&ts='+Date.now();},delay);}
+shot.addEventListener('load',()=>nextLiveFrame(45));
+shot.addEventListener('error',()=>nextLiveFrame(350));setInterval(refreshStatus,650);refreshStatus();nextLiveFrame();
 </script></body></html>"""
 
 
@@ -104,6 +106,8 @@ class WebControl:
         self.last_nudge_time = 0.0
         self.snapshot_requested = False
         self.snapshot_ready = threading.Event()
+        self.latest_jpeg = None
+        self.latest_jpeg_sequence = 0
         self._stopped = False
         control = self
 
@@ -151,6 +155,12 @@ class WebControl:
                             self.send_bytes(image_file.read(), "image/jpeg")
                     except OSError:
                         self.send_json({"ok": False, "error": "snapshot not ready"}, 503)
+                elif parsed.path == "/live.jpg":
+                    jpeg = control.get_latest_jpeg()
+                    if jpeg is None:
+                        self.send_json({"ok": False, "error": "live frame not ready"}, 503)
+                    else:
+                        self.send_bytes(jpeg, "image/jpeg")
                 else:
                     self.send_json({"ok": False, "error": "not found"}, 404)
 
@@ -344,3 +354,12 @@ class WebControl:
 
     def publish_frame(self):
         self.snapshot_ready.set()
+
+    def publish_jpeg(self, jpeg):
+        with self.lock:
+            self.latest_jpeg = jpeg
+            self.latest_jpeg_sequence += 1
+
+    def get_latest_jpeg(self):
+        with self.lock:
+            return self.latest_jpeg

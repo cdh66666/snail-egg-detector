@@ -3156,6 +3156,8 @@ while not app.need_exit():
         try:
             stream_jpeg = img.to_jpeg()
             profile_encode_done = profile_clock()
+            if web_control is not None:
+                web_control.publish_jpeg(stream_jpeg.to_bytes())
             jpeg_streamer.submit(stream_jpeg)
             stream_fps = jpeg_streamer.fps
         except Exception as e:
