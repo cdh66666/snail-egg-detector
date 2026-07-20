@@ -1531,18 +1531,13 @@ class AimWaypointPlanner:
             self.centered_ready = False
         point = (target.x + target.w * 0.5, target.y + target.h * 0.5)
         if hold_when_centered and aim_dot is not None and getattr(aim_dot, "fresh", False):
-            # Handoff is deliberately a little conservative. The box can
-            # move a few pixels between detector frames; stopping in this
-            # narrow buffer leaves the operator a useful manual correction
-            # instead of letting a near-centered target disappear first.
-            pad = min(8.0, max(3.0, min(float(target.w), float(target.h)) * 0.20))
-            margin_x = -pad
-            margin_y = -pad
-            inside_target = (
-                target.x + margin_x <= aim_dot.x <= target.x + target.w - margin_x
-                and target.y + margin_y <= aim_dot.y <= target.y + target.h - margin_y
-            )
-            if inside_target:
+            # Handoff is based on the target center, not the box edge. Scale
+            # the radius with the detected object but keep a small absolute
+            # floor so tiny distant egg masses remain practically aimable.
+            center_x, center_y = point
+            center_radius = min(10.0, max(4.0, min(float(target.w), float(target.h)) * 0.30))
+            center_error = ((aim_dot.x - center_x) ** 2 + (aim_dot.y - center_y) ** 2) ** 0.5
+            if center_error <= center_radius:
                 self.settled_frames += 1
                 if self.settled_frames == 1:
                     self.settled_since = now
