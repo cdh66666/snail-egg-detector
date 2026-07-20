@@ -254,14 +254,10 @@ MAX_COLOR_CHECKS = 36
 STRONG_COLOR_CHECKS = 2
 LOW_CONF_COLOR_CHECKS = 4
 REQUIRE_STABLE_FRAMES = 2
-# Keep a short prediction window when the detector misses a frame. At about
-# 19 FPS this is roughly 0.3 seconds, long enough to bridge transient misses.
-TRACK_MAX_MISSES = 60
-# At the current 18-22 Hz loop and every-other-frame YOLO cadence, forty
-# prediction frames bridge about two seconds of motion-induced detector loss.
-# Prediction velocity decays on every miss so stale boxes settle instead of
-# drifting across the view.
-TRACK_PREDICT_MAX_MISSES = 40
+# Every display frame runs YOLO. Kalman output is visible only as a three-frame
+# dropout bridge; the fourth consecutive miss removes the stale track.
+TRACK_MAX_MISSES = 3
+TRACK_PREDICT_MAX_MISSES = 3
 LOCK_REACQUIRE_RADIUS_PX = 38 if USE_FAST_MODEL else 75
 LOCK_REACQUIRE_MAX_COST = 60.0
 # A selected lock may only consume a measurement that is a tight continuation
@@ -292,7 +288,7 @@ TRACK_MAX_VELOCITY_PX = 27.0 if USE_FAST_MODEL else 54.0
 TRACK_REFERENCE_FPS = 20.0
 TRACK_MIN_DT_FRAMES = 0.35
 TRACK_MAX_DT_FRAMES = 2.50
-GIMBAL_PREDICT_MAX_MISSES = 12
+GIMBAL_PREDICT_MAX_MISSES = 3
 GIMBAL_COAST_MAX_MISSES = 2
 # 0 means automatically lock the first stable track; set a positive ID to
 # lock a specific track later when the gimbal controller is connected.
@@ -329,7 +325,7 @@ DUAL_BUFF = True
 # on every camera frame; YOLO refreshes the tracks every second frame and the
 # Kalman track bridges the intervening frame. This keeps a fresh detector rate
 # near 3 Hz on the installed runtime without freezing the web stream.
-DETECT_EVERY_N_FRAMES = 2
+DETECT_EVERY_N_FRAMES = 1
 
 # Per-target serial logging is useful during a lab trace but blocks the
 # MaixVision UART in normal operation. Structured STAT/PROF telemetry remains.
