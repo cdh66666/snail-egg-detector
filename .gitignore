@@ -10,6 +10,7 @@ runs/
 runs_yolo/
 dist/
 outputs/
+artifacts/
 *.cache
 *.log
 /yolo*.pt
