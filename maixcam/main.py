@@ -5,6 +5,10 @@ import time as pytime
 
 from maix import camera, display, image, nn, app, time, pwm, pinmap, gpio
 try:
+    from maix import network
+except Exception:
+    network = None
+try:
     from maix import http
 except Exception:
     http = None
@@ -83,7 +87,7 @@ AIM_DOT_LOG_EVERY_N_FRAMES = 10
 AIM_DOT_CONTROL_TOLERANCE_PX = 9
 AIM_SCAN_SETTLE_FRAMES = 2
 AIM_SCAN_DWELL_S = 0.12
-SELECTED_LOSS_CONFIRM_DETECTIONS = 8
+SELECTED_LOSS_CONFIRM_DETECTIONS = 3
 SELECTED_GOAL_FILTER_ALPHA = 0.30
 SELECTED_LOCK_CONFIRM_DETECTIONS = 4
 SELECTED_LOCK_TIMEOUT_DETECTIONS = 8
@@ -126,7 +130,7 @@ GIMBAL_TILT_PWM_ID = 7
 GIMBAL_CONTROL_HZ = 30.0
 GIMBAL_DEADZONE_X = 0.015
 GIMBAL_DEADZONE_Y = 0.018
-GIMBAL_SLOW_MAX_STEP_DEG = 0.35
+GIMBAL_SLOW_MAX_STEP_DEG = 0.65
 GIMBAL_SLOW_STEP_CHANGE_DEG = 0.060
 GIMBAL_SLOW_FULL_SPEED_ERROR = 0.08
 GIMBAL_SLOW_ERROR_FILTER_TAU_S = 0.04
@@ -134,7 +138,7 @@ GIMBAL_SLOW_ERROR_FILTER_TAU_S = 0.04
 # in small straight-line steps at 50 Hz. There is no acceleration planner: each
 # tick applies the same bounded step on both axes toward the latest target.
 GIMBAL_TRAJECTORY_HZ = 50.0
-GIMBAL_LINEAR_SPEED_DEG_S = 6.0
+GIMBAL_LINEAR_SPEED_DEG_S = 10.0
 # Kept for the offline trajectory-analysis scripts; the real-device writer
 # below no longer calls the quintic planner.
 GIMBAL_TRAJECTORY_MAX_SPEED_DEG_S = 3.0
@@ -342,6 +346,14 @@ WEB_CONTROL_PORT = 8000
 WEB_CONTROL_POLL_EVERY_N_FRAMES = 2
 WEB_CONTROL_DISABLE_FLAG = "/root/snail_egg/disable_web_control"
 RUNTIME_FLAG_POLL_EVERY_N_FRAMES = 15
+WIFI_AP_FALLBACK_DELAY_S = 15.0
+WIFI_AP_SSID = "SnailEgg-MaixCAM"
+WIFI_AP_PASSWORD = "snailcam2026"
+WIFI_AP_IP = "192.168.66.1"
+WIFI_AP_CHANNEL = 6
+_wifi_manager = None
+_network_mode = "checking"
+_network_ip = ""
 # Default to visual output for MaixVision/device use. The VSCode SSH helper
 # creates /root/snail_egg/headless before running so automated tests do not
 # block on display.Display().
@@ -571,6 +583,41 @@ def safe_sleep(seconds):
         pytime.sleep(seconds)
     except Exception:
         pass
+
+
+def start_network_fallback_monitor():
+    """Start a device AP only when saved Wi-Fi is still unavailable."""
+    if network is None:
+        return
+
+    def worker():
+        global _wifi_manager, _network_mode, _network_ip
+        safe_sleep(WIFI_AP_FALLBACK_DELAY_S)
+        try:
+            _wifi_manager = network.wifi.Wifi()
+            if _wifi_manager.is_connected():
+                _network_mode = "wifi"
+                _network_ip = str(_wifi_manager.get_ip())
+                print("NETWORK,WIFI,%s" % _network_ip)
+                return
+            if not _wifi_manager.is_ap_mode():
+                result = _wifi_manager.start_ap(
+                    WIFI_AP_SSID,
+                    WIFI_AP_PASSWORD,
+                    mode="g",
+                    channel=WIFI_AP_CHANNEL,
+                    ip=WIFI_AP_IP,
+                    netmask="255.255.255.0",
+                    hidden=False,
+                )
+                print("NETWORK,AP_START,%s,%s" % (WIFI_AP_SSID, result))
+            _network_mode = "ap"
+            _network_ip = WIFI_AP_IP
+        except Exception as e:
+            _network_mode = "error"
+            print("NETWORK,AP_ERROR,%s" % e)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 class LatestJpegStreamer:
@@ -949,10 +996,11 @@ class GimbalTracker:
             return "HOLD,NO_FRESH_TARGET"
         predicted = getattr(target, "predicted", False)
         if predicted:
-            # Do not move on a predicted box. A missing target must stop the
-            # gimbal instead of allowing a stale estimate to carry it onward.
+            # Detection intentionally runs every other frame. Freeze on the
+            # interpolated frame, but let the selected-lock loss counter decide
+            # whether the target is genuinely gone.
             self.hold()
-            return "HOLD,TARGET_LOST"
+            return "HOLD,PREDICTED_FRAME"
         if getattr(target, "track_id", 0) <= 0:
             self.hold()
             return "HOLD,NO_TRACK_ID"
@@ -965,8 +1013,8 @@ class GimbalTracker:
 
         center = obj_center(target)
         area = max(1.0, float(target.w) * float(target.h))
-        track_id = int(getattr(target, "track_id", 0))
-        if self.locked_track_id and track_id != self.locked_track_id:
+        identity = int(getattr(target, "aim_lock_id", getattr(target, "track_id", 0)))
+        if self.locked_track_id and identity != self.locked_track_id:
             self.hold()
             self.last_target_center = None
             self.last_target_area = None
@@ -981,7 +1029,7 @@ class GimbalTracker:
                 self.last_target_area = None
                 self.locked_track_id = 0
                 return "HOLD,TARGET_JUMP"
-        self.locked_track_id = track_id
+        self.locked_track_id = identity
         self.last_target_center = center
         self.last_target_area = area
 
@@ -1475,17 +1523,26 @@ class AimWaypointPlanner:
         if target is None:
             self.settled_frames = 0
             return None
-        track_id = getattr(target, "track_id", 0)
-        if track_id != self.track_id:
-            self.track_id = track_id
+        identity = getattr(target, "aim_lock_id", getattr(target, "track_id", 0))
+        if identity != self.track_id:
+            self.track_id = identity
             self.settled_frames = 0
             self.settled_since = now
             self.centered_ready = False
         point = (target.x + target.w * 0.5, target.y + target.h * 0.5)
         if hold_when_centered and aim_dot is not None and getattr(aim_dot, "fresh", False):
-            dx = aim_dot.x - point[0]
-            dy = aim_dot.y - point[1]
-            if (dx * dx + dy * dy) ** 0.5 <= AIM_DOT_CONTROL_TOLERANCE_PX:
+            # Handoff is deliberately a little conservative. The box can
+            # move a few pixels between detector frames; stopping in this
+            # narrow buffer leaves the operator a useful manual correction
+            # instead of letting a near-centered target disappear first.
+            pad = min(8.0, max(3.0, min(float(target.w), float(target.h)) * 0.20))
+            margin_x = -pad
+            margin_y = -pad
+            inside_target = (
+                target.x + margin_x <= aim_dot.x <= target.x + target.w - margin_x
+                and target.y + margin_y <= aim_dot.y <= target.y + target.h - margin_y
+            )
+            if inside_target:
                 self.settled_frames += 1
                 if self.settled_frames == 1:
                     self.settled_since = now
@@ -2345,6 +2402,7 @@ gimbal_tracker = init_gimbal_tracker(gimbal)
 aim_relay = init_aim_relay()
 aim_dot_detector = AimDotDetector()
 aim_waypoint_planner = AimWaypointPlanner()
+start_network_fallback_monitor()
 web_control = None
 if WebControl is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
     try:
@@ -2424,12 +2482,12 @@ overlay_stream_saved = 0
 aim_detect_frames = 0
 aim_missing_frames = 0
 last_fresh_egg_time = 0.0
-web_mode = "select"
+web_mode = "hold"
 web_pan = 0.0
 web_tilt = 0.0
-web_aim_override = None
+web_aim_override = False
 web_closed_loop_override = None
-web_estop = False
+web_estop = True
 last_control_mode = None
 selected_loss_detections = 0
 selected_lock_gate = SelectedLockGate()
@@ -2748,11 +2806,17 @@ while not app.need_exit():
     # In selected mode only, use the calibrated fixed point as an explicit
     # fallback when the dot is lost. This does not alter the real dot
     # measurement reported to the web UI.
+    # The stop handoff is geometric: once the calibrated camera aim point is
+    # inside the selected box, stop and leave the final adjustment to the
+    # operator. Red-dot feedback may still drive the approach, but a transient
+    # red-dot miss must never make the gimbal run past the target.
     planner_aim_dot = control_aim_dot
-    if selected_open_loop:
+    if web_mode == "selected":
         planner_aim_dot = AimDot(ACTIVE_AIM_X, ACTIVE_AIM_Y, 0.0, True, 0)
     current_pan_offset = float(getattr(gimbal, "pan_offset", 0.0)) if gimbal is not None else 0.0
     current_tilt_offset = float(getattr(gimbal, "tilt_offset", 0.0)) if gimbal is not None else 0.0
+    current_applied_pan = float(getattr(gimbal, "command_pan_offset", current_pan_offset)) if gimbal is not None else current_pan_offset
+    current_applied_tilt = float(getattr(gimbal, "command_tilt_offset", current_tilt_offset)) if gimbal is not None else current_tilt_offset
     if web_mode == "selected" and selected_lock_gate.confirmed and fresh_aim_present and primary_obj is not None:
         desired_x = primary_obj.x + primary_obj.w * 0.5
         desired_y = primary_obj.y + primary_obj.h * 0.5
@@ -2784,10 +2848,10 @@ while not app.need_exit():
         # the current applied position and hand control to the operator.
         aim_waypoint_planner.reset()
         if web_control is not None:
-            web_control.begin_lost_hold(current_pan_offset, current_tilt_offset, selected_track_id)
+            web_control.begin_lost_hold(current_applied_pan, current_applied_tilt, selected_track_id)
         web_mode = "manual"
-        web_pan = current_pan_offset
-        web_tilt = current_tilt_offset
+        web_pan = current_applied_pan
+        web_tilt = current_applied_tilt
         primary_obj = None
         primary_id = 0
         selected_loss_active = True
@@ -2798,10 +2862,10 @@ while not app.need_exit():
         # finish an old angular plan and do not resume from later detections.
         aim_waypoint_planner.reset()
         if web_control is not None:
-            web_control.begin_lost_hold(current_pan_offset, current_tilt_offset, selected_track_id)
+            web_control.begin_lost_hold(current_applied_pan, current_applied_tilt, selected_track_id)
         web_mode = "manual"
-        web_pan = current_pan_offset
-        web_tilt = current_tilt_offset
+        web_pan = current_applied_pan
+        web_tilt = current_applied_tilt
         primary_obj = None
         primary_id = 0
         selected_loss_active = True
@@ -2814,8 +2878,8 @@ while not app.need_exit():
         hold_when_centered=(web_mode == "selected"),
     )
     if web_mode == "selected" and selected_lock_gate.confirmed and aim_waypoint_planner.take_centered_ready():
-        current_pan_offset = float(getattr(gimbal, "pan_offset", 0.0)) if gimbal is not None else 0.0
-        current_tilt_offset = float(getattr(gimbal, "tilt_offset", 0.0)) if gimbal is not None else 0.0
+        current_pan_offset = float(getattr(gimbal, "command_pan_offset", 0.0)) if gimbal is not None else 0.0
+        current_tilt_offset = float(getattr(gimbal, "command_tilt_offset", 0.0)) if gimbal is not None else 0.0
         if web_control is not None:
             web_control.begin_manual_adjust(current_pan_offset, current_tilt_offset, primary_id)
         web_mode = "manual"
@@ -2845,7 +2909,7 @@ while not app.need_exit():
                     control_status = gimbal_tracker.recenter(now)
                 else:
                     control_status = gimbal_tracker.update(
-                        primary_obj,
+                        control_target,
                         FRAME_W,
                         FRAME_H,
                         now,
@@ -2853,6 +2917,16 @@ while not app.need_exit():
                         waypoint=aim_waypoint,
                         use_closed_loop=effective_closed_loop,
                     )
+                    if control_status.startswith(("HOLD,TARGET_CHANGED", "HOLD,TARGET_JUMP")):
+                        applied_pan = float(getattr(gimbal, "command_pan_offset", current_pan_offset))
+                        applied_tilt = float(getattr(gimbal, "command_tilt_offset", current_tilt_offset))
+                        gimbal_tracker.hold()
+                        if web_control is not None:
+                            web_control.begin_lost_hold(applied_pan, applied_tilt, primary_id)
+                        web_mode = "manual"
+                        web_pan = applied_pan
+                        web_tilt = applied_tilt
+                        control_status += ",MANUAL_HOLD"
         else:
             gimbal_tracker.hold()
             control_status = "WEB,SELECT_WAIT"
@@ -2897,6 +2971,9 @@ while not app.need_exit():
             "gimbal_tilt": round(float(getattr(gimbal, "tilt_offset", 0.0)), 2) if gimbal is not None else 0.0,
             "gimbal_phase": str(getattr(gimbal, "motion_phase", "hold")) if gimbal is not None else "off",
             "web_url": "http://<maixcam-ip>:%d/?token=%s" % (WEB_CONTROL_PORT, web_control.token),
+            "network_mode": _network_mode,
+            "network_ip": _network_ip,
+            "ap_ssid": WIFI_AP_SSID if _network_mode == "ap" else "",
         })
     if web_control is not None:
         web_snapshot_requested = web_control.consume_frame_request()
