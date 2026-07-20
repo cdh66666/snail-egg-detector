@@ -28,6 +28,7 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 .viewer-fullscreen.force-landscape #viewer-stage,#viewer:fullscreen.force-landscape #viewer-stage,#viewer:-webkit-full-screen.force-landscape #viewer-stage{position:absolute;left:50%;top:50%;width:100vh;height:100vw;transform:translate(-50%,-50%) rotate(90deg)}
 .dpad{position:absolute;left:max(10px,env(safe-area-inset-left));bottom:max(10px,env(safe-area-inset-bottom));z-index:3;display:grid;grid-template-columns:repeat(3,44px);grid-template-rows:repeat(3,38px);gap:4px;filter:drop-shadow(0 2px 5px #000b)}.dpad button{width:44px;height:38px;font-size:21px;padding:0;opacity:.82}.dpad button:active{opacity:1}.dpad .up{grid-column:2}.dpad .left{grid-column:1;grid-row:2}.dpad .center{grid-column:2;grid-row:2}.dpad .right{grid-column:3;grid-row:2}.dpad .down{grid-column:2;grid-row:3}
 .commands{display:grid;grid-template-columns:1fr 1fr;gap:8px}button{height:44px;font-size:15px;font-weight:650;border:0;border-radius:6px;padding:0 10px;background:var(--blue);color:#fff;touch-action:manipulation}button:active{filter:brightness(.82)}button.green{background:var(--green)}button.amber{background:var(--amber)}button.red{background:var(--red)}button.dark{background:#4b5960}.wide{grid-column:1/-1}.hint{font-size:12px;line-height:1.45;color:var(--muted);margin:7px 1px 0}
+.notice{position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;padding:20px;background:#000a}.notice.show{display:flex}.notice-box{width:min(430px,100%);background:#20282d;border:2px solid var(--amber);border-radius:8px;padding:20px;box-shadow:0 12px 50px #000}.notice-box h2{margin:0 0 10px;font-size:23px;color:#ffd27a}.notice-box p{margin:0 0 18px;font-size:17px;line-height:1.55}.notice-box button{width:100%;font-size:17px}.needs-estop{outline:3px solid #ffd27a;animation:pulse 1s ease-in-out 3}@keyframes pulse{50%{filter:brightness(1.5)}}
 @media(max-width:560px){.status-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
@@ -59,23 +60,31 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 <button class="dark wide" data-command="clear_estop">解除急停</button>
 </div><p class="hint">方向键每次松开移动 1°。人工微调后保持当前位置，不重新追踪旧目标。高功率消杀执行器始终由人工控制。</p></section>
 </main>
+<div id="notice" class="notice" role="alertdialog" aria-modal="true"><div class="notice-box"><h2 id="noticeTitle">操作提示</h2><p id="noticeText"></p><button id="noticeClose" class="amber">我知道了</button></div></div>
 <script>
 const token=new URLSearchParams(location.search).get('token')||'maixcam';
 const selection=document.querySelector('#selection'),viewer=document.querySelector('#viewer'),shot=document.querySelector('#shot');
+const onlineEl=document.querySelector('#online'),fpsEl=document.querySelector('#fps'),eggsEl=document.querySelector('#eggs'),primaryEl=document.querySelector('#primary'),relayEl=document.querySelector('#relay'),feedbackModeEl=document.querySelector('#feedbackMode');
+const notice=document.querySelector('#notice'),noticeTitle=document.querySelector('#noticeTitle'),noticeText=document.querySelector('#noticeText'),noticeClose=document.querySelector('#noticeClose'),clearEstopButton=document.querySelector('[data-command="clear_estop"]');
+let latestStatus={estop:true};
+function showNotice(title,text,highlight=false){noticeTitle.textContent=title;noticeText.textContent=text;notice.classList.add('show');if(highlight)clearEstopButton.classList.add('needs-estop');}
+function closeNotice(){notice.classList.remove('show');clearEstopButton.classList.remove('needs-estop');}
+noticeClose.addEventListener('click',closeNotice);notice.addEventListener('click',event=>{if(event.target===notice)closeNotice();});
 async function api(path){const join=path.includes('?')?'&':'?';const response=await fetch(path+join+'token='+encodeURIComponent(token),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);return response;}
-async function cmd(command){try{await api('/api/action?cmd='+encodeURIComponent(command));await refreshStatus();}catch(error){selection.textContent='控制请求失败：'+error.message;}}
+const estopBlockedCommands=new Set(['auto','select','center','nudge_left','nudge_right','nudge_up','nudge_down','aim_on']);
+async function cmd(command){if(latestStatus.estop&&estopBlockedCommands.has(command)){showNotice('当前处于急停状态','请先点击页面下方的“解除急停”，确认周围安全后再操作云台或跟踪目标。',true);return;}try{await api('/api/action?cmd='+encodeURIComponent(command));await refreshStatus();if(command==='clear_estop')showNotice('急停已解除','现在可以使用方向键、键盘方向键、点选跟踪或自动跟踪。');else if(command==='emergency')showNotice('已进入急停','云台已停止，红色辅助瞄准灯已关闭。');}catch(error){showNotice('操作没有执行','设备拒绝了本次操作：'+error.message+'。请检查设备在线状态和急停状态。');}}
 let nudgeBusy=false;
 async function nudge(command){if(nudgeBusy)return;nudgeBusy=true;try{await cmd(command);}finally{setTimeout(()=>{nudgeBusy=false},120);}}
 function fullscreenActive(){return !!(document.fullscreenElement||document.webkitFullscreenElement||viewer.classList.contains('viewer-fullscreen'));}
 function applyLandscapeFallback(){viewer.classList.toggle('force-landscape',fullscreenActive()&&innerHeight>innerWidth);}
 async function toggleFullscreen(){const enter=viewer.requestFullscreen||viewer.webkitRequestFullscreen,exit=document.exitFullscreen||document.webkitExitFullscreen;try{if(!fullscreenActive()){if(enter)await enter.call(viewer);else viewer.classList.add('viewer-fullscreen');try{if(screen.orientation?.lock)await screen.orientation.lock('landscape');}catch(_error){}setTimeout(applyLandscapeFallback,100);}else if(exit&&(document.fullscreenElement||document.webkitFullscreenElement)){await exit.call(document);}else{viewer.classList.remove('viewer-fullscreen','force-landscape');}}catch(_error){viewer.classList.toggle('viewer-fullscreen');setTimeout(applyLandscapeFallback,50);}}
 addEventListener('resize',applyLandscapeFallback);document.addEventListener('fullscreenchange',applyLandscapeFallback);document.addEventListener('webkitfullscreenchange',applyLandscapeFallback);
-async function selectTarget(event){if(!shot.naturalWidth||!shot.naturalHeight)return;const boxW=shot.clientWidth,boxH=shot.clientHeight;const cover=getComputedStyle(shot).objectFit==='cover';const scale=cover?Math.max(boxW/shot.naturalWidth,boxH/shot.naturalHeight):Math.min(boxW/shot.naturalWidth,boxH/shot.naturalHeight);const rw=shot.naturalWidth*scale,rh=shot.naturalHeight*scale,ox=(boxW-rw)/2,oy=(boxH-rh)/2;const x=(event.offsetX-ox)/rw,y=(event.offsetY-oy)/rh;if(x<0||x>1||y<0||y>1)return;await api(`/api/select?x=${x.toFixed(5)}&y=${y.toFixed(5)}`);await refreshStatus();}
+async function selectTarget(event){if(latestStatus.estop){showNotice('当前处于急停状态','请先解除急停，再点击绿色目标框进行跟踪。',true);return;}if(!shot.naturalWidth||!shot.naturalHeight)return;const boxW=shot.clientWidth,boxH=shot.clientHeight;const cover=getComputedStyle(shot).objectFit==='cover';const scale=cover?Math.max(boxW/shot.naturalWidth,boxH/shot.naturalHeight):Math.min(boxW/shot.naturalWidth,boxH/shot.naturalHeight);const rw=shot.naturalWidth*scale,rh=shot.naturalHeight*scale,ox=(boxW-rw)/2,oy=(boxH-rh)/2;const x=(event.offsetX-ox)/rw,y=(event.offsetY-oy)/rh;if(x<0||x>1||y<0||y>1)return;try{await api(`/api/select?x=${x.toFixed(5)}&y=${y.toFixed(5)}`);await refreshStatus();}catch(error){showNotice('没有选中目标','请先解除急停，并点击画面中的绿色目标框。');}}
 shot.addEventListener('click',selectTarget);
 document.querySelectorAll('[data-nudge]').forEach(button=>{let armed=false;button.addEventListener('pointerdown',event=>{event.preventDefault();event.stopPropagation();armed=true;button.setPointerCapture(event.pointerId)});button.addEventListener('pointerup',event=>{event.preventDefault();event.stopPropagation();if(!armed)return;armed=false;nudge(button.dataset.nudge)});button.addEventListener('pointercancel',()=>{armed=false});button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation()})});
 addEventListener('keydown',event=>{const keys={ArrowUp:'nudge_up',ArrowDown:'nudge_down',ArrowLeft:'nudge_left',ArrowRight:'nudge_right'};const command=keys[event.key];if(!command||event.repeat)return;event.preventDefault();nudge(command);});
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>button.dataset.command==='fullscreen'?toggleFullscreen():cmd(button.dataset.command)));
-async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();online.className='dot online';fps.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggs.textContent=status.eggs??'--';primary.textContent=status.selected_track_id||status.primary||'--';relay.textContent=status.relay??'--';selection.textContent=status.selection_message||'点击画面中的绿色目标框开始跟踪';const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackMode.textContent='红点闭环：'+mode;feedbackMode.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';}catch(_error){online.className='dot';}}
+async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();latestStatus=status;onlineEl.className='dot online';fpsEl.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggsEl.textContent=status.eggs??'--';primaryEl.textContent=status.selected_track_id||status.primary||'--';relayEl.textContent=status.relay??'--';selection.textContent=status.estop?'当前处于急停状态，请先解除急停':(status.selection_message||'点击画面中的绿色目标框开始跟踪');const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackModeEl.textContent='红点闭环：'+mode;feedbackModeEl.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';}catch(_error){onlineEl.className='dot';fpsEl.textContent='连接失败';}}
 let liveTimer=0,liveObjectUrl='';
 function startStream(){shot.src='/stream?token='+encodeURIComponent(token)+'&ts='+Date.now();}
 function nextLiveFrame(delay=0){
@@ -212,6 +221,11 @@ class WebControl:
             return False
         with self.lock:
             now = time.monotonic()
+            if self.estop and command in {
+                "auto", "select", "center", "nudge_left", "nudge_right",
+                "nudge_up", "nudge_down", "aim_on",
+            }:
+                return False
             if command == "auto":
                 self.mode, self.estop, self.selected_track_id = "auto", False, 0
                 self.selection_message = "自动跟踪模式"

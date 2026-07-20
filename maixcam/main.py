@@ -2938,7 +2938,9 @@ while not app.need_exit():
         })
     if web_control is not None:
         web_snapshot_requested = web_control.consume_frame_request()
-        _web_overlay_enabled = ENABLE_DISPLAY or web_snapshot_requested
+        # The headless phone/desktop stream still needs selectable detection
+        # boxes. Text remains controlled separately by SHOW_OVERLAY_TEXT.
+        _web_overlay_enabled = ENABLE_DISPLAY or web_snapshot_requested or jpeg_streamer is not None
     draw_text(img, 2, 2, "FPS %.1f YOLO/%d" % (fps_now, DETECT_EVERY_N_FRAMES), image.COLOR_GREEN)
     status_label = "WARM" if frame_id < WARMUP_FRAMES else "EGGS"
     draw_text(img, 2, 18, "M%d RAW %d CAND %d %s %d LOCK %d" % (RUN_MODE, last_raw_count, last_candidate_count, status_label, len(targets), primary_id),
