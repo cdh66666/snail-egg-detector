@@ -45,6 +45,12 @@ def main() -> None:
         assert payload["mode"] == "select"
         assert payload["pan_limits"] == [-30.0, 30.0]
         assert payload["tilt_limits"] == [-10.0, 30.0]
+        assert payload["closed_loop_override"] is None
+
+        for expected in (True, False, None):
+            status, _, _ = get(base + "/api/action?cmd=closed_loop_toggle&token=maixcam")
+            assert status == 200
+            assert web.get_closed_loop_override() is expected
 
         status, _, _ = get(base + "/api/action?cmd=unknown&token=maixcam")
         assert status == 400

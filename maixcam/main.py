@@ -2454,6 +2454,7 @@ web_mode = "select"
 web_pan = 0.0
 web_tilt = 0.0
 web_aim_override = None
+web_closed_loop_override = None
 web_estop = False
 last_control_mode = None
 selected_loss_detections = 0
@@ -2633,6 +2634,7 @@ while not app.need_exit():
         targets = []
     if web_control is not None and frame_id % WEB_CONTROL_POLL_EVERY_N_FRAMES == 0:
         web_mode, web_pan, web_tilt, web_aim_override, web_estop = web_control.get_control()
+        web_closed_loop_override = web_control.get_closed_loop_override()
     elif web_control is None:
         web_mode, web_pan, web_tilt, web_aim_override, web_estop = "auto", 0.0, 0.0, None, False
     target_objects = [item[0] for item in targets]
@@ -2764,7 +2766,11 @@ while not app.need_exit():
         and control_aim_dot is not None
         and getattr(control_aim_dot, "fresh", False)
     )
-    selected_open_loop = bool(web_mode == "selected" and not selected_dot_fresh)
+    if web_closed_loop_override is None:
+        effective_closed_loop = selected_dot_fresh
+    else:
+        effective_closed_loop = bool(web_closed_loop_override)
+    selected_open_loop = bool(web_mode == "selected" and not effective_closed_loop)
     # In selected mode only, use the calibrated fixed point as an explicit
     # fallback when the dot is lost. This does not alter the real dot
     # measurement reported to the web UI.
@@ -2883,10 +2889,7 @@ while not app.need_exit():
                         now,
                         aim_dot=control_aim_dot,
                         waypoint=aim_waypoint,
-                        # Automatic inspection must remain usable with the
-                        # aiming light forced off. Phone-selected precision
-                        # tracking still uses measured red-dot feedback.
-                        use_closed_loop=(selected_dot_fresh if web_mode == "selected" else False),
+                        use_closed_loop=effective_closed_loop,
                     )
         else:
             gimbal_tracker.hold()
@@ -2925,6 +2928,7 @@ while not app.need_exit():
             "relay": aim_relay.label() if aim_relay else "disabled",
             "dot": "fresh" if aim_dot is not None and aim_dot.fresh else "lost",
             "aim_mode": "fixed" if selected_open_loop else "closed_loop",
+            "closed_loop_override": web_closed_loop_override,
             "selected_lock_state": selected_lock_state,
             "control": control_status,
             "gimbal_pan": round(float(getattr(gimbal, "pan_offset", 0.0)), 2) if gimbal is not None else 0.0,

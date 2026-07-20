@@ -55,6 +55,7 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 <button class="dark" data-command="hold">保持位置</button><button class="amber" data-command="center">云台居中</button>
 <button class="red" data-command="emergency">立即急停</button><button class="amber" data-command="aim_auto">瞄准灯自动</button>
 <button class="amber" data-command="aim_on">开启红色瞄准</button><button class="dark" data-command="aim_off">关闭红色瞄准</button>
+<button id="feedbackMode" class="dark wide" data-command="closed_loop_toggle">红点闭环：自适应</button>
 <button class="dark wide" data-command="clear_estop">解除急停</button>
 </div><p class="hint">方向键每次松开移动 1°。人工微调后保持当前位置，不重新追踪旧目标。高功率消杀执行器始终由人工控制。</p></section>
 </main>
@@ -73,7 +74,7 @@ async function selectTarget(event){if(!shot.naturalWidth||!shot.naturalHeight)re
 shot.addEventListener('click',selectTarget);
 document.querySelectorAll('[data-nudge]').forEach(button=>{let armed=false;button.addEventListener('pointerdown',event=>{event.preventDefault();event.stopPropagation();armed=true;button.setPointerCapture(event.pointerId)});button.addEventListener('pointerup',event=>{event.preventDefault();event.stopPropagation();if(!armed)return;armed=false;nudge(button.dataset.nudge)});button.addEventListener('pointercancel',()=>{armed=false});button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation()})});
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>button.dataset.command==='fullscreen'?toggleFullscreen():cmd(button.dataset.command)));
-async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();online.className='dot online';fps.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggs.textContent=status.eggs??'--';primary.textContent=status.selected_track_id||status.primary||'--';relay.textContent=status.relay??'--';selection.textContent=status.selection_message||'点击画面中的绿色目标框开始跟踪';}catch(_error){online.className='dot';}}
+async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();online.className='dot online';fps.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggs.textContent=status.eggs??'--';primary.textContent=status.selected_track_id||status.primary||'--';relay.textContent=status.relay??'--';selection.textContent=status.selection_message||'点击画面中的绿色目标框开始跟踪';const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackMode.textContent='红点闭环：'+mode;feedbackMode.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';}catch(_error){online.className='dot';}}
 function startStream(){shot.src='http://'+location.hostname+':'+streamPort+'/stream?ts='+Date.now();}
 shot.addEventListener('error',()=>setTimeout(startStream,600));setInterval(refreshStatus,650);refreshStatus();startStream();
 </script></body></html>"""
@@ -94,6 +95,7 @@ class WebControl:
         self.pan_min, self.pan_max = -30.0, 30.0
         self.tilt_min, self.tilt_max = -10.0, 30.0
         self.aim_override = None
+        self.closed_loop_override = None
         self.estop = False
         self.status = {"web": "starting"}
         self.selection_request = None
@@ -176,7 +178,7 @@ class WebControl:
     def apply_command(self, command):
         valid = {
             "auto", "select", "hold", "center", "nudge_left", "nudge_right", "nudge_up", "nudge_down",
-            "aim_auto", "aim_on", "aim_off", "emergency", "clear_estop",
+            "aim_auto", "aim_on", "aim_off", "closed_loop_toggle", "emergency", "clear_estop",
         }
         if command not in valid:
             return False
@@ -214,6 +216,13 @@ class WebControl:
                 self.aim_override = True
             elif command == "aim_off":
                 self.aim_override = False
+            elif command == "closed_loop_toggle":
+                if self.closed_loop_override is None:
+                    self.closed_loop_override = True
+                elif self.closed_loop_override is True:
+                    self.closed_loop_override = False
+                else:
+                    self.closed_loop_override = None
             elif command == "emergency":
                 self._adopt_live_gimbal_locked()
                 self.mode, self.aim_override, self.estop = "hold", False, True
@@ -293,6 +302,10 @@ class WebControl:
             self.tilt = max(self.tilt_min, min(self.tilt_max, self.tilt_target))
             return self.mode, self.pan, self.tilt, self.aim_override, self.estop
 
+    def get_closed_loop_override(self):
+        with self.lock:
+            return self.closed_loop_override
+
     def update_status(self, values):
         with self.lock:
             self.status = dict(values)
@@ -313,6 +326,7 @@ class WebControl:
                 pan_limits=[self.pan_min, self.pan_max],
                 tilt_limits=[self.tilt_min, self.tilt_max],
                 aim_override=self.aim_override,
+                closed_loop_override=self.closed_loop_override,
                 estop=self.estop,
                 selected_track_id=self.selected_track_id,
                 selection_message=self.selection_message,
