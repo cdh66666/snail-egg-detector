@@ -150,6 +150,9 @@ GIMBAL_SERVO_ESTIMATE_MAX_SPEED_DEG_S = 90.0
 GIMBAL_TARGET_REPLAN_EPS_DEG = 0.20
 GIMBAL_RECENTER_NO_TARGET_S = 2.0
 GIMBAL_RECENTER_RATE_DEG_S = 3.0
+AUTO_CYCLE_FLAG = "/root/snail_egg/enable_auto_cycle"
+AUTO_CYCLE_HOLD_S = 1.25
+AUTO_CYCLE_TOLERANCE_PX = 12.0
 GIMBAL_PAN_SIGN = -1.0
 GIMBAL_TILT_SIGN = -1.0
 GIMBAL_MIN_STABLE = 3
@@ -359,6 +362,9 @@ _pending_detection_pan_offset = None
 _pending_detection_tilt_offset = None
 _last_aim_dot = None
 _previous_aim_dot = None
+_auto_cycle_track_id = 0
+_auto_cycle_since = 0.0
+_auto_cycle_index = -1
 
 
 class AimRelay:
@@ -2007,6 +2013,28 @@ def clear_target_lock():
     _manual_lock_active = False
 
 
+def auto_cycle_enabled():
+    return file_exists(AUTO_CYCLE_FLAG)
+
+
+def switch_auto_cycle_target(target_objects, now):
+    """Advance a supervised auto test to the next stable visible track."""
+    global _locked_track_id, _locked_last_center, _locked_last_size, _auto_cycle_index
+    if not target_objects:
+        return False
+    ordered = sorted(target_objects, key=lambda obj: (obj_center(obj)[1], obj_center(obj)[0]))
+    # Use an ordinal over the current sorted detections. Track IDs can be
+    # recreated after a camera move, so using the old ID as the cycle cursor
+    # can repeatedly select the first surviving track.
+    _auto_cycle_index = (_auto_cycle_index + 1) % len(ordered)
+    next_obj = ordered[_auto_cycle_index]
+    _locked_track_id = int(getattr(next_obj, "track_id", 0))
+    _locked_last_center = obj_center(next_obj)
+    _locked_last_size = (next_obj.w, next_obj.h)
+    print("AUTO_CYCLE,SWITCH,%d,%d,%d" % (_locked_track_id, _locked_last_center[0], _locked_last_center[1]))
+    return True
+
+
 def lock_target(obj):
     global _locked_track_id, _locked_last_center, _locked_last_size, _locked_missing_frames, _primary_center, _manual_lock_active
     track_id = int(getattr(obj, "track_id", 0))
@@ -2675,6 +2703,24 @@ while not app.need_exit():
         primary_obj = None
     primary_id = getattr(primary_obj, "aim_lock_id", getattr(primary_obj, "track_id", 0)) if primary_obj else 0
     fresh_aim_present = bool(primary_obj is not None and not getattr(primary_obj, "predicted", False))
+    # Optional supervised demo mode: once the current auto target is centered
+    # and remains fresh, advance to the next visible track. This is disabled by
+    # default so ordinary auto tracking never changes targets unexpectedly.
+    if web_mode == "auto" and auto_cycle_enabled() and primary_obj is not None and fresh_aim_present:
+        aim_cx, aim_cy = obj_center(primary_obj)
+        center_error = ((aim_cx - ACTIVE_AIM_X) ** 2 + (aim_cy - ACTIVE_AIM_Y) ** 2) ** 0.5
+        if center_error <= AUTO_CYCLE_TOLERANCE_PX:
+            if _auto_cycle_since <= 0.0:
+                _auto_cycle_since = pytime.time()
+            elif pytime.time() - _auto_cycle_since >= AUTO_CYCLE_HOLD_S:
+                if switch_auto_cycle_target(target_objects, pytime.time()):
+                    _auto_cycle_since = pytime.time()
+                    primary_obj = select_primary_target(target_objects)
+                    primary_id = getattr(primary_obj, "track_id", 0) if primary_obj else 0
+        else:
+            _auto_cycle_since = 0.0
+    elif web_mode != "auto":
+        _auto_cycle_since = 0.0
     if web_mode == "selected" and run_detection:
         if fresh_aim_present:
             selected_loss_detections = 0
@@ -2837,7 +2883,10 @@ while not app.need_exit():
                         now,
                         aim_dot=control_aim_dot,
                         waypoint=aim_waypoint,
-                        use_closed_loop=(selected_dot_fresh if web_mode == "selected" else None),
+                        # Automatic inspection must remain usable with the
+                        # aiming light forced off. Phone-selected precision
+                        # tracking still uses measured red-dot feedback.
+                        use_closed_loop=(selected_dot_fresh if web_mode == "selected" else False),
                     )
         else:
             gimbal_tracker.hold()
