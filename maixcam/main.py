@@ -204,7 +204,10 @@ if USE_FAST_MODEL:
 # Keep two capture buffers. Three buffers plus YOLO dual buffering and the
 # physical display can exhaust the MaixCAM media pool during Display() init;
 # two still prevents the camera read from blocking behind inference.
-CAMERA_BUFF_NUM = 2
+# MaixCAM's CSI/TPU path is more stable with one capture buffer when the
+# compact YOLO11 model is used. Extra buffers increased latency and caused the
+# synchronous detector call to wait behind stale frames on the real device.
+CAMERA_BUFF_NUM = 1
 CAMERA_TARGET_FPS = 60
 WEB_STREAM_PORT = 8001
 WEB_STREAM_MAX_CLIENTS = 4
@@ -234,8 +237,11 @@ MAX_RED_BAD_RATIO = 0.55
 RED_BAD_DOMINANCE = 2.4
 COLOR_GRID = 6
 MAX_COLOR_CHECKS = 36
-STRONG_COLOR_CHECKS = 4
-LOW_CONF_COLOR_CHECKS = 16
+# Color is a secondary sanity check after YOLO, not the detector. Keep the
+# sample budget small on MaixCAM: Python get_pixel() is much more expensive
+# than the NPU result and was dominating the measured detection stage.
+STRONG_COLOR_CHECKS = 2
+LOW_CONF_COLOR_CHECKS = 4
 REQUIRE_STABLE_FRAMES = 2
 # Keep a short prediction window when the detector misses a frame. At about
 # 19 FPS this is roughly 0.3 seconds, long enough to bridge transient misses.
@@ -298,15 +304,15 @@ elif SPEED_PROFILE == "fast":
 else:
     print("WARN,UNKNOWN_SPEED_PROFILE,%s" % SPEED_PROFILE)
 
-# The updated MaixPy runtime supports asynchronous YOLO11 inference. Two camera
-# buffers plus NPU dual buffering overlap capture, inference and control.
+# MaixPy's official dual-buffer path overlaps CPU preprocessing and NPU work.
+# Keep it enabled; with camera buff_num=1 this is the lowest-latency supported
+# combination on the installed MaixCAM runtime.
 DUAL_BUFF = True
 # YOLO inference is the expensive stage. The tracker/control/display loop runs
-# on every camera frame; YOLO refreshes the tracks periodically. A value of 1
-# restores detector-on-every-frame behavior for accuracy comparisons.
-# Detection accuracy and stable association take priority. Run YOLO on every
-# frame by default; real device PROF data decides whether a stride is needed.
-DETECT_EVERY_N_FRAMES = 1
+# on every camera frame; YOLO refreshes the tracks every second frame and the
+# Kalman track bridges the intervening frame. This keeps a fresh detector rate
+# near 3 Hz on the installed runtime without freezing the web stream.
+DETECT_EVERY_N_FRAMES = 2
 
 # Per-target serial logging is useful during a lab trace but blocks the
 # MaixVision UART in normal operation. Structured STAT/PROF telemetry remains.
@@ -326,7 +332,7 @@ DEBUG_MAX_SAVES = 6
 MANUAL_CAPTURE_EVERY_N_FRAMES = 60
 MANUAL_CAPTURE_MAX_SAVES = 4
 WEB_CONTROL_PORT = 8000
-WEB_CONTROL_POLL_EVERY_N_FRAMES = 1
+WEB_CONTROL_POLL_EVERY_N_FRAMES = 2
 WEB_CONTROL_DISABLE_FLAG = "/root/snail_egg/disable_web_control"
 RUNTIME_FLAG_POLL_EVERY_N_FRAMES = 15
 # Default to visual output for MaixVision/device use. The VSCode SSH helper
