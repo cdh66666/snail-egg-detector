@@ -633,12 +633,16 @@ ignore_broadcast_ssid=0
     command = (
         "killall hostapd 2>/dev/null || true; "
         "killall udhcpd 2>/dev/null || true; "
+        "killall dnsmasq 2>/dev/null || true; "
         "killall wpa_supplicant 2>/dev/null || true; "
         "ip link set wlan0 down; ip addr flush dev wlan0; "
         "ip link set wlan0 up; ip addr add %s/24 dev wlan0; "
         "hostapd -B /tmp/snail_egg_hostapd.conf; sleep 1; "
-        "udhcpd /etc/udhcpd.wlan0.conf >/tmp/snail_egg_udhcpd.log 2>&1 &"
-    ) % WIFI_AP_IP
+        "dnsmasq --keep-in-foreground --interface=wlan0 --bind-interfaces "
+        "--dhcp-authoritative --dhcp-range=%s,%s,255.255.255.0,12h "
+        "--dhcp-option=3,%s --dhcp-option=6,%s --address=/#/%s "
+        "--no-resolv >/tmp/snail_egg_dnsmasq.log 2>&1 &"
+    ) % (WIFI_AP_IP, "192.168.66.100", "192.168.66.200", WIFI_AP_IP, WIFI_AP_IP, WIFI_AP_IP)
     return os.system(command) == 0
 
 

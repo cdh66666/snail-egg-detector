@@ -251,9 +251,33 @@ class WebControl:
         self.server.daemon_threads = True
         self.port = int(self.server.server_address[1])
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.portal_server = None
+        self.portal_thread = None
+        if self.host == "0.0.0.0" and self.port == 8000:
+            class PortalHandler(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    return
+
+                def do_GET(self):
+                    location = "http://192.168.66.1:8000/?token=%s" % control.token
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            try:
+                self.portal_server = ThreadingHTTPServer((self.host, 80), PortalHandler)
+                self.portal_server.daemon_threads = True
+                self.portal_thread = threading.Thread(target=self.portal_server.serve_forever, daemon=True)
+            except OSError as error:
+                print("CAPTIVE_PORTAL,DISABLED,%s" % error)
 
     def start(self):
         self.thread.start()
+        if self.portal_thread is not None:
+            self.portal_thread.start()
+            print("CAPTIVE_PORTAL,LISTEN,%s,80" % self.host)
         print("WEB_CONTROL,LISTEN,%s,%d" % (self.host, self.port))
 
     def stop(self):
@@ -265,6 +289,11 @@ class WebControl:
             self.server.server_close()
             if self.thread.is_alive():
                 self.thread.join(1.0)
+            if self.portal_server is not None:
+                self.portal_server.shutdown()
+                self.portal_server.server_close()
+            if self.portal_thread is not None and self.portal_thread.is_alive():
+                self.portal_thread.join(1.0)
         except Exception:
             pass
 
