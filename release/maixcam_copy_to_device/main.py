@@ -350,13 +350,16 @@ WEB_CONTROL_POLL_EVERY_N_FRAMES = 2
 WEB_CONTROL_DISABLE_FLAG = "/root/snail_egg/disable_web_control"
 RUNTIME_FLAG_POLL_EVERY_N_FRAMES = 15
 WIFI_AP_FALLBACK_DELAY_S = 15.0
+WIFI_AP_AUTO_FALLBACK = False
 WIFI_AP_SSID = "SnailEgg-MaixCAM"
-WIFI_AP_PASSWORD = "snailcam2026"
+WIFI_AP_PASSWORD = ""
 WIFI_AP_IP = "192.168.66.1"
 WIFI_AP_CHANNEL = 6
 _wifi_manager = None
 _network_mode = "checking"
 _network_ip = ""
+_network_lock = threading.Lock()
+_network_switching = False
 # Default to visual output for MaixVision/device use. The VSCode SSH helper
 # creates /root/snail_egg/headless before running so automated tests do not
 # block on display.Display().
@@ -589,7 +592,7 @@ def safe_sleep(seconds):
 
 
 def start_network_fallback_monitor():
-    """Start a device AP only when saved Wi-Fi is still unavailable."""
+    """Report saved Wi-Fi state; hotspot switching is manual by design."""
     if network is None:
         return
 
@@ -597,28 +600,121 @@ def start_network_fallback_monitor():
         global _wifi_manager, _network_mode, _network_ip
         safe_sleep(WIFI_AP_FALLBACK_DELAY_S)
         try:
-            _wifi_manager = network.wifi.Wifi()
-            if _wifi_manager.is_connected():
-                _network_mode = "wifi"
-                _network_ip = str(_wifi_manager.get_ip())
-                print("NETWORK,WIFI,%s" % _network_ip)
-                return
-            if not _wifi_manager.is_ap_mode():
-                result = _wifi_manager.start_ap(
-                    WIFI_AP_SSID,
-                    WIFI_AP_PASSWORD,
-                    mode="g",
-                    channel=WIFI_AP_CHANNEL,
-                    ip=WIFI_AP_IP,
-                    netmask="255.255.255.0",
-                    hidden=False,
-                )
-                print("NETWORK,AP_START,%s,%s" % (WIFI_AP_SSID, result))
-            _network_mode = "ap"
-            _network_ip = WIFI_AP_IP
+            with _network_lock:
+                _wifi_manager = network.wifi.Wifi()
+                if _wifi_manager.is_connected():
+                    _network_mode = "wifi"
+                    _network_ip = str(_wifi_manager.get_ip())
+                    print("NETWORK,WIFI,%s" % _network_ip)
+                    return
+                _network_mode = "offline"
+                _network_ip = ""
+                print("NETWORK,WIFI_OFFLINE,MANUAL_AP_ONLY")
         except Exception as e:
             _network_mode = "error"
             print("NETWORK,AP_ERROR,%s" % e)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def start_open_access_point():
+    """Start a real open AP, working around the firmware empty-PSK bug."""
+    config = """interface=wlan0
+driver=nl80211
+ssid=%s
+hw_mode=g
+channel=%d
+auth_algs=1
+wpa=0
+ignore_broadcast_ssid=0
+""" % (WIFI_AP_SSID, WIFI_AP_CHANNEL)
+    with open("/tmp/snail_egg_hostapd.conf", "w") as config_file:
+        config_file.write(config)
+    command = (
+        "killall hostapd 2>/dev/null || true; "
+        "killall udhcpd 2>/dev/null || true; "
+        "killall wpa_supplicant 2>/dev/null || true; "
+        "ip link set wlan0 down; ip addr flush dev wlan0; "
+        "ip link set wlan0 up; ip addr add %s/24 dev wlan0; "
+        "hostapd -B /tmp/snail_egg_hostapd.conf; sleep 1; "
+        "udhcpd /etc/udhcpd.wlan0.conf >/tmp/snail_egg_udhcpd.log 2>&1 &"
+    ) % WIFI_AP_IP
+    return os.system(command) == 0
+
+
+def start_default_network_ap():
+    """Start the field-control AP at boot; company Wi-Fi is opt-in."""
+    def worker():
+        global _network_mode, _network_ip
+        try:
+            with _network_lock:
+                ready = start_open_access_point()
+                _network_mode = "ap" if ready else "error"
+                _network_ip = WIFI_AP_IP if ready else ""
+                print("NETWORK,DEFAULT_AP,%s" % ready)
+        except Exception as error:
+            _network_mode = "error"
+            print("NETWORK,DEFAULT_AP_ERROR,%s" % error)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def connect_saved_company_wifi(ssid, password):
+    """Persist and connect to a user-supplied company Wi-Fi without reboot."""
+    def worker():
+        global _wifi_manager, _network_mode, _network_ip
+        try:
+            with open("/boot/wifi.ssid", "w") as ssid_file:
+                ssid_file.write(ssid)
+            with open("/boot/wifi.pass", "w") as pass_file:
+                pass_file.write(password)
+            with _network_lock:
+                _wifi_manager = network.wifi.Wifi()
+                _wifi_manager.stop_ap()
+                safe_sleep(0.7)
+                result = _wifi_manager.connect(ssid, password, wait=True, timeout=30)
+                _network_mode = "wifi" if _wifi_manager.is_connected() else "error"
+                _network_ip = str(_wifi_manager.get_ip()) if _network_mode == "wifi" else ""
+                print("NETWORK,COMPANY_WIFI,%s,%s,%s" % (ssid, result, _network_ip))
+        except Exception as error:
+            _network_mode = "error"
+            print("NETWORK,COMPANY_WIFI_ERROR,%s" % error)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def start_forced_network_ap():
+    """Leave saved Wi-Fi and start the field-control AP on user request."""
+    global _network_switching, _network_mode, _network_ip
+    if network is None or _network_switching:
+        return
+    _network_switching = True
+    _network_mode = "switching"
+    _network_ip = ""
+
+    def worker():
+        global _wifi_manager, _network_switching, _network_mode, _network_ip
+        # Let the HTTP action response reach the phone before Wi-Fi is dropped.
+        safe_sleep(2.0)
+        try:
+            with _network_lock:
+                for attempt in range(1, 4):
+                    try:
+                        ready = start_open_access_point()
+                        print("NETWORK,OPEN_AP_FORCE,%d,%s" % (attempt, ready))
+                    except Exception as attempt_error:
+                        ready = False
+                        print("NETWORK,OPEN_AP_ERROR,%d,%s" % (attempt, attempt_error))
+                    safe_sleep(0.8)
+                    if ready:
+                        _network_mode = "ap"
+                        _network_ip = WIFI_AP_IP
+                        print("NETWORK,AP_READY,%s,%s" % (WIFI_AP_SSID, WIFI_AP_IP))
+                        return
+                raise RuntimeError("AP mode did not become active")
+        except Exception as e:
+            _network_mode = "error"
+            print("NETWORK,AP_FORCE_ERROR,%s" % e)
+        finally:
+            _network_switching = False
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -738,6 +834,7 @@ SCREEN_TEST_MODE = file_exists(SCREEN_TEST_FLAG)
 ACTIVE_CONF_TH = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else CONF_TH
 ACTIVE_MIN_MODEL_CONF = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else MIN_MODEL_CONF
 ACTIVE_GIMBAL_MIN_SCORE = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else GIMBAL_MIN_SCORE
+runtime_conf_th = ACTIVE_CONF_TH
 ACTIVE_AIM_X = SCREEN_TEST_AIM_X if SCREEN_TEST_MODE else FIXED_AIM_X
 ACTIVE_AIM_Y = SCREEN_TEST_AIM_Y if SCREEN_TEST_MODE else FIXED_AIM_Y
 ACTIVE_AIM_DISTANCE_MM = SCREEN_TEST_DISTANCE_MM if SCREEN_TEST_MODE else LASER_WORK_DISTANCE_MM
@@ -2400,7 +2497,7 @@ def detect_frame(detector, img, frame_id):
         tile = img if (tx == 0 and ty == 0 and frame_w == tile_w and frame_h == tile_h) else crop_tile(img, tx, ty, tile_w, tile_h)
         if tile is None:
             continue
-        objs = detector.detect(tile, conf_th=ACTIVE_CONF_TH, iou_th=IOU_TH)
+        objs = detector.detect(tile, conf_th=runtime_conf_th, iou_th=IOU_TH)
         raw_count += len(objs)
         candidates, pink_ratio, red_ratio, candidate_rows = filter_candidates(
             tile, objs, tile_w, tile_h, frame_id
@@ -2428,7 +2525,7 @@ gimbal_tracker = init_gimbal_tracker(gimbal)
 aim_relay = init_aim_relay()
 aim_dot_detector = AimDotDetector()
 aim_waypoint_planner = AimWaypointPlanner()
-start_network_fallback_monitor()
+start_default_network_ap()
 web_control = None
 if WebControl is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
     try:
@@ -2693,8 +2790,14 @@ while not app.need_exit():
     if web_control is not None and frame_id % WEB_CONTROL_POLL_EVERY_N_FRAMES == 0:
         web_mode, web_pan, web_tilt, web_aim_override, web_estop = web_control.get_control()
         web_closed_loop_override = web_control.get_closed_loop_override()
+        runtime_conf_th = web_control.get_confidence_threshold()
     elif web_control is None:
         web_mode, web_pan, web_tilt, web_aim_override, web_estop = "auto", 0.0, 0.0, None, False
+    if web_control is not None and web_control.consume_network_request() == "start_ap":
+        start_forced_network_ap()
+    wifi_request = web_control.consume_wifi_request() if web_control is not None else None
+    if wifi_request is not None:
+        connect_saved_company_wifi(wifi_request[0], wifi_request[1])
     target_objects = [item[0] for item in targets]
     selection_request = web_control.consume_selection_request() if web_control is not None else None
     selection_changed = False
@@ -2991,6 +3094,7 @@ while not app.need_exit():
             "dot": "fresh" if aim_dot is not None and aim_dot.fresh else "lost",
             "aim_mode": "fixed" if selected_open_loop else "closed_loop",
             "closed_loop_override": web_closed_loop_override,
+            "confidence_threshold": round(float(runtime_conf_th), 2),
             "selected_lock_state": selected_lock_state,
             "control": control_status,
             "gimbal_pan": round(float(getattr(gimbal, "pan_offset", 0.0)), 2) if gimbal is not None else 0.0,

@@ -6,7 +6,15 @@ import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import HTTPRedirectHandler, build_opener
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+OPEN = build_opener(NoRedirect).open
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -16,7 +24,7 @@ from maixcam.web_control import HTML, WebControl
 
 def get(url: str):
     try:
-        with urlopen(url, timeout=2) as response:
+        with OPEN(url, timeout=2) as response:
             return response.status, response.headers, response.read()
     except HTTPError as error:
         return error.code, error.headers, error.read()
@@ -48,6 +56,24 @@ def main() -> None:
         assert payload["pan_limits"] == [-30.0, 30.0]
         assert payload["tilt_limits"] == [-10.0, 30.0]
         assert payload["closed_loop_override"] is None
+        assert payload["confidence_threshold"] == 0.10
+
+        status, _, _ = get(base + "/api/action?cmd=conf_down&token=maixcam")
+        assert status == 200
+        assert web.get_confidence_threshold() == 0.08
+        status, _, _ = get(base + "/api/action?cmd=conf_up&token=maixcam")
+        assert status == 200
+        assert web.get_confidence_threshold() == 0.10
+
+        for probe_path in ("/generate_204", "/hotspot-detect.html", "/connecttest.txt", "/ncsi.txt"):
+            status, headers, _ = get(base + probe_path)
+            assert status == 302
+            assert headers.get("Location") == "/?token=maixcam"
+
+        status, _, _ = get(base + "/api/action?cmd=start_ap&token=maixcam")
+        assert status == 200
+        assert web.consume_network_request() == "start_ap"
+        assert web.consume_network_request() is None
 
         for expected in (True, False, None):
             status, _, _ = get(base + "/api/action?cmd=closed_loop_toggle&token=maixcam")

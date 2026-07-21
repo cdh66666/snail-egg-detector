@@ -58,6 +58,9 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 <button class="amber" data-command="aim_on">开启红色瞄准</button><button class="dark" data-command="aim_off">关闭红色瞄准</button>
 <button id="feedbackMode" class="dark wide" data-command="closed_loop_toggle">红点闭环：自适应</button>
 <button class="dark wide" data-command="clear_estop">解除急停</button>
+<button id="hotspotSwitch" class="amber wide">切换到设备热点</button>
+<div class="wifi-config"><input id="wifiSsid" placeholder="公司 WiFi 名称"><input id="wifiPassword" type="password" placeholder="公司 WiFi 密码"><button id="wifiSave" class="dark wide">保存并连接公司 WiFi</button></div>
+<div class="threshold-row"><span>识别阈值</span><button class="dark" data-command="conf_down">-</button><b id="confidenceThreshold">0.10</b><button class="dark" data-command="conf_up">+</button></div>
 </div><p class="hint">方向键每次松开移动 1°。人工微调后保持当前位置，不重新追踪旧目标。高功率消杀执行器始终由人工控制。</p></section>
 </main>
 <div id="notice" class="notice" role="alertdialog" aria-modal="true"><div class="notice-box"><h2 id="noticeTitle">操作提示</h2><p id="noticeText"></p><button id="noticeClose" class="amber">我知道了</button></div></div>
@@ -65,13 +68,18 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 const token=new URLSearchParams(location.search).get('token')||'maixcam';
 const selection=document.querySelector('#selection'),viewer=document.querySelector('#viewer'),shot=document.querySelector('#shot');
 const onlineEl=document.querySelector('#online'),fpsEl=document.querySelector('#fps'),eggsEl=document.querySelector('#eggs'),primaryEl=document.querySelector('#primary'),relayEl=document.querySelector('#relay'),feedbackModeEl=document.querySelector('#feedbackMode');
+const confidenceThresholdEl=document.querySelector('#confidenceThreshold');
 const notice=document.querySelector('#notice'),noticeTitle=document.querySelector('#noticeTitle'),noticeText=document.querySelector('#noticeText'),noticeClose=document.querySelector('#noticeClose'),clearEstopButton=document.querySelector('[data-command="clear_estop"]');
+const hotspotSwitch=document.querySelector('#hotspotSwitch');
+const wifiSsid=document.querySelector('#wifiSsid'),wifiPassword=document.querySelector('#wifiPassword'),wifiSave=document.querySelector('#wifiSave');
 let latestStatus={estop:true};
 function showNotice(title,text,highlight=false){noticeTitle.textContent=title;noticeText.textContent=text;notice.classList.add('show');if(highlight)clearEstopButton.classList.add('needs-estop');}
 function closeNotice(){notice.classList.remove('show');clearEstopButton.classList.remove('needs-estop');}
 noticeClose.addEventListener('click',closeNotice);notice.addEventListener('click',event=>{if(event.target===notice)closeNotice();});
 async function api(path){const join=path.includes('?')?'&':'?';const response=await fetch(path+join+'token='+encodeURIComponent(token),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);return response;}
 const estopBlockedCommands=new Set(['auto','select','center','nudge_left','nudge_right','nudge_up','nudge_down','aim_on']);
+async function saveWifi(){const ssid=wifiSsid.value.trim(),password=wifiPassword.value;if(!ssid){showNotice('缺少 WiFi 名称','请填写公司 WiFi 名称。');return;}try{await api('/api/wifi?ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(password));showNotice('正在连接公司 WiFi','设备会保存配置并尝试连接，网页可能短暂断开；连接成功后请使用状态中的 network_ip 访问。');}catch(error){showNotice('WiFi 配置失败','设备没有接受配置：'+error.message+'。');}}
+wifiSave.addEventListener('click',saveWifi);
 let actionQueue=[],actionRunning=false;
 function queueAction(command){actionQueue.push(command);if(!actionRunning)processActions();}
 async function processActions(){
@@ -89,6 +97,13 @@ async function processActions(){
   }finally{actionRunning=false;if(actionQueue.length)processActions();}
 }
 async function emergencyNow(){actionQueue=[];latestStatus.estop=true;try{await api('/api/action?cmd=emergency');await refreshStatus();showNotice('已进入急停','云台已停止，红色辅助瞄准灯已关闭。');}catch(error){showNotice('急停请求失败','设备没有响应急停请求：'+error.message+'。请立即切断设备电源。');}}
+async function switchToHotspot(){
+  if(!confirm('设备将断开当前 WiFi。请随后连接开放热点 SnailEgg-MaixCAM，无需密码。确定切换吗？'))return;
+  try{
+    await api('/api/action?cmd=start_ap');
+    showNotice('正在切换设备热点','约 5 秒后连接开放热点 SnailEgg-MaixCAM，无需密码，然后打开 http://192.168.66.1:8000/?token=maixcam。重启设备会重新尝试已保存 WiFi。');
+  }catch(error){showNotice('热点切换失败','设备没有接受切换请求：'+error.message+'。');}
+}
 function cmd(command){if(command==='emergency'){emergencyNow();return;}if(latestStatus.estop&&estopBlockedCommands.has(command)){showNotice('当前处于急停状态','请先点击页面下方的“解除急停”，确认周围安全后再操作云台或跟踪目标。',true);return;}queueAction(command);}
 function nudge(command){if(latestStatus.estop){showNotice('当前处于急停状态','请先解除急停，再使用方向键或键盘方向键微调。',true);return;}actionQueue=actionQueue.filter(item=>item!=='auto'&&item!=='select');actionQueue.unshift(command);if(!actionRunning)processActions();}
 function fullscreenActive(){return !!(document.fullscreenElement||document.webkitFullscreenElement||viewer.classList.contains('viewer-fullscreen'));}
@@ -100,8 +115,10 @@ shot.addEventListener('click',selectTarget);
 document.querySelectorAll('[data-nudge]').forEach(button=>button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();nudge(button.dataset.nudge);}));
 addEventListener('keydown',event=>{const keys={ArrowUp:'nudge_up',ArrowDown:'nudge_down',ArrowLeft:'nudge_left',ArrowRight:'nudge_right'};const command=keys[event.key];if(!command||event.repeat)return;event.preventDefault();nudge(command);});
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>button.dataset.command==='fullscreen'?toggleFullscreen():cmd(button.dataset.command)));
-async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();latestStatus=status;onlineEl.className='dot online';fpsEl.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggsEl.textContent=status.eggs??'--';primaryEl.textContent=status.selected_track_id||status.primary||'--';relayEl.textContent=status.relay??'--';selection.textContent=status.estop?'当前处于急停状态，请先解除急停':(status.selection_message||'点击画面中的绿色目标框开始跟踪');const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackModeEl.textContent='红点闭环：'+mode;feedbackModeEl.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';}catch(_error){onlineEl.className='dot';fpsEl.textContent='连接失败';}}
+hotspotSwitch.addEventListener('click',switchToHotspot);
+async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();latestStatus=status;onlineEl.className='dot online';fpsEl.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggsEl.textContent=status.eggs??'--';primaryEl.textContent=status.selected_track_id||status.primary||'--';relayEl.textContent=status.relay??'--';selection.textContent=status.estop?'当前处于急停状态，请先解除急停':(status.selection_message||'点击画面中的绿色目标框开始跟踪');const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackModeEl.textContent='红点闭环：'+mode;feedbackModeEl.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';const apActive=status.network_mode==='ap',apSwitching=status.network_mode==='switching';hotspotSwitch.textContent=apActive?'当前为设备热点':apSwitching?'热点切换中…':'切换到设备热点';hotspotSwitch.disabled=apActive||apSwitching;}catch(_error){onlineEl.className='dot';fpsEl.textContent='连接失败';}}
 let liveTimer=0,liveObjectUrl='';
+const thresholdRefresh=setInterval(()=>{if(latestStatus.confidence_threshold!==undefined)confidenceThresholdEl.textContent=Number(latestStatus.confidence_threshold).toFixed(2);},250);
 function startStream(){shot.src='/stream?token='+encodeURIComponent(token)+'&ts='+Date.now();}
 function nextLiveFrame(delay=0){
   clearTimeout(liveTimer);
@@ -130,6 +147,9 @@ class WebControl:
         self.token = os.environ.get("MAIX_WEB_TOKEN", "maixcam")
         self.lock = threading.Lock()
         self.mode = "hold"
+        self.network_request = None
+        self.wifi_request = None
+        self.confidence_threshold = 0.10
         self.pan = 0.0
         self.tilt = 0.0
         self.pan_target = 0.0
@@ -167,12 +187,29 @@ class WebControl:
             def send_json(self, payload, status=200):
                 self.send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
+            def send_captive_redirect(self):
+                self.send_response(302)
+                self.send_header("Location", "/?token=%s" % control.token)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def authorized(self, query):
                 return query.get("token", [""])[0] == control.token
 
             def do_GET(self):
                 parsed = urlparse(self.path)
                 query = parse_qs(parsed.query)
+                # Android, iOS, Windows and common router probes use these
+                # paths after joining an open AP. Redirect them to the UI so
+                # the captive-portal prompt opens the control page.
+                if parsed.path in {
+                    "/generate_204", "/gen_204", "/hotspot-detect.html",
+                    "/connecttest.txt", "/ncsi.txt", "/success.txt",
+                    "/fwlink", "/canonical.html", "/library/test/success.html",
+                }:
+                    self.send_captive_redirect()
+                    return
                 if parsed.path == "/":
                     self.send_bytes(HTML.encode("utf-8"), "text/html; charset=utf-8")
                     return
@@ -186,6 +223,9 @@ class WebControl:
                 elif parsed.path == "/api/action":
                     command = query.get("cmd", [""])[0]
                     accepted = control.apply_command(command)
+                    self.send_json({"ok": accepted}, 200 if accepted else 400)
+                elif parsed.path == "/api/wifi":
+                    accepted = control.request_wifi_config(query.get("ssid", [""])[0], query.get("password", [""])[0])
                     self.send_json({"ok": accepted}, 200 if accepted else 400)
                 elif parsed.path == "/api/select":
                     accepted = control.request_selection(query.get("x", ["-1"])[0], query.get("y", ["-1"])[0])
@@ -230,7 +270,7 @@ class WebControl:
 
     def apply_command(self, command):
         valid = {
-            "auto", "select", "hold", "center", "nudge_left", "nudge_right", "nudge_up", "nudge_down",
+        "auto", "select", "hold", "center", "nudge_left", "nudge_right", "nudge_up", "nudge_down", "start_ap", "conf_down", "conf_up",
             "aim_auto", "aim_on", "aim_off", "closed_loop_toggle", "emergency", "clear_estop",
         }
         if command not in valid:
@@ -284,7 +324,35 @@ class WebControl:
                 self.mode, self.aim_override, self.estop = "hold", False, True
             elif command == "clear_estop":
                 self.estop = False
+            elif command == "start_ap":
+                self.network_request = "start_ap"
+            elif command == "conf_down":
+                self.confidence_threshold = max(0.05, round(self.confidence_threshold - 0.02, 2))
+            elif command == "conf_up":
+                self.confidence_threshold = min(0.30, round(self.confidence_threshold + 0.02, 2))
         return True
+
+    def get_confidence_threshold(self):
+        with self.lock:
+            return self.confidence_threshold
+
+    def consume_network_request(self):
+        with self.lock:
+            request, self.network_request = self.network_request, None
+            return request
+
+    def request_wifi_config(self, ssid, password):
+        ssid, password = str(ssid).strip(), str(password)
+        if not ssid or len(ssid) > 64 or len(password) > 63:
+            return False
+        with self.lock:
+            self.wifi_request = (ssid, password)
+        return True
+
+    def consume_wifi_request(self):
+        with self.lock:
+            request, self.wifi_request = self.wifi_request, None
+            return request
 
     def _adopt_live_gimbal_locked(self):
         if self.mode == "manual":
@@ -383,6 +451,7 @@ class WebControl:
                 tilt_limits=[self.tilt_min, self.tilt_max],
                 aim_override=self.aim_override,
                 closed_loop_override=self.closed_loop_override,
+                confidence_threshold=self.confidence_threshold,
                 estop=self.estop,
                 selected_track_id=self.selected_track_id,
                 selection_message=self.selection_message,
