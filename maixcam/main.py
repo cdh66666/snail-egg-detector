@@ -5,6 +5,10 @@ import time as pytime
 
 from maix import camera, display, image, nn, app, time, pwm, pinmap, gpio
 try:
+    from maix import touchscreen
+except Exception:
+    touchscreen = None
+try:
     from maix import network
 except Exception:
     network = None
@@ -44,9 +48,9 @@ AIM_RELAY_DISABLE_FLAG = "/root/snail_egg/disable_aim_relay"
 AIM_RELAY_NO_TARGET_TEST_FLAG = "/root/snail_egg/test_no_target_safety"
 AIM_RELAY_STARTUP_TEST_DONE_FLAG = "/root/snail_egg/aim_relay_startup_test_done"
 AIM_RELAY_ON_STABLE_FRAMES = 3
-# Keep the harmless red aiming light on while any fresh valid egg detection is
-# present anywhere in the camera view. Brief detector gaps are tolerated, but
-# two seconds without a fresh valid egg turns it off.
+# Automatic mode keeps the low-power red aiming light on while a fresh valid
+# egg exists. Manual ON is available for calibration; emergency stop always
+# forces it off regardless of mode.
 AIM_RELAY_OFF_MISSING_S = 2.0
 AIM_RELAY_PULSE_S = 0.20
 AIM_RELAY_STARTUP_TEST_ON_S = 1.0
@@ -349,17 +353,25 @@ WEB_CONTROL_PORT = 8000
 WEB_CONTROL_POLL_EVERY_N_FRAMES = 2
 WEB_CONTROL_DISABLE_FLAG = "/root/snail_egg/disable_web_control"
 RUNTIME_FLAG_POLL_EVERY_N_FRAMES = 15
-WIFI_AP_FALLBACK_DELAY_S = 15.0
-WIFI_AP_AUTO_FALLBACK = False
 WIFI_AP_SSID = "SnailEgg-MaixCAM"
 WIFI_AP_PASSWORD = ""
 WIFI_AP_IP = "192.168.66.1"
 WIFI_AP_CHANNEL = 6
+WIFI_AP_HEALTH_INTERVAL_S = 3.0
+WIFI_AP_RECOVERY_SETTLE_S = 1.5
+WIFI_STA_FAILURE_LIMIT = 3
+WIFI_SSID_PATH = "/boot/wifi.ssid"
+WIFI_PASSWORD_PATH = "/boot/wifi.pass"
+RAW_RECORDING_DIR = "/root/snail_egg/recordings"
+RAW_RECORDING_FPS = 8
+RAW_RECORDING_MAX_FRAMES = 14400
+RAW_RECORDING_MIN_FREE_MB = 256
 _wifi_manager = None
 _network_mode = "checking"
 _network_ip = ""
 _network_lock = threading.Lock()
 _network_switching = False
+_network_supervisor = None
 # Default to visual output for MaixVision/device use. The VSCode SSH helper
 # creates /root/snail_egg/headless before running so automated tests do not
 # block on display.Display().
@@ -591,34 +603,39 @@ def safe_sleep(seconds):
         pass
 
 
-def start_network_fallback_monitor():
-    """Report saved Wi-Fi state; hotspot switching is manual by design."""
-    if network is None:
-        return
-
-    def worker():
-        global _wifi_manager, _network_mode, _network_ip
-        safe_sleep(WIFI_AP_FALLBACK_DELAY_S)
-        try:
-            with _network_lock:
-                _wifi_manager = network.wifi.Wifi()
-                if _wifi_manager.is_connected():
-                    _network_mode = "wifi"
-                    _network_ip = str(_wifi_manager.get_ip())
-                    print("NETWORK,WIFI,%s" % _network_ip)
-                    return
-                _network_mode = "offline"
-                _network_ip = ""
-                print("NETWORK,WIFI_OFFLINE,MANUAL_AP_ONLY")
-        except Exception as e:
-            _network_mode = "error"
-            print("NETWORK,AP_ERROR,%s" % e)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
 def start_open_access_point():
-    """Start a real open AP, working around the firmware empty-PSK bug."""
+    """Start the open AP through the firmware API, with a shell fallback."""
+    global _wifi_manager
+    if network is not None:
+        try:
+            _wifi_manager = network.wifi.Wifi()
+            try:
+                _wifi_manager.stop_ap()
+            except Exception:
+                pass
+            stop_wlan_station_client()
+            result = _wifi_manager.start_ap(
+                WIFI_AP_SSID,
+                WIFI_AP_PASSWORD,
+                mode="g",
+                channel=WIFI_AP_CHANNEL,
+                ip=WIFI_AP_IP,
+                netmask="255.255.255.0",
+                hidden=False,
+            )
+            safe_sleep(WIFI_AP_RECOVERY_SETTLE_S)
+            if access_point_healthy():
+                # Captive DNS is optional. The firmware AP already owns DHCP.
+                os.system(
+                    "killall dnsmasq 2>/dev/null || true; "
+                    "dnsmasq --keep-in-foreground --interface=wlan0 --bind-interfaces "
+                    "--no-dhcp-interface=wlan0 --address=/#/%s --no-resolv "
+                    ">/tmp/snail_egg_dnsmasq.log 2>&1 &" % WIFI_AP_IP
+                )
+                print("NETWORK,OFFICIAL_AP,%s" % result)
+                return True
+        except Exception as error:
+            print("NETWORK,OFFICIAL_AP_ERROR,%s" % error)
     config = """interface=wlan0
 driver=nl80211
 ssid=%s
@@ -635,6 +652,7 @@ ignore_broadcast_ssid=0
         "killall udhcpd 2>/dev/null || true; "
         "killall dnsmasq 2>/dev/null || true; "
         "killall wpa_supplicant 2>/dev/null || true; "
+        "if [ -s /run/udhcpc.wlan0.pid ]; then kill $(cat /run/udhcpc.wlan0.pid) 2>/dev/null || true; rm -f /run/udhcpc.wlan0.pid; fi; "
         "ip link set wlan0 down; ip addr flush dev wlan0; "
         "ip link set wlan0 up; ip addr add %s/24 dev wlan0; "
         "hostapd -B /tmp/snail_egg_hostapd.conf; sleep 1; "
@@ -643,23 +661,274 @@ ignore_broadcast_ssid=0
         "--dhcp-option=3,%s --dhcp-option=6,%s --address=/#/%s "
         "--no-resolv >/tmp/snail_egg_dnsmasq.log 2>&1 &"
     ) % (WIFI_AP_IP, "192.168.66.100", "192.168.66.200", WIFI_AP_IP, WIFI_AP_IP, WIFI_AP_IP)
-    return os.system(command) == 0
+    if os.system(command) != 0:
+        return False
+    safe_sleep(WIFI_AP_RECOVERY_SETTLE_S)
+    return access_point_healthy()
 
 
-def start_default_network_ap():
-    """Start the field-control AP at boot; company Wi-Fi is opt-in."""
-    def worker():
+def shell_ok(command):
+    try:
+        return os.system(command + " >/dev/null 2>&1") == 0
+    except Exception:
+        return False
+
+
+def access_point_healthy():
+    """Verify association, DHCP and the fixed maintenance address separately."""
+    return (
+        shell_ok("pidof hostapd")
+        and (
+            shell_ok("ps | grep -q '[d]nsmasq.*interface=wlan0'")
+            or shell_ok("ps | grep -q '[u]dhcpd.*wlan0'")
+        )
+        and shell_ok("ip -4 addr show dev wlan0 | grep -q '%s/24'" % WIFI_AP_IP)
+    )
+
+
+def stop_wlan_station_client():
+    """The firmware may spawn a DHCP client when wlan0 rises; AP mode must own it."""
+    os.system(
+        "if [ -s /run/udhcpc.wlan0.pid ]; then "
+        "kill $(cat /run/udhcpc.wlan0.pid) 2>/dev/null || true; "
+        "rm -f /run/udhcpc.wlan0.pid; fi"
+    )
+
+
+def read_saved_wifi():
+    try:
+        with open(WIFI_SSID_PATH, "r") as ssid_file:
+            ssid = ssid_file.read().strip()
+        with open(WIFI_PASSWORD_PATH, "r") as password_file:
+            password = password_file.read().strip()
+        return ssid, password
+    except Exception:
+        return "", ""
+
+
+class NetworkSupervisor:
+    """Keep one recoverable control path alive without blocking vision."""
+
+    def __init__(self):
+        self._stop = False
+        self._thread = None
+        self.recovery_count = 0
+        self.last_error = ""
+        self._wifi_failures = 0
+
+    def start(self):
+        self.ensure_ap("boot")
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def ensure_ap(self, reason):
         global _network_mode, _network_ip
+        with _network_lock:
+            if access_point_healthy():
+                _network_mode, _network_ip = "ap", WIFI_AP_IP
+                return True
+            for attempt in range(1, 4):
+                try:
+                    ready = start_open_access_point()
+                except Exception as error:
+                    ready = False
+                    self.last_error = str(error)
+                print("NETWORK,AP_ENSURE,%s,%d,%s" % (reason, attempt, ready))
+                if ready:
+                    _network_mode, _network_ip = "ap", WIFI_AP_IP
+                    self.recovery_count += 1
+                    self._wifi_failures = 0
+                    return True
+                safe_sleep(0.8)
+            _network_mode, _network_ip = "error", ""
+            return False
+
+    def _loop(self):
+        global _network_mode, _network_ip
+        while not self._stop:
+            safe_sleep(WIFI_AP_HEALTH_INTERVAL_S)
+            try:
+                mode = _network_mode
+                if mode == "ap":
+                    stop_wlan_station_client()
+                    if not access_point_healthy():
+                        self.last_error = "ap health check failed"
+                        self.ensure_ap("watchdog")
+                elif mode == "wifi" and _wifi_manager is not None:
+                    if _wifi_manager.is_connected():
+                        self._wifi_failures = 0
+                        _network_ip = str(_wifi_manager.get_ip())
+                    else:
+                        self._wifi_failures += 1
+                        if self._wifi_failures >= WIFI_STA_FAILURE_LIMIT:
+                            self.last_error = "station disconnected"
+                            self.ensure_ap("wifi_lost")
+                elif mode == "error":
+                    self.ensure_ap("error_recovery")
+            except Exception as error:
+                self.last_error = str(error)
+                print("NETWORK,WATCHDOG_ERROR,%s" % error)
+
+    def close(self):
+        self._stop = True
+
+
+class RawFrameRecorder:
+    """Write model-input JPEG frames before any overlay is drawn."""
+
+    def __init__(self, root=RAW_RECORDING_DIR):
+        self.root = root
+        self.active = False
+        self.session_dir = ""
+        self.frame_count = 0
+        self.dropped = 0
+        self.error = ""
+        self._queue = []
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = False
+        self._last_submit = 0.0
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+
+    def start_recording(self):
+        if self.active:
+            return True
         try:
-            with _network_lock:
-                ready = start_open_access_point()
-                _network_mode = "ap" if ready else "error"
-                _network_ip = WIFI_AP_IP if ready else ""
-                print("NETWORK,DEFAULT_AP,%s" % ready)
+            os.makedirs(self.root, exist_ok=True)
+            stats = os.statvfs(self.root)
+            free_mb = stats.f_bavail * stats.f_frsize / (1024.0 * 1024.0)
+            if free_mb < RAW_RECORDING_MIN_FREE_MB:
+                raise RuntimeError("free space below %d MB" % RAW_RECORDING_MIN_FREE_MB)
+            stamp = pytime.strftime("%Y%m%d_%H%M%S")
+            base_dir = "%s/session_%s" % (self.root, stamp)
+            self.session_dir = base_dir
+            suffix = 1
+            while os.path.exists(self.session_dir):
+                self.session_dir = "%s_%02d" % (base_dir, suffix)
+                suffix += 1
+            os.makedirs(self.session_dir, exist_ok=False)
+            with open("%s/metadata.txt" % self.session_dir, "w") as metadata:
+                metadata.write("format=jpeg_sequence\nwidth=%d\nheight=%d\nfps=%d\noverlay=none\n" % (
+                    FRAME_W, FRAME_H, RAW_RECORDING_FPS
+                ))
+            self.frame_count, self.dropped, self.error = 0, 0, ""
+            self._last_submit = 0.0
+            self.active = True
+            print("RECORD,START,%s" % self.session_dir)
+            return True
         except Exception as error:
-            _network_mode = "error"
-            print("NETWORK,DEFAULT_AP_ERROR,%s" % error)
-    threading.Thread(target=worker, daemon=True).start()
+            self.error = str(error)
+            return False
+
+    def stop_recording(self):
+        self.active = False
+        print("RECORD,STOP,%s,%d" % (self.session_dir, self.frame_count))
+
+    def submit(self, img, now):
+        if not self.active or self.frame_count >= RAW_RECORDING_MAX_FRAMES:
+            if self.active:
+                self.stop_recording()
+            return
+        if now - self._last_submit < 1.0 / RAW_RECORDING_FPS:
+            return
+        self._last_submit = now
+        try:
+            jpeg_bytes = img.to_jpeg().to_bytes()
+        except Exception as error:
+            self.error = str(error)
+            return
+        with self._lock:
+            if len(self._queue) >= 2:
+                self._queue.pop(0)
+                self.dropped += 1
+            self._queue.append((self.session_dir, self.frame_count, jpeg_bytes))
+            self.frame_count += 1
+        self._ready.set()
+
+    def _writer_loop(self):
+        while not self._stop:
+            self._ready.wait(0.5)
+            self._ready.clear()
+            while True:
+                with self._lock:
+                    item = self._queue.pop(0) if self._queue else None
+                if item is None:
+                    break
+                session_dir, index, jpeg_bytes = item
+                try:
+                    if index % 128 == 0:
+                        stats = os.statvfs(self.root)
+                        free_mb = stats.f_bavail * stats.f_frsize / (1024.0 * 1024.0)
+                        if free_mb < RAW_RECORDING_MIN_FREE_MB:
+                            raise RuntimeError("recording stopped: low disk space")
+                    with open("%s/frame_%06d.jpg" % (session_dir, index), "wb") as frame_file:
+                        frame_file.write(jpeg_bytes)
+                except Exception as error:
+                    self.error = str(error)
+                    self.active = False
+                    break
+
+    def status(self):
+        return {
+            "recording": self.active,
+            "recording_frames": self.frame_count,
+            "recording_dropped": self.dropped,
+            "recording_session": self.session_dir,
+            "recording_error": self.error,
+        }
+
+    def close(self):
+        self.active = False
+        self._stop = True
+        self._ready.set()
+
+
+class ScreenNetworkButton:
+    """Touch fallback that remains usable when the phone cannot join the AP."""
+
+    def __init__(self, disp):
+        self.disp = disp
+        self.touch = touchscreen.TouchScreen() if touchscreen is not None else None
+        self.was_pressed = False
+        self.last_x = 0
+        self.last_y = 0
+        self.x = FRAME_W - 104
+        self.y = FRAME_H - 34
+        self.w = 100
+        self.h = 30
+
+    def _touch_to_image(self, tx, ty):
+        dw, dh = float(self.disp.width()), float(self.disp.height())
+        scale = min(dw / FRAME_W, dh / FRAME_H)
+        return (tx - (dw - FRAME_W * scale) * 0.5) / scale, (ty - (dh - FRAME_H * scale) * 0.5) / scale
+
+    def update(self, img, now):
+        label = "WIFI" if _network_mode == "ap" else "HOTSPOT"
+        color = image.COLOR_BLUE if _network_mode in ("ap", "wifi") else image.COLOR_RED
+        draw_rect(img, self.x, self.y, self.w, self.h, color, 2)
+        draw_text(img, self.x + 8, self.y + 7, label, color)
+        if self.touch is None:
+            return
+        try:
+            tx, ty, pressed = self.touch.read()
+            if pressed:
+                self.last_x, self.last_y = tx, ty
+            elif self.was_pressed:
+                ix, iy = self._touch_to_image(self.last_x, self.last_y)
+                if self.x <= ix <= self.x + self.w and self.y <= iy <= self.y + self.h:
+                    if _network_mode == "ap":
+                        ssid, password = read_saved_wifi()
+                        if ssid:
+                            connect_saved_company_wifi(ssid, password)
+                        else:
+                            print("NETWORK,SCREEN_WIFI,NO_SAVED_CONFIG")
+                    else:
+                        start_forced_network_ap()
+            self.was_pressed = bool(pressed)
+        except Exception as error:
+            print("TOUCHSCREEN,ERROR,%s" % error)
+            self.touch = None
 
 
 def connect_saved_company_wifi(ssid, password):
@@ -667,9 +936,9 @@ def connect_saved_company_wifi(ssid, password):
     def worker():
         global _wifi_manager, _network_mode, _network_ip
         try:
-            with open("/boot/wifi.ssid", "w") as ssid_file:
+            with open(WIFI_SSID_PATH, "w") as ssid_file:
                 ssid_file.write(ssid)
-            with open("/boot/wifi.pass", "w") as pass_file:
+            with open(WIFI_PASSWORD_PATH, "w") as pass_file:
                 pass_file.write(password)
             with _network_lock:
                 _wifi_manager = network.wifi.Wifi()
@@ -679,9 +948,13 @@ def connect_saved_company_wifi(ssid, password):
                 _network_mode = "wifi" if _wifi_manager.is_connected() else "error"
                 _network_ip = str(_wifi_manager.get_ip()) if _network_mode == "wifi" else ""
                 print("NETWORK,COMPANY_WIFI,%s,%s,%s" % (ssid, result, _network_ip))
+                if _network_mode != "wifi":
+                    raise RuntimeError("WiFi association failed")
         except Exception as error:
             _network_mode = "error"
             print("NETWORK,COMPANY_WIFI_ERROR,%s" % error)
+            if _network_supervisor is not None:
+                _network_supervisor.ensure_ap("wifi_connect_failed")
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -699,21 +972,12 @@ def start_forced_network_ap():
         # Let the HTTP action response reach the phone before Wi-Fi is dropped.
         safe_sleep(2.0)
         try:
-            with _network_lock:
-                for attempt in range(1, 4):
-                    try:
-                        ready = start_open_access_point()
-                        print("NETWORK,OPEN_AP_FORCE,%d,%s" % (attempt, ready))
-                    except Exception as attempt_error:
-                        ready = False
-                        print("NETWORK,OPEN_AP_ERROR,%d,%s" % (attempt, attempt_error))
-                    safe_sleep(0.8)
-                    if ready:
-                        _network_mode = "ap"
-                        _network_ip = WIFI_AP_IP
-                        print("NETWORK,AP_READY,%s,%s" % (WIFI_AP_SSID, WIFI_AP_IP))
-                        return
+            ready = _network_supervisor.ensure_ap("manual") if _network_supervisor is not None else start_open_access_point()
+            if not ready:
                 raise RuntimeError("AP mode did not become active")
+            _network_mode = "ap"
+            _network_ip = WIFI_AP_IP
+            print("NETWORK,AP_READY,%s,%s" % (WIFI_AP_SSID, WIFI_AP_IP))
         except Exception as e:
             _network_mode = "error"
             print("NETWORK,AP_FORCE_ERROR,%s" % e)
@@ -818,6 +1082,17 @@ def aim_relay_decision(fresh_target, detected_frames, missing_frames, missing_se
     return None
 
 
+def web_aim_relay_decision(estop, override, run_detection, fresh_target, detected_frames, missing_frames, missing_seconds):
+    """Resolve manual/automatic aiming-light modes with emergency priority."""
+    if estop or override is False:
+        return False
+    if override is True:
+        return True
+    if run_detection:
+        return aim_relay_decision(fresh_target, detected_frames, missing_frames, missing_seconds)
+    return None
+
+
 def gimbal_pwm_requested():
     if file_exists(GIMBAL_DISABLE_FLAG):
         return False
@@ -839,6 +1114,9 @@ ACTIVE_CONF_TH = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else CONF_TH
 ACTIVE_MIN_MODEL_CONF = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else MIN_MODEL_CONF
 ACTIVE_GIMBAL_MIN_SCORE = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else GIMBAL_MIN_SCORE
 runtime_conf_th = ACTIVE_CONF_TH
+runtime_discovery_conf = DISCOVERY_MODEL_CONF
+runtime_iou_th = IOU_TH
+runtime_min_pink_ratio = MIN_PINK_RATIO
 ACTIVE_AIM_X = SCREEN_TEST_AIM_X if SCREEN_TEST_MODE else FIXED_AIM_X
 ACTIVE_AIM_Y = SCREEN_TEST_AIM_Y if SCREEN_TEST_MODE else FIXED_AIM_Y
 ACTIVE_AIM_DISTANCE_MM = SCREEN_TEST_DISTANCE_MM if SCREEN_TEST_MODE else LASER_WORK_DISTANCE_MM
@@ -1705,7 +1983,7 @@ def color_gate(img, x, y, w, h, max_checks=MAX_COLOR_CHECKS):
     red_ratio = red_bad / total if total > 0 else 0.0
     if red_ratio > MAX_RED_BAD_RATIO and red_bad > pink * RED_BAD_DOMINANCE:
         return False, ratio, red_ratio
-    return pink >= MIN_PINK_PIXELS and ratio >= MIN_PINK_RATIO, ratio, red_ratio
+    return pink >= MIN_PINK_PIXELS and ratio >= runtime_min_pink_ratio, ratio, red_ratio
 
 
 def pass_geometry(obj, frame_w, frame_h):
@@ -1868,7 +2146,7 @@ def track_object(track, predicted):
 
 def measurement_noise_for_score(score):
     """Make weak, trajectory-gated boxes observe without pulling hard."""
-    weakness = max(0.0, DISCOVERY_MODEL_CONF - float(score)) / max(0.01, DISCOVERY_MODEL_CONF)
+    weakness = max(0.0, runtime_discovery_conf - float(score)) / max(0.01, runtime_discovery_conf)
     return TRACK_KF_MEASUREMENT_NOISE * (1.0 + 2.5 * min(1.0, weakness))
 
 
@@ -1980,7 +2258,7 @@ def track_match_cost(obj, track):
     if (
         _manual_lock_active
         and track["id"] == _locked_track_id
-        and obj.score >= DISCOVERY_MODEL_CONF
+        and obj.score >= runtime_discovery_conf
     ):
         max_center_distance = max(
             4.0,
@@ -2001,7 +2279,7 @@ def track_match_cost(obj, track):
         return None
     size_cost = (width_ratio - 1.0) + (height_ratio - 1.0)
     shape_cost = aspect_ratio - 1.0
-    confidence_penalty = max(0.0, DISCOVERY_MODEL_CONF - obj.score) / max(0.01, DISCOVERY_MODEL_CONF)
+    confidence_penalty = max(0.0, runtime_discovery_conf - obj.score) / max(0.01, runtime_discovery_conf)
     cost = (
         min(2.0, normalized_innovation / 3.0) * 0.42
         + (1.0 - overlap) * 0.30
@@ -2009,7 +2287,7 @@ def track_match_cost(obj, track):
         + min(1.0, shape_cost) * 0.07
         + confidence_penalty * 0.05
     )
-    low_measurement = obj.score < DISCOVERY_MODEL_CONF
+    low_measurement = obj.score < runtime_discovery_conf
     if low_measurement:
         if not _manual_lock_active or track["id"] != _locked_track_id:
             return None
@@ -2089,7 +2367,7 @@ def update_tracks(objs, dt_frames=1.0):
                 best_obj = objs[best_det_idx]
                 max_cost = (
                     TRACK_LOCKED_STRONG_ASSOC_MAX_COST
-                    if best_obj.score >= DISCOVERY_MODEL_CONF
+                    if best_obj.score >= runtime_discovery_conf
                     else TRACK_LOCKED_LOW_ASSOC_MAX_COST
                 )
                 unambiguous = (
@@ -2131,7 +2409,7 @@ def update_tracks(objs, dt_frames=1.0):
             track["obj"] = track_object(track, True)
             next_tracks.append(track)
 
-    birth_threshold = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else DISCOVERY_MODEL_CONF
+    birth_threshold = SCREEN_TEST_CONF_TH if SCREEN_TEST_MODE else runtime_discovery_conf
     for det_idx, obj in enumerate(objs):
         if det_idx not in used_detections and obj.score >= birth_threshold:
             next_tracks.append(new_track(obj))
@@ -2150,7 +2428,7 @@ def update_tracks(objs, dt_frames=1.0):
 def fresh_detection_for_safety(objs):
     """Count only discoverable boxes or weak boxes tied to the selected track."""
     for obj in objs:
-        if obj.score >= DISCOVERY_MODEL_CONF:
+        if obj.score >= runtime_discovery_conf:
             return True
         if (
             _manual_lock_active
@@ -2501,7 +2779,7 @@ def detect_frame(detector, img, frame_id):
         tile = img if (tx == 0 and ty == 0 and frame_w == tile_w and frame_h == tile_h) else crop_tile(img, tx, ty, tile_w, tile_h)
         if tile is None:
             continue
-        objs = detector.detect(tile, conf_th=runtime_conf_th, iou_th=IOU_TH)
+        objs = detector.detect(tile, conf_th=runtime_conf_th, iou_th=runtime_iou_th)
         raw_count += len(objs)
         candidates, pink_ratio, red_ratio, candidate_rows = filter_candidates(
             tile, objs, tile_w, tile_h, frame_id
@@ -2522,6 +2800,9 @@ def detect_frame(detector, img, frame_id):
 
 
 print("YOLO SNAIL EGG DETECTOR BOOT")
+_network_supervisor = NetworkSupervisor()
+_network_supervisor.start()
+atexit.register(_network_supervisor.close)
 gimbal = init_gimbal()
 if gimbal:
     atexit.register(gimbal.close)
@@ -2529,7 +2810,6 @@ gimbal_tracker = init_gimbal_tracker(gimbal)
 aim_relay = init_aim_relay()
 aim_dot_detector = AimDotDetector()
 aim_waypoint_planner = AimWaypointPlanner()
-start_default_network_ap()
 web_control = None
 if WebControl is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
     try:
@@ -2538,6 +2818,8 @@ if WebControl is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
         atexit.register(web_control.stop)
     except Exception as e:
         print("WEB_CONTROL_ERROR,%s" % e)
+raw_recorder = RawFrameRecorder()
+atexit.register(raw_recorder.close)
 jpeg_streamer = None
 if http is not None and not file_exists(WEB_CONTROL_DISABLE_FLAG):
     try:
@@ -2592,9 +2874,11 @@ cam = camera.Camera(
 print("INIT,CAMERA_OK")
 if ENABLE_DISPLAY:
     disp = display.Display()
+    screen_network_button = ScreenNetworkButton(disp)
     print("INIT,DISPLAY_OK")
 else:
     disp = None
+    screen_network_button = None
     print("INIT,DISPLAY_SKIP")
 frame_id = 0
 last_yolo_frame = -DETECT_EVERY_N_FRAMES
@@ -2669,6 +2953,7 @@ while not app.need_exit():
         print("TRACE,%d,READ_BEGIN" % frame_id)
     img = cam.read()
     profile_read_done = profile_clock()
+    raw_recorder.submit(img, profile_loop_start)
     dot_enabled = bool(
         closed_loop_enabled_runtime
         and aim_relay is not None
@@ -2794,7 +3079,11 @@ while not app.need_exit():
     if web_control is not None and frame_id % WEB_CONTROL_POLL_EVERY_N_FRAMES == 0:
         web_mode, web_pan, web_tilt, web_aim_override, web_estop = web_control.get_control()
         web_closed_loop_override = web_control.get_closed_loop_override()
-        runtime_conf_th = web_control.get_confidence_threshold()
+        runtime_params = web_control.get_runtime_params()
+        runtime_conf_th = runtime_params["inference_conf"]
+        runtime_discovery_conf = runtime_params["discovery_conf"]
+        runtime_iou_th = runtime_params["iou_threshold"]
+        runtime_min_pink_ratio = runtime_params["min_pink_ratio"]
     elif web_control is None:
         web_mode, web_pan, web_tilt, web_aim_override, web_estop = "auto", 0.0, 0.0, None, False
     if web_control is not None and web_control.consume_network_request() == "start_ap":
@@ -2802,6 +3091,11 @@ while not app.need_exit():
     wifi_request = web_control.consume_wifi_request() if web_control is not None else None
     if wifi_request is not None:
         connect_saved_company_wifi(wifi_request[0], wifi_request[1])
+    record_request = web_control.consume_record_request() if web_control is not None else None
+    if record_request == "start":
+        raw_recorder.start_recording()
+    elif record_request == "stop":
+        raw_recorder.stop_recording()
     target_objects = [item[0] for item in targets]
     selection_request = web_control.consume_selection_request() if web_control is not None else None
     selection_changed = False
@@ -2913,19 +3207,32 @@ while not app.need_exit():
             aim_detect_frames = 0
             aim_missing_frames += 1
     if aim_relay:
-        if web_estop or web_aim_override is False:
-            relay_decision = False
-        elif run_detection:
-            # A web "ON" request never bypasses the whole-view egg safety gate.
-            missing_seconds = pytime.time() - last_fresh_egg_time if last_fresh_egg_time else 999.0
-            relay_decision = aim_relay_decision(
-                fresh_egg_present, aim_detect_frames, aim_missing_frames, missing_seconds
-            )
-        else:
-            relay_decision = None
+        missing_seconds = pytime.time() - last_fresh_egg_time if last_fresh_egg_time else 999.0
+        relay_decision = web_aim_relay_decision(
+            web_estop,
+            web_aim_override,
+            run_detection,
+            fresh_egg_present,
+            aim_detect_frames,
+            aim_missing_frames,
+            missing_seconds,
+        )
         if relay_decision is not None:
             aim_relay.request(relay_decision)
         aim_relay.update(pytime.time())
+    aim_missing_seconds_now = pytime.time() - last_fresh_egg_time if last_fresh_egg_time else 999.0
+    if web_estop:
+        aim_block_reason = "急停未解除"
+    elif web_aim_override is False:
+        aim_block_reason = "网页已手动关闭"
+    elif web_aim_override is True:
+        aim_block_reason = "网页手动开启"
+    elif not fresh_egg_present and aim_missing_seconds_now >= AIM_RELAY_OFF_MISSING_S:
+        aim_block_reason = "视野内没有新鲜有效卵团"
+    elif aim_detect_frames < AIM_RELAY_ON_STABLE_FRAMES:
+        aim_block_reason = "等待连续稳定检测"
+    else:
+        aim_block_reason = "允许开启"
     selected_dot_fresh = bool(
         web_mode == "selected"
         and control_aim_dot is not None
@@ -3084,7 +3391,7 @@ while not app.need_exit():
 
     fps_now = time.fps()
     if web_control is not None and frame_id % WEB_CONTROL_POLL_EVERY_N_FRAMES == 0:
-        web_control.update_status({
+        web_status = {
             "fps": round(float(fps_now), 2),
             "loop_fps": round(float(fps_now), 2),
             "detect_hz": round(float(detect_fps), 2),
@@ -3095,6 +3402,11 @@ while not app.need_exit():
             "eggs": len(targets),
             "primary": primary_id,
             "relay": aim_relay.label() if aim_relay else "disabled",
+            "fresh_target": bool(fresh_egg_present),
+            "aim_detect_frames": int(aim_detect_frames),
+            "aim_required_frames": int(AIM_RELAY_ON_STABLE_FRAMES),
+            "aim_missing_seconds": round(float(aim_missing_seconds_now), 2),
+            "aim_block_reason": aim_block_reason,
             "dot": "fresh" if aim_dot is not None and aim_dot.fresh else "lost",
             "aim_mode": "fixed" if selected_open_loop else "closed_loop",
             "closed_loop_override": web_closed_loop_override,
@@ -3108,7 +3420,17 @@ while not app.need_exit():
             "network_mode": _network_mode,
             "network_ip": _network_ip,
             "ap_ssid": WIFI_AP_SSID if _network_mode == "ap" else "",
-        })
+            "network_recoveries": _network_supervisor.recovery_count if _network_supervisor is not None else 0,
+            "network_error": _network_supervisor.last_error if _network_supervisor is not None else "",
+            "runtime_params": {
+                "inference_conf": round(float(runtime_conf_th), 3),
+                "discovery_conf": round(float(runtime_discovery_conf), 3),
+                "iou_threshold": round(float(runtime_iou_th), 3),
+                "min_pink_ratio": round(float(runtime_min_pink_ratio), 4),
+            },
+        }
+        web_status.update(raw_recorder.status())
+        web_control.update_status(web_status)
     if web_control is not None:
         web_snapshot_requested = web_control.consume_frame_request()
         # The headless phone/desktop stream still needs selectable detection
@@ -3327,6 +3649,7 @@ while not app.need_exit():
     profile_stream_done = profile_clock()
 
     if disp:
+        screen_network_button.update(img, profile_clock())
         disp.show(img)
     profile_display_done = profile_clock()
     profile_count += 1

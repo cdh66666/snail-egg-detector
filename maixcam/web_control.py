@@ -28,6 +28,7 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 .viewer-fullscreen.force-landscape #viewer-stage,#viewer:fullscreen.force-landscape #viewer-stage,#viewer:-webkit-full-screen.force-landscape #viewer-stage{position:absolute;left:50%;top:50%;width:100vh;height:100vw;transform:translate(-50%,-50%) rotate(90deg)}
 .dpad{position:absolute;left:max(10px,env(safe-area-inset-left));bottom:max(10px,env(safe-area-inset-bottom));z-index:3;display:grid;grid-template-columns:repeat(3,44px);grid-template-rows:repeat(3,38px);gap:4px;filter:drop-shadow(0 2px 5px #000b)}.dpad button{width:44px;height:38px;font-size:21px;padding:0;opacity:.82}.dpad button:active{opacity:1}.dpad .up{grid-column:2}.dpad .left{grid-column:1;grid-row:2}.dpad .center{grid-column:2;grid-row:2}.dpad .right{grid-column:3;grid-row:2}.dpad .down{grid-column:2;grid-row:3}
 .commands{display:grid;grid-template-columns:1fr 1fr;gap:8px}button{height:44px;font-size:15px;font-weight:650;border:0;border-radius:6px;padding:0 10px;background:var(--blue);color:#fff;touch-action:manipulation}button:active{filter:brightness(.82)}button.green{background:var(--green)}button.amber{background:var(--amber)}button.red{background:var(--red)}button.dark{background:#4b5960}.wide{grid-column:1/-1}.hint{font-size:12px;line-height:1.45;color:var(--muted);margin:7px 1px 0}
+.params{display:grid;grid-template-columns:1fr 92px;gap:8px;align-items:center}.params label{font-size:13px;color:var(--muted)}.params input{width:92px;height:38px;border:1px solid var(--line);border-radius:5px;background:#101518;color:#fff;padding:0 8px}.record-status{font-size:13px;color:var(--muted);grid-column:1/-1}
 .notice{position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;padding:20px;background:#000a}.notice.show{display:flex}.notice-box{width:min(430px,100%);background:#20282d;border:2px solid var(--amber);border-radius:8px;padding:20px;box-shadow:0 12px 50px #000}.notice-box h2{margin:0 0 10px;font-size:23px;color:#ffd27a}.notice-box p{margin:0 0 18px;font-size:17px;line-height:1.55}.notice-box button{width:100%;font-size:17px}.needs-estop{outline:3px solid #ffd27a;animation:pulse 1s ease-in-out 3}@keyframes pulse{50%{filter:brightness(1.5)}}
 @media(max-width:560px){.status-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
@@ -60,15 +61,23 @@ main{max-width:760px;margin:auto}header{display:flex;align-items:center;justify-
 <button class="dark wide" data-command="clear_estop">解除急停</button>
 <button id="hotspotSwitch" class="amber wide">切换到设备热点</button>
 <div class="wifi-config"><input id="wifiSsid" placeholder="公司 WiFi 名称"><input id="wifiPassword" type="password" placeholder="公司 WiFi 密码"><button id="wifiSave" class="dark wide">保存并连接公司 WiFi</button></div>
-<div class="threshold-row"><span>识别阈值</span><button class="dark" data-command="conf_down">-</button><b id="confidenceThreshold">0.10</b><button class="dark" data-command="conf_up">+</button></div>
+<button id="recordToggle" class="green wide">开始录制原始画面</button><div id="recordStatus" class="record-status">未录制；保存 320×224 无框原始帧</div>
 </div><p class="hint">方向键每次松开移动 1°。人工微调后保持当前位置，不重新追踪旧目标。高功率消杀执行器始终由人工控制。</p></section>
+<section class="panel"><h2 style="font-size:16px;margin:0 0 10px">高级识别参数</h2><div class="params">
+<label for="paramInference">模型推理下限</label><input id="paramInference" data-param="inference_conf" type="number" min="0.03" max="0.30" step="0.01">
+<label for="paramDiscovery">新目标确认阈值</label><input id="paramDiscovery" data-param="discovery_conf" type="number" min="0.10" max="0.70" step="0.01">
+<label for="paramIou">重叠合并阈值</label><input id="paramIou" data-param="iou_threshold" type="number" min="0.15" max="0.80" step="0.01">
+<label for="paramPink">最低粉色占比</label><input id="paramPink" data-param="min_pink_ratio" type="number" min="0" max="0.20" step="0.005">
+<button id="saveParams" class="dark wide">应用参数</button><button id="resetParams" class="amber wide">恢复推荐参数</button>
+</div><p class="hint">参数只影响识别候选与跟踪建立，不改变模型文件；误检时提高“新目标确认阈值”，漏检时小幅降低。</p></section>
 </main>
 <div id="notice" class="notice" role="alertdialog" aria-modal="true"><div class="notice-box"><h2 id="noticeTitle">操作提示</h2><p id="noticeText"></p><button id="noticeClose" class="amber">我知道了</button></div></div>
 <script>
 const token=new URLSearchParams(location.search).get('token')||'maixcam';
 const selection=document.querySelector('#selection'),viewer=document.querySelector('#viewer'),shot=document.querySelector('#shot');
 const onlineEl=document.querySelector('#online'),fpsEl=document.querySelector('#fps'),eggsEl=document.querySelector('#eggs'),primaryEl=document.querySelector('#primary'),relayEl=document.querySelector('#relay'),feedbackModeEl=document.querySelector('#feedbackMode');
-const confidenceThresholdEl=document.querySelector('#confidenceThreshold');
+const recordToggle=document.querySelector('#recordToggle'),recordStatus=document.querySelector('#recordStatus');
+const paramInputs=[...document.querySelectorAll('[data-param]')],saveParams=document.querySelector('#saveParams'),resetParams=document.querySelector('#resetParams');
 const notice=document.querySelector('#notice'),noticeTitle=document.querySelector('#noticeTitle'),noticeText=document.querySelector('#noticeText'),noticeClose=document.querySelector('#noticeClose'),clearEstopButton=document.querySelector('[data-command="clear_estop"]');
 const hotspotSwitch=document.querySelector('#hotspotSwitch');
 const wifiSsid=document.querySelector('#wifiSsid'),wifiPassword=document.querySelector('#wifiPassword'),wifiSave=document.querySelector('#wifiSave');
@@ -76,10 +85,15 @@ let latestStatus={estop:true};
 function showNotice(title,text,highlight=false){noticeTitle.textContent=title;noticeText.textContent=text;notice.classList.add('show');if(highlight)clearEstopButton.classList.add('needs-estop');}
 function closeNotice(){notice.classList.remove('show');clearEstopButton.classList.remove('needs-estop');}
 noticeClose.addEventListener('click',closeNotice);notice.addEventListener('click',event=>{if(event.target===notice)closeNotice();});
-async function api(path){const join=path.includes('?')?'&':'?';const response=await fetch(path+join+'token='+encodeURIComponent(token),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);return response;}
+async function fetchTimed(path,timeoutMs=1800){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);try{return await fetch(path,{cache:'no-store',signal:controller.signal});}finally{clearTimeout(timer);}}
+async function api(path){const join=path.includes('?')?'&':'?';const response=await fetchTimed(path+join+'token='+encodeURIComponent(token));if(!response.ok)throw new Error('HTTP '+response.status);return response;}
 const estopBlockedCommands=new Set(['auto','select','center','nudge_left','nudge_right','nudge_up','nudge_down','aim_on']);
 async function saveWifi(){const ssid=wifiSsid.value.trim(),password=wifiPassword.value;if(!ssid){showNotice('缺少 WiFi 名称','请填写公司 WiFi 名称。');return;}try{await api('/api/wifi?ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(password));showNotice('正在连接公司 WiFi','设备会保存配置并尝试连接，网页可能短暂断开；连接成功后请使用状态中的 network_ip 访问。');}catch(error){showNotice('WiFi 配置失败','设备没有接受配置：'+error.message+'。');}}
 wifiSave.addEventListener('click',saveWifi);
+async function setRecording(command){try{await api('/api/action?cmd='+command);await refreshStatus();}catch(error){showNotice('录制操作失败',error.message);}}
+recordToggle.addEventListener('click',()=>setRecording(latestStatus.recording?'record_stop':'record_start'));
+async function applyParams(reset=false){try{const query=reset?'reset=1':paramInputs.map(input=>encodeURIComponent(input.dataset.param)+'='+encodeURIComponent(input.value)).join('&');await api('/api/params?'+query);await refreshStatus();showNotice('参数已应用',reset?'已恢复推荐参数。':'新参数将在下一帧识别时生效。');}catch(error){showNotice('参数无效','请检查数值范围：'+error.message);}}
+saveParams.addEventListener('click',()=>applyParams(false));resetParams.addEventListener('click',()=>applyParams(true));
 let actionQueue=[],actionRunning=false;
 function queueAction(command){actionQueue.push(command);if(!actionRunning)processActions();}
 async function processActions(){
@@ -97,6 +111,7 @@ async function processActions(){
   }finally{actionRunning=false;if(actionQueue.length)processActions();}
 }
 async function emergencyNow(){actionQueue=[];latestStatus.estop=true;try{await api('/api/action?cmd=emergency');await refreshStatus();showNotice('已进入急停','云台已停止，红色辅助瞄准灯已关闭。');}catch(error){showNotice('急停请求失败','设备没有响应急停请求：'+error.message+'。请立即切断设备电源。');}}
+async function clearEstopNow(){actionQueue=[];try{await api('/api/action?cmd=clear_estop');await new Promise(resolve=>setTimeout(resolve,80));const response=await api('/api/status'),status=await response.json();latestStatus=status;if(status.estop)throw new Error('设备状态仍为急停');showNotice('急停已解除','控制已解锁，可以使用方向键、点选跟踪或自动跟踪。');}catch(error){latestStatus.estop=true;showNotice('解除急停失败','设备未确认解锁：'+error.message+'。请勿操作云台。',true);}}
 async function switchToHotspot(){
   if(!confirm('设备将断开当前 WiFi。请随后连接开放热点 SnailEgg-MaixCAM，无需密码。确定切换吗？'))return;
   try{
@@ -104,7 +119,7 @@ async function switchToHotspot(){
     showNotice('正在切换设备热点','约 5 秒后连接开放热点 SnailEgg-MaixCAM，无需密码，然后打开 http://192.168.66.1:8000/?token=maixcam。重启设备会重新尝试已保存 WiFi。');
   }catch(error){showNotice('热点切换失败','设备没有接受切换请求：'+error.message+'。');}
 }
-function cmd(command){if(command==='emergency'){emergencyNow();return;}if(latestStatus.estop&&estopBlockedCommands.has(command)){showNotice('当前处于急停状态','请先点击页面下方的“解除急停”，确认周围安全后再操作云台或跟踪目标。',true);return;}queueAction(command);}
+function cmd(command){if(command==='emergency'){emergencyNow();return;}if(command==='clear_estop'){clearEstopNow();return;}if(latestStatus.estop&&estopBlockedCommands.has(command)){showNotice('当前处于急停状态','请先点击页面下方的“解除急停”，确认周围安全后再操作云台或跟踪目标。',true);return;}queueAction(command);}
 function nudge(command){if(latestStatus.estop){showNotice('当前处于急停状态','请先解除急停，再使用方向键或键盘方向键微调。',true);return;}actionQueue=actionQueue.filter(item=>item!=='auto'&&item!=='select');actionQueue.unshift(command);if(!actionRunning)processActions();}
 function fullscreenActive(){return !!(document.fullscreenElement||document.webkitFullscreenElement||viewer.classList.contains('viewer-fullscreen'));}
 function applyLandscapeFallback(){viewer.classList.toggle('force-landscape',fullscreenActive()&&innerHeight>innerWidth);}
@@ -116,15 +131,14 @@ document.querySelectorAll('[data-nudge]').forEach(button=>button.addEventListene
 addEventListener('keydown',event=>{const keys={ArrowUp:'nudge_up',ArrowDown:'nudge_down',ArrowLeft:'nudge_left',ArrowRight:'nudge_right'};const command=keys[event.key];if(!command||event.repeat)return;event.preventDefault();nudge(command);});
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>button.dataset.command==='fullscreen'?toggleFullscreen():cmd(button.dataset.command)));
 hotspotSwitch.addEventListener('click',switchToHotspot);
-async function refreshStatus(){try{const response=await api('/api/status');const status=await response.json();latestStatus=status;onlineEl.className='dot online';fpsEl.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggsEl.textContent=status.eggs??'--';primaryEl.textContent=status.selected_track_id||status.primary||'--';relayEl.textContent=status.relay??'--';selection.textContent=status.estop?'当前处于急停状态，请先解除急停':(status.selection_message||'点击画面中的绿色目标框开始跟踪');const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackModeEl.textContent='红点闭环：'+mode;feedbackModeEl.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';const apActive=status.network_mode==='ap',apSwitching=status.network_mode==='switching';hotspotSwitch.textContent=apActive?'当前为设备热点':apSwitching?'热点切换中…':'切换到设备热点';hotspotSwitch.disabled=apActive||apSwitching;}catch(_error){onlineEl.className='dot';fpsEl.textContent='连接失败';}}
+let paramsEditing=false,statusBusy=false;paramInputs.forEach(input=>{input.addEventListener('focus',()=>paramsEditing=true);input.addEventListener('blur',()=>paramsEditing=false);});
+async function refreshStatus(){if(statusBusy)return;statusBusy=true;try{const response=await api('/api/status');const status=await response.json();latestStatus=status;onlineEl.className='dot online';fpsEl.textContent=(status.loop_fps??status.fps??'--')+' / '+(status.detect_hz??'--')+' / '+(status.stream_fps??'--');eggsEl.textContent=status.eggs??'--';primaryEl.textContent=status.selected_track_id||status.primary||'--';relayEl.textContent=(status.relay??'--')+(status.relay==='AIM ON'?'':' · '+(status.aim_block_reason||''));selection.textContent=status.estop?'当前处于急停状态，请先解除急停':(status.selection_message||'点击画面中的绿色目标框开始跟踪');clearEstopButton.textContent=status.estop?'解除急停':'控制已解锁';clearEstopButton.className=(status.estop?'amber':'green')+' wide';const mode=status.closed_loop_override===true?'强制闭环':status.closed_loop_override===false?'强制开环':'自适应';feedbackModeEl.textContent='红点闭环：'+mode;feedbackModeEl.className=status.closed_loop_override===true?'green wide':status.closed_loop_override===false?'amber wide':'dark wide';const apActive=status.network_mode==='ap',apSwitching=status.network_mode==='switching';hotspotSwitch.textContent=apActive?'当前为设备热点':apSwitching?'热点切换中…':'切换到设备热点';hotspotSwitch.disabled=apActive||apSwitching;recordToggle.textContent=status.recording?'停止录制原始画面':'开始录制原始画面';recordToggle.className=(status.recording?'red':'green')+' wide';recordStatus.textContent=status.recording?('录制中：'+(status.recording_frames||0)+' 帧，丢弃 '+(status.recording_dropped||0)+' 帧'):((status.recording_session?'上次：'+status.recording_session:'未录制')+(status.recording_error?'；错误：'+status.recording_error:''));if(!paramsEditing&&status.runtime_params){paramInputs.forEach(input=>{if(status.runtime_params[input.dataset.param]!==undefined)input.value=status.runtime_params[input.dataset.param];});}}catch(_error){onlineEl.className='dot';fpsEl.textContent='连接失败';}finally{statusBusy=false;}}
 let liveTimer=0,liveObjectUrl='';
-const thresholdRefresh=setInterval(()=>{if(latestStatus.confidence_threshold!==undefined)confidenceThresholdEl.textContent=Number(latestStatus.confidence_threshold).toFixed(2);},250);
-function startStream(){shot.src='/stream?token='+encodeURIComponent(token)+'&ts='+Date.now();}
 function nextLiveFrame(delay=0){
   clearTimeout(liveTimer);
   liveTimer=setTimeout(async()=>{
     try{
-      const response=await fetch('/live.jpg?token='+encodeURIComponent(token)+'&ts='+Date.now(),{cache:'no-store'});
+      const response=await fetchTimed('/live.jpg?token='+encodeURIComponent(token)+'&ts='+Date.now(),1200);
       if(!response.ok)throw new Error('HTTP '+response.status);
       const blob=await response.blob();
       const nextUrl=URL.createObjectURL(blob),oldUrl=liveObjectUrl;
@@ -135,7 +149,7 @@ function nextLiveFrame(delay=0){
   },delay);
 }
 shot.addEventListener('error',()=>nextLiveFrame(350));
-setInterval(refreshStatus,650);refreshStatus();startStream();
+setInterval(refreshStatus,650);refreshStatus();nextLiveFrame(0);
 </script></body></html>"""
 
 
@@ -149,7 +163,13 @@ class WebControl:
         self.mode = "hold"
         self.network_request = None
         self.wifi_request = None
-        self.confidence_threshold = 0.10
+        self.runtime_params = {
+            "inference_conf": 0.10,
+            "discovery_conf": 0.35,
+            "iou_threshold": 0.35,
+            "min_pink_ratio": 0.035,
+        }
+        self.record_request = None
         self.pan = 0.0
         self.tilt = 0.0
         self.pan_target = 0.0
@@ -217,7 +237,7 @@ class WebControl:
                     self.send_json({"ok": False, "error": "bad token"}, 403)
                     return
                 if parsed.path == "/stream":
-                    control.stream_frame(self)
+                    self.send_json({"ok": False, "error": "legacy stream disabled; use /live.jpg"}, 410)
                 elif parsed.path == "/api/status":
                     self.send_json(control.get_status())
                 elif parsed.path == "/api/action":
@@ -226,6 +246,9 @@ class WebControl:
                     self.send_json({"ok": accepted}, 200 if accepted else 400)
                 elif parsed.path == "/api/wifi":
                     accepted = control.request_wifi_config(query.get("ssid", [""])[0], query.get("password", [""])[0])
+                    self.send_json({"ok": accepted}, 200 if accepted else 400)
+                elif parsed.path == "/api/params":
+                    accepted = control.request_params(query)
                     self.send_json({"ok": accepted}, 200 if accepted else 400)
                 elif parsed.path == "/api/select":
                     accepted = control.request_selection(query.get("x", ["-1"])[0], query.get("y", ["-1"])[0])
@@ -299,7 +322,7 @@ class WebControl:
 
     def apply_command(self, command):
         valid = {
-        "auto", "select", "hold", "center", "nudge_left", "nudge_right", "nudge_up", "nudge_down", "start_ap", "conf_down", "conf_up",
+        "auto", "select", "hold", "center", "nudge_left", "nudge_right", "nudge_up", "nudge_down", "start_ap", "conf_down", "conf_up", "record_start", "record_stop",
             "aim_auto", "aim_on", "aim_off", "closed_loop_toggle", "emergency", "clear_estop",
         }
         if command not in valid:
@@ -356,14 +379,54 @@ class WebControl:
             elif command == "start_ap":
                 self.network_request = "start_ap"
             elif command == "conf_down":
-                self.confidence_threshold = max(0.05, round(self.confidence_threshold - 0.02, 2))
+                self.runtime_params["inference_conf"] = max(0.03, round(self.runtime_params["inference_conf"] - 0.02, 2))
             elif command == "conf_up":
-                self.confidence_threshold = min(0.30, round(self.confidence_threshold + 0.02, 2))
+                self.runtime_params["inference_conf"] = min(0.30, round(self.runtime_params["inference_conf"] + 0.02, 2))
+            elif command == "record_start":
+                self.record_request = "start"
+            elif command == "record_stop":
+                self.record_request = "stop"
         return True
 
     def get_confidence_threshold(self):
         with self.lock:
-            return self.confidence_threshold
+            return self.runtime_params["inference_conf"]
+
+    def get_runtime_params(self):
+        with self.lock:
+            return dict(self.runtime_params)
+
+    def request_params(self, query):
+        defaults = {
+            "inference_conf": 0.10,
+            "discovery_conf": 0.35,
+            "iou_threshold": 0.35,
+            "min_pink_ratio": 0.035,
+        }
+        limits = {
+            "inference_conf": (0.03, 0.30),
+            "discovery_conf": (0.10, 0.70),
+            "iou_threshold": (0.15, 0.80),
+            "min_pink_ratio": (0.0, 0.20),
+        }
+        try:
+            if query.get("reset", [""])[0] == "1":
+                values = defaults
+            else:
+                with self.lock:
+                    values = dict(self.runtime_params)
+                for name, (low, high) in limits.items():
+                    if name not in query:
+                        continue
+                    value = float(query[name][0])
+                    if not low <= value <= high:
+                        return False
+                    values[name] = round(value, 3)
+            with self.lock:
+                self.runtime_params.update(values)
+            return True
+        except (TypeError, ValueError):
+            return False
 
     def consume_network_request(self):
         with self.lock:
@@ -381,6 +444,11 @@ class WebControl:
     def consume_wifi_request(self):
         with self.lock:
             request, self.wifi_request = self.wifi_request, None
+            return request
+
+    def consume_record_request(self):
+        with self.lock:
+            request, self.record_request = self.record_request, None
             return request
 
     def _adopt_live_gimbal_locked(self):
@@ -480,7 +548,8 @@ class WebControl:
                 tilt_limits=[self.tilt_min, self.tilt_max],
                 aim_override=self.aim_override,
                 closed_loop_override=self.closed_loop_override,
-                confidence_threshold=self.confidence_threshold,
+                confidence_threshold=self.runtime_params["inference_conf"],
+                runtime_params=dict(self.runtime_params),
                 estop=self.estop,
                 selected_track_id=self.selected_track_id,
                 selection_message=self.selection_message,

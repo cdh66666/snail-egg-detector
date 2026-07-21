@@ -1,4 +1,4 @@
-"""Regression test for the fail-closed red aiming-light safety gate."""
+"""Regression tests for automatic gating, manual override, and emergency stop."""
 
 import ast
 from pathlib import Path
@@ -20,7 +20,7 @@ def load_gate():
                 "AIM_RELAY_NO_TARGET_TEST_FLAG",
             }:
                 selected.append(node)
-        elif isinstance(node, ast.FunctionDef) and node.name == "aim_relay_decision":
+        elif isinstance(node, ast.FunctionDef) and node.name in {"aim_relay_decision", "web_aim_relay_decision"}:
             selected.append(node)
     namespace = {}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(MAIN), "exec"), namespace)
@@ -30,6 +30,7 @@ def load_gate():
 def main():
     ns = load_gate()
     decide = ns["aim_relay_decision"]
+    web_decide = ns["web_aim_relay_decision"]
     assert ns["AIM_RELAY_OFF_MISSING_S"] == 2.0
     assert ns["AIM_RELAY_NO_TARGET_TEST_FLAG"].endswith("test_no_target_safety")
 
@@ -47,7 +48,15 @@ def main():
     # seconds without a fresh whole-view detection fails closed.
     assert decide(False, 0, 1, 1.99) is None
     assert decide(False, 0, 50, 2.0) is False
-    print({"stable_enable_frames": 3, "missing_seconds_to_off": 2.0, "fail_closed": "passed"})
+
+    # Manual ON is an explicit calibration override for the low-power aiming
+    # light. It does not require a target; emergency stop always wins.
+    assert web_decide(False, True, True, False, 0, 50, 999.0) is True
+    assert web_decide(True, True, True, True, 3, 0, 0.0) is False
+    assert web_decide(False, False, True, True, 3, 0, 0.0) is False
+    assert web_decide(False, None, True, False, 0, 50, 2.0) is False
+    assert web_decide(False, None, False, False, 0, 0, 0.0) is None
+    print({"stable_enable_frames": 3, "missing_seconds_to_off": 2.0, "manual_override": "passed", "emergency_priority": "passed"})
     return 0
 
 

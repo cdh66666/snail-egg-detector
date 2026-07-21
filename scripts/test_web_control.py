@@ -44,6 +44,8 @@ def main() -> None:
         assert "�" not in html and "锟" not in html
         assert "object-fit:cover" in html
         assert "data-command=\"auto\"" in html
+        assert "nextLiveFrame(0)" in html
+        assert "refreshStatus();startStream()" not in html
 
         status, _, _ = get(base + "/api/status")
         assert status == 403
@@ -57,6 +59,9 @@ def main() -> None:
         assert payload["tilt_limits"] == [-10.0, 30.0]
         assert payload["closed_loop_override"] is None
         assert payload["confidence_threshold"] == 0.10
+        assert payload["runtime_params"]["discovery_conf"] == 0.35
+        status, _, body = get(base + "/stream?token=maixcam")
+        assert status == 410 and b"legacy stream disabled" in body
 
         status, _, _ = get(base + "/api/action?cmd=conf_down&token=maixcam")
         assert status == 200
@@ -64,6 +69,24 @@ def main() -> None:
         status, _, _ = get(base + "/api/action?cmd=conf_up&token=maixcam")
         assert status == 200
         assert web.get_confidence_threshold() == 0.10
+
+        status, _, _ = get(base + "/api/params?inference_conf=0.07&discovery_conf=0.42&iou_threshold=0.40&min_pink_ratio=0.025&token=maixcam")
+        assert status == 200
+        assert web.get_runtime_params() == {
+            "inference_conf": 0.07,
+            "discovery_conf": 0.42,
+            "iou_threshold": 0.40,
+            "min_pink_ratio": 0.025,
+        }
+        status, _, _ = get(base + "/api/params?discovery_conf=2&token=maixcam")
+        assert status == 400
+        status, _, _ = get(base + "/api/params?reset=1&token=maixcam")
+        assert status == 200 and web.get_confidence_threshold() == 0.10
+
+        status, _, _ = get(base + "/api/action?cmd=record_start&token=maixcam")
+        assert status == 200 and web.consume_record_request() == "start"
+        status, _, _ = get(base + "/api/action?cmd=record_stop&token=maixcam")
+        assert status == 200 and web.consume_record_request() == "stop"
 
         for probe_path in ("/generate_204", "/hotspot-detect.html", "/connecttest.txt", "/ncsi.txt"):
             status, headers, _ = get(base + probe_path)
@@ -93,6 +116,8 @@ def main() -> None:
         assert status == 200
         mode, pan, tilt, _, _ = web.get_control()
         assert mode == "manual" and pan == 13.0 and tilt == -4.0
+        web.update_status({"fresh_target": False, "aim_block_reason": "视野内没有新鲜有效卵团"})
+        assert web.get_status()["aim_block_reason"] == "视野内没有新鲜有效卵团"
         time.sleep(0.13)
         get(base + "/api/action?cmd=nudge_right&token=maixcam")
         _, pan, _, _, _ = web.get_control()

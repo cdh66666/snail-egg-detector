@@ -39,6 +39,7 @@ def load_namespace():
         "LOCKED_ASSOC_MAX_CENTER_RATIO": 0.90,
         "LOCKED_ASSOC_MAX_SIZE_RATIO": 1.55,
         "DISCOVERY_MODEL_CONF": 0.35,
+        "runtime_discovery_conf": 0.35,
         "_manual_lock_active": True,
         "_locked_track_id": 7,
         "FRAME_W": 320,
