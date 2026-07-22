@@ -360,6 +360,7 @@ WIFI_AP_CHANNEL = 6
 WIFI_AP_HEALTH_INTERVAL_S = 3.0
 WIFI_AP_RECOVERY_SETTLE_S = 1.5
 WIFI_STA_FAILURE_LIMIT = 3
+WIFI_BOOT_CONNECT_TIMEOUT_S = 10
 WIFI_SSID_PATH = "/boot/wifi.ssid"
 WIFI_PASSWORD_PATH = "/boot/wifi.pass"
 RAW_RECORDING_DIR = "/root/snail_egg/recordings"
@@ -369,6 +370,7 @@ RAW_RECORDING_MIN_FREE_MB = 256
 _wifi_manager = None
 _network_mode = "checking"
 _network_ip = ""
+_network_ssid = ""
 _network_lock = threading.Lock()
 _network_switching = False
 _network_supervisor = None
@@ -717,15 +719,58 @@ class NetworkSupervisor:
         self._wifi_failures = 0
 
     def start(self):
-        self.ensure_ap("boot")
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        # Do not hold up camera/model initialization while an absent saved
+        # network reaches its timeout. The control path comes up independently.
+        self._thread = threading.Thread(target=self._boot_and_monitor, daemon=True)
         self._thread.start()
 
+    def _boot_and_monitor(self):
+        ssid, password = read_saved_wifi()
+        connected = bool(ssid) and self.connect_wifi(
+            ssid,
+            password,
+            timeout=WIFI_BOOT_CONNECT_TIMEOUT_S,
+            reason="boot",
+        )
+        if not connected:
+            self.ensure_ap("boot_fallback" if ssid else "boot_no_saved_wifi")
+        self._loop()
+
+    def connect_wifi(self, ssid, password, timeout=30, reason="manual"):
+        """Connect as a station; callers decide whether failure falls back to AP."""
+        global _wifi_manager, _network_mode, _network_ip, _network_ssid
+        if network is None or not ssid:
+            return False
+        with _network_lock:
+            _network_mode, _network_ip = "wifi_connecting", ""
+            try:
+                _wifi_manager = network.wifi.Wifi()
+                try:
+                    _wifi_manager.stop_ap()
+                except Exception:
+                    pass
+                safe_sleep(0.4)
+                result = _wifi_manager.connect(ssid, password, wait=True, timeout=timeout)
+                if not _wifi_manager.is_connected():
+                    raise RuntimeError("WiFi association timed out")
+                _network_mode = "wifi"
+                _network_ip = str(_wifi_manager.get_ip())
+                _network_ssid = ssid
+                self._wifi_failures = 0
+                self.last_error = ""
+                print("NETWORK,WIFI_CONNECTED,%s,%s,%s,%s" % (reason, ssid, result, _network_ip))
+                return True
+            except Exception as error:
+                self.last_error = str(error)
+                _network_mode, _network_ip, _network_ssid = "error", "", ""
+                print("NETWORK,WIFI_ERROR,%s,%s,%s" % (reason, ssid, error))
+                return False
+
     def ensure_ap(self, reason):
-        global _network_mode, _network_ip
+        global _network_mode, _network_ip, _network_ssid
         with _network_lock:
             if access_point_healthy():
-                _network_mode, _network_ip = "ap", WIFI_AP_IP
+                _network_mode, _network_ip, _network_ssid = "ap", WIFI_AP_IP, WIFI_AP_SSID
                 return True
             for attempt in range(1, 4):
                 try:
@@ -735,12 +780,12 @@ class NetworkSupervisor:
                     self.last_error = str(error)
                 print("NETWORK,AP_ENSURE,%s,%d,%s" % (reason, attempt, ready))
                 if ready:
-                    _network_mode, _network_ip = "ap", WIFI_AP_IP
+                    _network_mode, _network_ip, _network_ssid = "ap", WIFI_AP_IP, WIFI_AP_SSID
                     self.recovery_count += 1
                     self._wifi_failures = 0
                     return True
                 safe_sleep(0.8)
-            _network_mode, _network_ip = "error", ""
+            _network_mode, _network_ip, _network_ssid = "error", "", ""
             return False
 
     def _loop(self):
@@ -934,27 +979,23 @@ class ScreenNetworkButton:
 def connect_saved_company_wifi(ssid, password):
     """Persist and connect to a user-supplied company Wi-Fi without reboot."""
     def worker():
-        global _wifi_manager, _network_mode, _network_ip
+        global _network_switching
+        _network_switching = True
         try:
             with open(WIFI_SSID_PATH, "w") as ssid_file:
                 ssid_file.write(ssid)
             with open(WIFI_PASSWORD_PATH, "w") as pass_file:
                 pass_file.write(password)
-            with _network_lock:
-                _wifi_manager = network.wifi.Wifi()
-                _wifi_manager.stop_ap()
-                safe_sleep(0.7)
-                result = _wifi_manager.connect(ssid, password, wait=True, timeout=30)
-                _network_mode = "wifi" if _wifi_manager.is_connected() else "error"
-                _network_ip = str(_wifi_manager.get_ip()) if _network_mode == "wifi" else ""
-                print("NETWORK,COMPANY_WIFI,%s,%s,%s" % (ssid, result, _network_ip))
-                if _network_mode != "wifi":
-                    raise RuntimeError("WiFi association failed")
+            if _network_supervisor is None or not _network_supervisor.connect_wifi(
+                ssid, password, timeout=30, reason="web_or_screen"
+            ):
+                raise RuntimeError("WiFi association failed")
         except Exception as error:
-            _network_mode = "error"
             print("NETWORK,COMPANY_WIFI_ERROR,%s" % error)
             if _network_supervisor is not None:
                 _network_supervisor.ensure_ap("wifi_connect_failed")
+        finally:
+            _network_switching = False
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -3419,6 +3460,8 @@ while not app.need_exit():
             "web_url": "http://<maixcam-ip>:%d/?token=%s" % (WEB_CONTROL_PORT, web_control.token),
             "network_mode": _network_mode,
             "network_ip": _network_ip,
+            "network_ssid": _network_ssid,
+            "network_boot_policy": "saved_wifi_then_ap",
             "ap_ssid": WIFI_AP_SSID if _network_mode == "ap" else "",
             "network_recoveries": _network_supervisor.recovery_count if _network_supervisor is not None else 0,
             "network_error": _network_supervisor.last_error if _network_supervisor is not None else "",
