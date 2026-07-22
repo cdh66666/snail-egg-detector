@@ -360,9 +360,13 @@ WIFI_AP_CHANNEL = 6
 WIFI_AP_HEALTH_INTERVAL_S = 3.0
 WIFI_AP_RECOVERY_SETTLE_S = 1.5
 WIFI_STA_FAILURE_LIMIT = 3
-WIFI_BOOT_CONNECT_TIMEOUT_S = 10
-WIFI_SSID_PATH = "/boot/wifi.ssid"
-WIFI_PASSWORD_PATH = "/boot/wifi.pass"
+WIFI_BOOT_SETTLE_S = 5.0
+WIFI_BOOT_CONNECT_TIMEOUT_S = 20
+WIFI_CONFIG_DIR = "/root/snail_egg"
+WIFI_SSID_PATH = WIFI_CONFIG_DIR + "/wifi_sta.ssid"
+WIFI_PASSWORD_PATH = WIFI_CONFIG_DIR + "/wifi_sta.pass"
+LEGACY_WIFI_SSID_PATH = "/boot/wifi.ssid"
+LEGACY_WIFI_PASSWORD_PATH = "/boot/wifi.pass"
 RAW_RECORDING_DIR = "/root/snail_egg/recordings"
 RAW_RECORDING_FPS = 8
 RAW_RECORDING_MAX_FRAMES = 14400
@@ -697,15 +701,40 @@ def stop_wlan_station_client():
     )
 
 
-def read_saved_wifi():
+def prepare_wlan_for_station(ssid, password):
+    """Clear boot-time AP services before asking MaixPy to enter STA mode."""
     try:
-        with open(WIFI_SSID_PATH, "r") as ssid_file:
-            ssid = ssid_file.read().strip()
-        with open(WIFI_PASSWORD_PATH, "r") as password_file:
-            password = password_file.read().strip()
-        return ssid, password
-    except Exception:
-        return "", ""
+        with open(LEGACY_WIFI_SSID_PATH, "w") as ssid_file:
+            ssid_file.write(ssid)
+        with open(LEGACY_WIFI_PASSWORD_PATH, "w") as password_file:
+            password_file.write(password)
+    except Exception as error:
+        print("NETWORK,LEGACY_WIFI_SYNC_ERROR,%s" % error)
+    os.system(
+        "killall hostapd 2>/dev/null || true; "
+        "killall dnsmasq 2>/dev/null || true; "
+        "killall udhcpd 2>/dev/null || true; "
+        "ip addr flush dev wlan0 2>/dev/null || true"
+    )
+
+
+def read_saved_wifi():
+    for ssid_path, password_path in (
+        (WIFI_SSID_PATH, WIFI_PASSWORD_PATH),
+        (LEGACY_WIFI_SSID_PATH, LEGACY_WIFI_PASSWORD_PATH),
+    ):
+        try:
+            with open(ssid_path, "r") as ssid_file:
+                ssid = ssid_file.read().strip()
+            with open(password_path, "r") as password_file:
+                password = password_file.read().strip()
+            # MaixPy start_ap() persists its own AP credentials under /boot;
+            # never mistake those values for station credentials.
+            if ssid and ssid != WIFI_AP_SSID:
+                return ssid, password
+        except Exception:
+            pass
+    return "", ""
 
 
 class NetworkSupervisor:
@@ -725,6 +754,9 @@ class NetworkSupervisor:
         self._thread.start()
 
     def _boot_and_monitor(self):
+        # The firmware may still be applying /boot AP settings when the app
+        # process starts. Let that one-shot service finish before taking wlan0.
+        safe_sleep(WIFI_BOOT_SETTLE_S)
         ssid, password = read_saved_wifi()
         connected = bool(ssid) and self.connect_wifi(
             ssid,
@@ -744,6 +776,7 @@ class NetworkSupervisor:
         with _network_lock:
             _network_mode, _network_ip = "wifi_connecting", ""
             try:
+                prepare_wlan_for_station(ssid, password)
                 _wifi_manager = network.wifi.Wifi()
                 try:
                     _wifi_manager.stop_ap()
@@ -982,6 +1015,7 @@ def connect_saved_company_wifi(ssid, password):
         global _network_switching
         _network_switching = True
         try:
+            os.makedirs(WIFI_CONFIG_DIR, exist_ok=True)
             with open(WIFI_SSID_PATH, "w") as ssid_file:
                 ssid_file.write(ssid)
             with open(WIFI_PASSWORD_PATH, "w") as pass_file:
